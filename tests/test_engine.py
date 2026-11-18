@@ -338,3 +338,47 @@ def test_resume_refuses_to_bypass_daily_loss_limit(tmp_path) -> None:
     assert engine.paused is True
     assert "Daily net loss limit reached" in engine._risk_halt_reason
     engine.ledger.conn.close()
+
+
+
+def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "restore-metadata.db"),
+    ))
+    old_start = int(time.time()) - 600
+    slug = f"btc-updown-5m-{old_start}"
+    restored = WindowState(
+        slug=slug,
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "5" * 64,
+        up_token="",
+        down_token="",
+        start_ts=float(old_start),
+        end_ts=float(old_start + 300),
+        last_ptb_retry_mono=time.monotonic() - 10.0,
+    )
+    restored.up_shares = 5.0
+    restored.up_cost = 2.0
+    engine.windows[slug] = restored
+
+    async def fake_gamma(requested_slug: str):
+        return {
+            "condition_id": "0x" + "5" * 64,
+            "up_token": "restored-up-token",
+            "down_token": "restored-down-token",
+            "price_to_beat": 100_000.0,
+            "price_to_beat_source": "gamma.eventMetadata.priceToBeat",
+            "fee_rate": 0.25,
+        }
+
+    engine._gamma = fake_gamma  # type: ignore[method-assign]
+    asyncio.run(engine._discover())
+
+    assert restored.up_token == "restored-up-token"
+    assert restored.down_token == "restored-down-token"
+    assert restored.price_to_beat == 100_000.0
+    assert engine._market_tokens_changed.is_set()
+    engine.ledger.conn.close()
