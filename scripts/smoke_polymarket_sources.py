@@ -184,25 +184,33 @@ async def check_boundary_twap_vs_gamma(
     start_ts = ((int(time.time()) // 300) + 1) * 300
     deadline = start_ts + 3
     samples: list[tuple[float, float]] = []
-    stream = PolymarketOracleFeed(["BTC"]).events()
 
     async def consume_until_boundary() -> None:
-        try:
-            async for asset, kind, price, timestamp_ms in stream:
-                ts = timestamp_ms / 1000.0
-                if (
-                    asset == "BTC"
-                    and kind == "chainlink_twap60"
-                    and start_ts - 2 <= ts <= start_ts + 2
-                ):
-                    samples.append((ts, price))
-                if time.time() > deadline:
-                    return
-        finally:
+        # Mirror the engine's reconnect behavior if a WebSocket session ends.
+        while time.time() <= deadline:
+            stream = PolymarketOracleFeed(["BTC"]).events()
             try:
-                await asyncio.wait_for(stream.aclose(), timeout=5.0)
-            except (asyncio.TimeoutError, RuntimeError):
-                pass
+                async for asset, kind, price, timestamp_ms in stream:
+                    ts = timestamp_ms / 1000.0
+                    if (
+                        asset == "BTC"
+                        and kind == "chainlink_twap60"
+                        and start_ts - 2 <= ts <= start_ts + 2
+                    ):
+                        samples.append((ts, price))
+                    if time.time() > deadline:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await asyncio.sleep(0.5)
+            finally:
+                try:
+                    await asyncio.wait_for(stream.aclose(), timeout=5.0)
+                except (asyncio.TimeoutError, RuntimeError):
+                    pass
+            if time.time() <= deadline:
+                await asyncio.sleep(0.5)
 
     timeout_seconds = max(30.0, deadline - time.time() + 5.0)
     try:
