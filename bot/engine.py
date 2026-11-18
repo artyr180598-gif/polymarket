@@ -266,6 +266,7 @@ class TradingEngine:
             window.up_fees = float(position.get("up_fees", 0.0))
             window.down_fees = float(position.get("down_fees", 0.0))
             self.windows[slug] = window
+            self._market_tokens_changed.set()
             self._log_event(
                 "INFO",
                 f"Восстановлена PAPER-позиция {slug}: Up {window.up_shares:.2f}, "
@@ -345,6 +346,8 @@ class TradingEngine:
                 ]
                 for s in dead:
                     del self.windows[s]
+                if dead:
+                    self._market_tokens_changed.set()
             except Exception as e:
                 log.warning("discovery: %s", e)
             await asyncio.sleep(4)
@@ -393,6 +396,7 @@ class TradingEngine:
                         last_ptb_retry_mono=time.monotonic(),
                     )
                     self.windows[slug] = w
+                    self._market_tokens_changed.set()
 
     async def _gamma(self, slug: str):
         try:
