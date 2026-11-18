@@ -606,7 +606,7 @@ class TradingEngine:
             return
         book = self._market_books.setdefault(
             token,
-            {"bids": {}, "asks": {}, "best_bid": 0.0, "best_ask": 1.0, "tick_size": 0.01},
+            {"bids": {}, "asks": {}, "best_bid": 0.0, "best_ask": 1.0, "tick_size": 0.01, "min_order_size": 0.0},
         )
         kind = event.get("type")
         if self.paused or self._risk_halt_active:
@@ -632,6 +632,7 @@ class TradingEngine:
             book["bids"] = {float(p): float(s) for p, s in event.get("bids", []) if float(s) > 0}
             book["asks"] = {float(p): float(s) for p, s in event.get("asks", []) if float(s) > 0}
             book["tick_size"] = float(event.get("tick_size") or book["tick_size"])
+            book["min_order_size"] = float(event.get("min_order_size") or book.get("min_order_size", 0.0))
         elif kind == "price_change":
             side = str(event.get("side") or "").upper()
             levels = book["bids"] if side == "BUY" else book["asks"] if side == "SELL" else None
@@ -813,7 +814,7 @@ class TradingEngine:
         # Empirical median maker fill sizes from the target wallet's 5m history.
         # These are conservative PAPER seed sizes, not a claim of exact wallet sizing.
         size_caps = {"BTC": 12.0, "ETH": 11.0, "SOL": 8.0}
-        min_size = float(self.params.maker_min_size)
+        min_size = max(float(self.params.maker_min_size), float(book.get("min_order_size") or 0.0))
         min_edge = float(self.params.min_maker_edge)
         min_price = float(self.params.maker_min_price)
         max_price = float(self.params.maker_max_price)
