@@ -15,6 +15,7 @@ from .config import BotConfig, PRESETS, StrategyParams
 from .execution import PaperExecutor, LiveExecutor
 from .fees import calc_taker_fee_usdc, fee_regime_label
 from .ledger import Ledger
+from .oracle_feed import PolymarketOracleFeed
 from .twap_model import AssetPriceTracker
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,8 @@ class TradingEngine:
         self._notify_cb: Optional[NotifyFn] = None
         self._streams_ok = False
         self._price_ok = False
+        self._oracle_connected = False
+        self._oracle_last_event_ts = 0.0
         self._fill_history: List[Dict[str, Any]] = []
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
@@ -110,7 +113,7 @@ class TradingEngine:
         self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
         self.running = True
         self._tasks = [
-            asyncio.create_task(self._rest_price_loop(), name="prices"),
+            asyncio.create_task(self._polymarket_oracle_loop(), name="polymarket_oracle"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
@@ -149,83 +152,56 @@ class TradingEngine:
         self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
         return {"canceled": 0, "merged_usd": round(merged, 2)}
 
-    async def _fetch_spot(self, asset: str) -> Optional[float]:
-        timeout = aiohttp.ClientTimeout(total=8)
-        cb = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}.get(asset)
-        if cb:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(f"https://api.coinbase.com/v2/prices/{cb}/spot") as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            px = float((d.get("data") or {}).get("amount") or 0)
-                            if px > 0:
-                                return px
-            except Exception:
-                pass
-        kr = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}.get(asset)
-        if kr:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(f"https://api.kraken.com/0/public/Ticker?pair={kr}") as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            for v in (d.get("result") or {}).values():
-                                c0 = (v.get("c") or [None])[0]
-                                if c0:
-                                    px = float(c0)
-                                    if px > 0:
-                                        return px
-            except Exception:
-                pass
-        return None
-
-    async def _rest_price_loop(self) -> None:
-        notified = False
+    async def _polymarket_oracle_loop(self) -> None:
+        """Consume Polymarket's own Chainlink spot and settlement TWAP60 stream."""
+        delay = 1.0
         while self.running:
             try:
-                now = time.time()
-                ok_any = False
-                for asset in list(self.cfg.enabled_assets):
-                    tr = self.trackers.get(asset)
-                    if not tr:
+                feed = PolymarketOracleFeed(self.cfg.enabled_assets)
+                async for asset, kind, price, ts_ms in feed.events():
+                    tracker = self.trackers.get(asset)
+                    if tracker is None:
                         continue
-                    px = await self._fetch_spot(asset)
-                    if not px:
+                    # Reject timestamps that are clearly stale or implausibly in the future.
+                    source_ts = ts_ms / 1000.0
+                    age = time.time() - source_ts
+                    if age > 5.0 or age < -2.0:
                         continue
-                    ok_any = True
-                    ts_ms = int(now * 1000)
-                    # Coinbase/Kraken REST spot is NOT Chainlink oracle data.
-                    # Do not relabel it as Chainlink spot/TWAP: the strategy requires
-                    # the actual market settlement feed before it can calculate fair value.
-                    # Coinbase/Kraken fallback is only a reference quote.
-                    # It is NOT Binance and NOT Polymarket's Chainlink settlement feed.
-                    # Never use it for fair value, price-to-beat, or final settlement.
-                for w in list(self.windows.values()):
-                    if w.resolved or w.price_to_beat is not None:
-                        continue
-                    tr = self.trackers.get(w.asset)
-                    if not tr:
-                        continue
-                    ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
-                    if ptb:
-                        w.price_to_beat = float(ptb)
-                # Reference spot availability is not equivalent to a healthy
-                # Chainlink settlement feed. Keep trading health false until the
-                # official oracle stream is connected and timestamp-validated.
+                    if kind == "chainlink_spot":
+                        tracker.on_chainlink_spot(price, ts_ms)
+                    elif kind == "chainlink_twap60":
+                        tracker.on_chainlink_twap60(price, ts_ms)
+                    self._oracle_last_event_ts = time.time()
+                    fresh = all(
+                        t.cl_spot is not None
+                        and t.cl_twap60 is not None
+                        and time.monotonic() - t.cl_recv_mono <= 5.0
+                        and time.monotonic() - t.cl_twap_recv_mono <= 5.0
+                        and time.time() - t.cl_spot_ts <= 5.0
+                        and time.time() - t.cl_twap60_ts <= 5.0
+                        for t in self.trackers.values()
+                    )
+                    self._oracle_connected = fresh
+                    self._price_ok = fresh
+                    self._streams_ok = fresh
+                    if fresh:
+                        delay = 1.0
+                if self.running:
+                    raise RuntimeError("Polymarket RTDS stream ended unexpectedly")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._oracle_connected = False
                 self._price_ok = False
                 self._streams_ok = False
-                if ok_any and not notified:
-                    self._log_event(
-                        "WARNING",
-                        "Reference spot reachable; Polymarket Chainlink settlement feed is not connected. "
-                        "Strategy will remain idle rather than fabricate oracle inputs.",
-                        notify=True,
-                    )
-                    notified = True
-            except Exception as e:
-                log.warning("prices: %s", e)
-            await asyncio.sleep(2.0)
+                log.warning("Polymarket Chainlink RTDS disconnected: %s", exc)
+                self._log_event(
+                    "WARNING",
+                    f"Polymarket Chainlink feed unavailable; entries are halted ({type(exc).__name__})",
+                    notify=True,
+                )
+                await asyncio.sleep(delay)
+                delay = min(30.0, delay * 2.0)
 
     async def _discovery_loop(self) -> None:
         while self.running:
@@ -265,8 +241,8 @@ class TradingEngine:
                     )
                     if w.price_to_beat is None:
                         tr = self.trackers[asset]
-                        ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
-                        if ptb:
+                        ptb = tr.lookup_twap_at(int(start), max_diff_sec=2.0)
+                        if ptb is not None:
                             w.price_to_beat = float(ptb)
                     self.windows[slug] = w
 
@@ -307,44 +283,39 @@ class TradingEngine:
             return None
 
     async def _clob_ask_info(self, token_id: str):
-        """(best_ask, size_at_best_ask). Book asks are often high→low; use /price for best."""
+        """Return the real best ask and size resting at that exact price level."""
         if not token_id:
             return None
         try:
             timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                best_px = None
-                depth = 12.0
-                async with s.get(
-                    f"https://clob.polymarket.com/price?token_id={token_id}&side=BUY"
-                ) as r:
-                    if r.status == 200:
-                        pd = await r.json()
-                        if pd.get("price") is not None:
-                            best_px = float(pd["price"])
-                async with s.get(f"https://clob.polymarket.com/book?token_id={token_id}") as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        asks = d.get("asks") or []
-                        levels = []
-                        for a in asks:
-                            try:
-                                px = float(a.get("price") or 0)
-                                sz = float(a.get("size") or 0)
-                            except Exception:
-                                continue
-                            if px > 0 and sz > 0:
-                                levels.append((px, sz))
-                        if levels:
-                            min_px = min(px for px, _ in levels)
-                            if best_px is None:
-                                best_px = min_px
-                            depth = sum(sz for px, sz in levels if abs(px - best_px) < 0.015)
-                            depth = max(depth, 5.0)
-                if best_px is None or best_px <= 0:
-                    return None
-                return (best_px, float(depth))
-        except Exception:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"https://clob.polymarket.com/book?token_id={token_id}"
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    book = await response.json()
+            asks = book.get("asks") or []
+            levels = []
+            for level in asks:
+                try:
+                    price = float(level.get("price"))
+                    size = float(level.get("size"))
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 < price < 1.0 and size > 0.0:
+                    levels.append((price, size))
+            if not levels:
+                return None
+            best_ask = min(price for price, _ in levels)
+            # Only count quantity actually resting at the best price. Do not
+            # invent a minimum depth or pretend deeper levels fill at best ask.
+            best_depth = sum(size for price, size in levels if abs(price - best_ask) < 1e-9)
+            if best_depth <= 0:
+                return None
+            return best_ask, best_depth
+        except Exception as exc:
+            log.debug("CLOB book unavailable for %s: %s", token_id, exc)
             return None
 
     async def _clob_best_ask(self, token_id: str):
@@ -374,9 +345,21 @@ class TradingEngine:
     async def _run(self, w: WindowState) -> None:
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
+        now_mono = time.monotonic()
+        if (
+            spot is None
+            or tr.cl_twap60 is None
+            or now_mono - tr.cl_recv_mono > 5.0
+            or now_mono - tr.cl_twap_recv_mono > 5.0
+            or time.time() - tr.cl_spot_ts > 5.0
+            or time.time() - tr.cl_twap60_ts > 5.0
+        ):
+            return
         if w.price_to_beat is None:
-            w.price_to_beat = spot or getattr(tr, "cl_twap60", None)
-        if w.price_to_beat is None or spot is None:
+            ptb = tr.lookup_twap_at(int(w.start_ts), max_diff_sec=2.0)
+            if ptb is not None:
+                w.price_to_beat = float(ptb)
+        if w.price_to_beat is None:
             return
         try:
             fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
@@ -598,29 +581,54 @@ class TradingEngine:
             await asyncio.sleep(3)
 
     async def _resolve(self, w: WindowState) -> None:
+        # Preserve the closest real settlement-feed observation for diagnostics.
+        tracker = self.trackers.get(w.asset)
+        if tracker is not None and w.final_price is None:
+            final_twap = tracker.lookup_twap_at(int(w.end_ts), max_diff_sec=2.0)
+            if final_twap is not None:
+                w.final_price = float(final_twap)
+
+        # A market is resolved only by Polymarket's official resolution endpoint.
+        # Never infer the winner from Coinbase/Binance spot or the bot's inventory.
         winner = None
         try:
             timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
-                async with s.get(url) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        items = data.get("data") if isinstance(data, dict) else data
-                        if items:
-                            item = items[0] if isinstance(items, list) else items
-                            if item.get("status") == "resolved":
-                                payouts = item.get("payouts") or []
-                                winner = "Up" if payouts and float(payouts[0]) > 0 else "Down"
-        except Exception:
-            pass
-        # Never guess a winner from inventory or an unrelated exchange quote.
-        # Only the official Polymarket resolution feed may settle this position.
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                url = (
+                    "https://data-api.polymarket.com/v2/resolutions"
+                    f"?condition_id={w.condition_id}"
+                )
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        payload = await response.json()
+                        rows = payload.get("data") if isinstance(payload, dict) else None
+                        if isinstance(rows, dict):
+                            rows = [rows]
+                        for item in rows or []:
+                            if str(item.get("status", "")).lower() != "resolved":
+                                continue
+                            payouts = item.get("payouts") or []
+                            if len(payouts) < 2:
+                                continue
+                            up_payout, down_payout = float(payouts[0]), float(payouts[1])
+                            if up_payout > down_payout:
+                                winner = "Up"
+                            elif down_payout > up_payout:
+                                winner = "Down"
+                            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("official resolution lookup failed for %s: %s", w.slug, exc)
+
         if winner is None:
+            # Data API can lag settlement. Keep the market pending; never book a
+            # guessed winner or manufacture PnL while the authoritative result is absent.
             return
         if w.up_shares < 0.01 and w.down_shares < 0.01:
             w.resolved = True
             return
+
         payout = float(w.up_shares if winner == "Up" else w.down_shares)
         gross_cost = float(w.up_cost + w.down_cost)
         gross = payout - gross_cost
@@ -632,21 +640,23 @@ class TradingEngine:
             self.ledger.record_resolution(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
-                price_to_beat=w.price_to_beat, final_price=w.final_price or spot,
+                price_to_beat=w.price_to_beat, final_price=w.final_price,
                 up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
                 merged_pairs=0.0, gross_cost=gross_cost, total_fees=0.0, total_payout=payout,
             )
-        except Exception as e:
-            log.warning("record_resolution: %s", e)
-        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "pnl": gross})
+        except Exception as exc:
+            log.warning("record_resolution: %s", exc)
+        self._resolve_history.insert(
+            0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "pnl": gross}
+        )
         self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
         if gross >= 0:
-            msg = f"✅ Окно закрылось · победил {side}\nПрибыль: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\\nПрибыль: <b>${gross:+.2f}</b>\\n<code>{w.slug}</code>"
         else:
-            msg = f"❌ Окно закрылось · победил {side}\nУбыток: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\\nУбыток: <b>${gross:+.2f}</b>\\n<code>{w.slug}</code>"
         self._log_event("INFO", msg, notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
@@ -699,6 +709,9 @@ class TradingEngine:
             "fee_regime": fee_regime_label(),
             "assets": self.cfg.enabled_assets,
             "streams_ok": self._price_ok,
+            "oracle_connected": self._oracle_connected,
+            "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
+            "oracle_last_event_ts": self._oracle_last_event_ts,
             "fill_history": self._fill_history[:20],
             "merge_history": self._merge_history[:10],
             "resolve_history": self._resolve_history[:10],
