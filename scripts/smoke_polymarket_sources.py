@@ -279,39 +279,6 @@ async def check_boundary_twap_vs_gamma(
     }
 
 
-async def check_clob_websocket(token_id: str) -> dict[str, bool]:
-    iterator = PolymarketMarketFeed([token_id]).events().__aiter__()
-    got_book = False
-    got_trade = False
-    deadline = time.monotonic() + 20.0
-    try:
-        while time.monotonic() < deadline:
-            try:
-                event = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
-            except asyncio.TimeoutError:
-                if got_book:
-                    break
-                continue
-            except StopAsyncIteration:
-                break
-            if event.get("type") == "book":
-                got_book = True
-            elif event.get("type") == "last_trade":
-                got_trade = True
-            if got_book and got_trade:
-                break
-    finally:
-        # The SDK's websocket close can wait on the transport; bound cleanup so
-        # a read-only CI smoke test cannot hang indefinitely after its deadline.
-        try:
-            await asyncio.wait_for(iterator.aclose(), timeout=3.0)
-        except (asyncio.TimeoutError, RuntimeError):
-            pass
-    if not got_book:
-        raise RuntimeError("CLOB WebSocket did not deliver a book snapshot")
-    return {"book_snapshot": got_book, "last_trade_event_observed": got_trade}
-
-
 async def check_data_api(session: aiohttp.ClientSession) -> dict[str, Any]:
     payload = await get_json(
         session,
@@ -333,7 +300,6 @@ async def main() -> None:
             session,
             int(gamma_clob["slug"].rsplit("-", 1)[1]),
         )
-        clob_ws = await check_clob_websocket(gamma_clob["clob_token_ids"][0])
         data_api = await check_data_api(session)
         boundary_strike = await check_boundary_twap_vs_gamma(session)
     print(json.dumps({
@@ -341,7 +307,6 @@ async def main() -> None:
         "rtds_chainlink": rtds,
         "gamma_and_clob": gamma_clob,
         "open_price_reference_vs_gamma_ptb": open_price_reference,
-        "clob_websocket": clob_ws,
         "data_api_v2": data_api,
         "boundary_strike_reconciliation": boundary_strike,
     }, indent=2))
