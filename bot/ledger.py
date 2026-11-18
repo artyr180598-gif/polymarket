@@ -152,10 +152,12 @@ class Ledger:
         )
         self.conn.commit()
         row = self.conn.execute(
-            "SELECT id FROM telegram_outbox WHERE event_key = ?", (key,)
+            "SELECT id, message FROM telegram_outbox WHERE event_key = ?", (key,)
         ).fetchone()
         if row is None:
             raise RuntimeError("Telegram outbox insert could not be verified")
+        if str(row["message"]) != clean:
+            raise ValueError("Telegram outbox event_key collision with different message")
         return int(row["id"])
 
     def pending_telegram_notifications(self, limit: int = 500) -> List[Dict[str, Any]]:
@@ -229,14 +231,26 @@ class Ledger:
                 ),
             )
             fill_id = int(cur.lastrowid)
+            if bool(notification_message) != bool(notification_event_key):
+                raise ValueError("notification_message and notification_event_key must be supplied together")
             if notification_message and notification_event_key:
+                clean_message = str(notification_message).strip()[:3500]
+                event_key = str(notification_event_key).strip()
+                if not clean_message or not event_key:
+                    raise ValueError("Telegram outbox message and event_key are required")
                 cur.execute(
                     """
                     INSERT OR IGNORE INTO telegram_outbox (event_key, message, created_at)
                     VALUES (?, ?, ?)
                     """,
-                    (notification_event_key, str(notification_message).strip()[:3500], t),
+                    (event_key, clean_message, t),
                 )
+                existing = cur.execute(
+                    "SELECT message FROM telegram_outbox WHERE event_key = ?",
+                    (event_key,),
+                ).fetchone()
+                if existing is None or str(existing["message"]) != clean_message:
+                    raise ValueError("Telegram outbox event_key collision with different message")
             self.conn.commit()
             return fill_id
         except Exception:
@@ -278,18 +292,30 @@ class Ledger:
                 """,
                 rows,
             )
+            if bool(notification_message) != bool(notification_event_key):
+                raise ValueError("notification_message and notification_event_key must be supplied together")
             if notification_message and notification_event_key:
+                clean_message = str(notification_message).strip()[:3500]
+                event_key = str(notification_event_key).strip()
+                if not clean_message or not event_key:
+                    raise ValueError("Telegram outbox message and event_key are required")
                 self.conn.execute(
                     """
                     INSERT OR IGNORE INTO telegram_outbox (event_key, message, created_at)
                     VALUES (?, ?, ?)
                     """,
                     (
-                        notification_event_key,
-                        str(notification_message).strip()[:3500],
+                        event_key,
+                        clean_message,
                         float(fills[0].get("ts", time.time())),
                     ),
                 )
+                existing = self.conn.execute(
+                    "SELECT message FROM telegram_outbox WHERE event_key = ?",
+                    (event_key,),
+                ).fetchone()
+                if existing is None or str(existing["message"]) != clean_message:
+                    raise ValueError("Telegram outbox event_key collision with different message")
             self.conn.commit()
         except Exception:
             self.conn.rollback()
