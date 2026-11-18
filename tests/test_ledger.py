@@ -459,3 +459,31 @@ def test_consecutive_net_losses_include_fully_merged_markets(tmp_path) -> None:
     assert round(ledger.market_history("paper", 10)[0]["market_net_pnl"], 2) == -2.2
     assert ledger.consecutive_net_losses("paper") == 1
     ledger.conn.close()
+
+
+def test_telegram_outbox_survives_ledger_reopen_and_tracks_delivery(tmp_path) -> None:
+    db_path = str(tmp_path / "telegram-outbox.db")
+    first = Ledger(db_path)
+    notification_id = first.enqueue_telegram_notification(
+        "PAPER fill BTC Up: 5 shares", "stable-test-event"
+    )
+    first.mark_telegram_notification_attempt(notification_id, "telegram_send_failed")
+    pending_before_restart = first.pending_telegram_notifications()
+    assert len(pending_before_restart) == 1
+    assert pending_before_restart[0]["attempts"] == 1
+    assert pending_before_restart[0]["last_error"] == "telegram_send_failed"
+    first.conn.close()
+
+    reopened = Ledger(db_path)
+    restored = reopened.pending_telegram_notifications()
+    assert len(restored) == 1
+    assert restored[0]["id"] == notification_id
+    assert restored[0]["message"] == "PAPER fill BTC Up: 5 shares"
+    assert reopened.enqueue_telegram_notification(
+        "duplicate must not be created", "stable-test-event"
+    ) == notification_id
+    assert len(reopened.pending_telegram_notifications()) == 1
+
+    reopened.mark_telegram_notification_delivered(notification_id)
+    assert reopened.pending_telegram_notifications() == []
+    reopened.conn.close()
