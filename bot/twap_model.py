@@ -117,7 +117,6 @@ class AssetPriceTracker:
             self.basis_ema = price - self.cl_spot
 
     def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
-        epoch_sec = int(epoch_sec)
         # Use source timestamps, not rounded dictionary keys, to select the
         # closest sample to the exact market boundary.
         nearest = min(
