@@ -438,7 +438,7 @@ class TradingEngine:
                     # Chainlink TWAP60 sample at the exact window boundary. The
                     # frontend crypto-price openPrice is a separate reference and
                     # can differ; never substitute it for the settlement strike.
-                    ptb, ptb_source = _select_live_strike(ev)
+                    ptb, ptb_source = _select_closed_gamma_strike(ev)
                     fee_schedule = m.get("feeSchedule") or ev.get("feeSchedule") or {}
                     if isinstance(fee_schedule, str):
                         try:
