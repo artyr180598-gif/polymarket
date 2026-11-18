@@ -130,6 +130,7 @@ class TradingEngine:
         self._market_tokens_changed = asyncio.Event()
         self._market_feed_connected = False
         self._market_feed_last_event_mono = 0.0
+        self._risk_halt_active = False
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -731,12 +732,22 @@ class TradingEngine:
     async def _strategy_loop(self) -> None:
         while self.running:
             try:
-                if not self.paused and not self._risk_halted():
-                    for w in list(self.windows.values()):
-                        if w.resolved or w.remain_sec < 15:
-                            continue
-                        await self._run(w)
-                        await self._try_merge(w)
+                if not self.paused:
+                    halted = self._risk_halted()
+                    if halted:
+                        if not self._risk_halt_active:
+                            self._log_event("ALERT", "Достигнут лимит риска · maker-заявки отменены", notify=True)
+                        self._risk_halt_active = True
+                        if self.executor is not None:
+                            await self.executor.cancel_all()
+                    else:
+                        self._risk_halt_active = False
+                        for w in list(self.windows.values()):
+                            if w.resolved or w.remain_sec < 15:
+                                await self._cancel_window_maker_orders(w)
+                                continue
+                            await self._run(w)
+                            await self._try_merge(w)
             except Exception as e:
                 log.warning("strategy: %s", e)
             await asyncio.sleep(1.5)
@@ -1041,16 +1052,28 @@ class TradingEngine:
         if fee_up < 0 or fee_down < 0:
             return False
         combined_cost = size * (price_up + price_down) + fee_up + fee_down
-        window_exposure = w.up_cost + w.down_cost
+        reserved_total = sum(
+            order.price * order.remaining for order in self.executor.get_open_orders()
+        ) if self.executor is not None else 0.0
+        window_reserved = sum(
+            order.price * order.remaining
+            for token in (w.up_token, w.down_token)
+            for order in (self.executor.get_open_orders(token) if self.executor is not None else [])
+        )
+        window_exposure = w.up_cost + w.down_cost + window_reserved
         total_exposure = sum(
             max(0.0, item.up_cost) + max(0.0, item.down_cost)
             for item in self.windows.values() if not item.resolved
+        ) + reserved_total
+        available_cash = min(
+            self.cash,
+            self.executor.cash if self.executor is not None else self.cash,
         )
         if window_exposure + combined_cost > self.cfg.max_window_risk_usd:
             return False
         if total_exposure + combined_cost > self.cfg.max_total_exposure_usd:
             return False
-        if combined_cost > self.cash + 1e-9:
+        if combined_cost > available_cash + 1e-9:
             return False
         ts = time.time()
         fills = [
@@ -1098,20 +1121,33 @@ class TradingEngine:
         fee = float(fee or 0.0)
         if not (0.0 < price < 1.0) or size < 5.0 or fee < 0.0:
             return
-        window_exposure = w.up_cost + w.down_cost
+        reserved_total = sum(
+            order.price * order.remaining for order in self.executor.get_open_orders()
+        ) if self.executor is not None else 0.0
+        window_reserved = sum(
+            order.price * order.remaining
+            for token in (w.up_token, w.down_token)
+            for order in (self.executor.get_open_orders(token) if self.executor is not None else [])
+        )
+        window_exposure = w.up_cost + w.down_cost + window_reserved
         total_exposure = sum(
             max(0.0, item.up_cost) + max(0.0, item.down_cost)
             for item in self.windows.values() if not item.resolved
-        )
+        ) + reserved_total
         cost = price * size + fee
+        available_cash = min(
+            self.cash,
+            self.executor.cash if self.executor is not None else self.cash,
+        )
         if window_exposure + cost > self.cfg.max_window_risk_usd:
             return
         if total_exposure + cost > self.cfg.max_total_exposure_usd:
             return
-        if cost > self.cash:
-            affordable = max(0.0, self.cash / (price + calc_taker_fee_usdc(
+        if cost > available_cash:
+            fee_per_share = calc_taker_fee_usdc(
                 1.0, price, w.asset, w.timeframe, market_override_rate=w.fee_rate
-            )))
+            )
+            affordable = max(0.0, available_cash / (price + fee_per_share))
             size = math.floor(affordable * 100.0) / 100.0
             if size < 5.0:
                 return
@@ -1120,7 +1156,7 @@ class TradingEngine:
                 size, price, w.asset, w.timeframe, market_override_rate=w.fee_rate
             )
             cost = price * size + fee
-        if cost > self.cash + 1e-9:
+        if cost > available_cash + 1e-9:
             return
         fill = {
             "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
@@ -1138,6 +1174,8 @@ class TradingEngine:
             log.exception("PAPER fill was not persisted; refusing in-memory fill: %s", e)
             return
         self.cash -= cost
+        if self.executor is not None:
+            self.executor.cash -= cost
         self.fees_paid += fee
         if outcome == "Up":
             w.up_shares += size
@@ -1211,6 +1249,8 @@ class TradingEngine:
             w.up_fees = max(0.0, w.up_fees - up_fee_part)
             w.down_fees = max(0.0, w.down_fees - dn_fee_part)
             self.cash += pairs
+            if self.executor is not None:
+                self.executor.cash += pairs
             self.realized_pnl += locked
             self.day_pnl += net_locked
             self._merge_history.insert(0, {
@@ -1308,6 +1348,8 @@ class TradingEngine:
             log.exception("PAPER resolution was not persisted; market remains pending: %s", exc)
             return
         self.cash += payout
+        if self.executor is not None:
+            self.executor.cash += payout
         self.realized_pnl += gross
         self.day_pnl += net
         self.consecutive_losses = self.ledger.consecutive_net_losses(self.cfg.trading_mode)
