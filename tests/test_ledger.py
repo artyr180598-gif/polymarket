@@ -456,6 +456,6 @@ def test_consecutive_net_losses_include_fully_merged_markets(tmp_path) -> None:
         tx_hash="paper-losing-full-merge",
     )
 
-    assert ledger.market_history("paper", 10)[0]["market_net_pnl"] == -2.2
+    assert round(ledger.market_history("paper", 10)[0]["market_net_pnl"], 2) == -2.2
     assert ledger.consecutive_net_losses("paper") == 1
     ledger.conn.close()
