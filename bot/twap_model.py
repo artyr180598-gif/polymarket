@@ -69,6 +69,9 @@ class AssetPriceTracker:
 
     def on_chainlink_spot(self, price: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        # A delayed/out-of-order RTDS packet must never roll the live price back.
+        if ts < self.cl_spot_ts:
+            return
         now_m = time.monotonic()
         if self._last_vol_px is not None and ts > self._last_vol_ts:
             dt = ts - self._last_vol_ts
@@ -95,6 +98,9 @@ class AssetPriceTracker:
 
     def on_chainlink_twap60(self, twap_val: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        # Keep the latest source timestamp monotonic; do not regress the anchor.
+        if ts < self.cl_twap60_ts:
+            return
         self.cl_twap60 = twap_val
         self.cl_twap60_ts = ts
         self.cl_twap_recv_mono = time.monotonic()
@@ -110,6 +116,8 @@ class AssetPriceTracker:
 
     def on_binance_spot(self, price: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        if ts < self.bn_spot_ts:
+            return
         self.bn_spot = price
         self.bn_spot_ts = ts
         self.bn_recv_mono = time.monotonic()
