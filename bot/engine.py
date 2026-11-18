@@ -560,7 +560,7 @@ class TradingEngine:
                 return
 
     async def _open(self, w, outcome, price, size, reason, fee: float = 0.0, fair_prob: Optional[float] = None) -> None:
-        price = round(float(price), 2)
+        price = float(price)  # preserve exact CLOB tick price; never round a real quote
         size = round(float(size), 2)
         fee = float(fee or 0.0)
         if not (0.0 < price < 1.0) or size < 5.0 or fee < 0.0:
