@@ -74,7 +74,11 @@ def test_telegram_main_keyboard_exposes_history():
 
 def test_telegram_market_history_renders_net_pnl():
     engine = SimpleNamespace(
-        cfg=SimpleNamespace(trading_mode="paper"),
+        cfg=SimpleNamespace(
+            trading_mode="paper",
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
         ledger=SimpleNamespace(market_history=lambda mode, limit: [{
             "asset": "BTC",
             "timeframe": "5m",
