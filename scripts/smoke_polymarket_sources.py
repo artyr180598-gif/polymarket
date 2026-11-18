@@ -140,7 +140,7 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
 async def check_open_price_reference_vs_gamma_ptb(
     session: aiohttp.ClientSession,
     current_start_ts: int,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     # Use a market that closed at least 25 minutes ago so Gamma has time to
     # publish the settled priceToBeat field.
     start_ts = current_start_ts - 1800
