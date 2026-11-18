@@ -103,15 +103,15 @@ def test_daily_net_pnl_deducts_fees_exactly_once(tmp_path) -> None:
 def test_market_win_rate_includes_merge_pnl_after_all_fees(tmp_path) -> None:
     ledger = Ledger(str(tmp_path / "paper.db"))
     slug = "btc-updown-5m-1795035600"
-    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.40, fee=0.10)
-    _record_buy(ledger, slug=slug, outcome="Down", shares=10, price=0.50, fee=0.10)
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.01, fee=0.10)
+    _record_buy(ledger, slug=slug, outcome="Down", shares=10, price=0.01, fee=0.10)
     ledger.record_merge(
         mode="paper",
         slug=slug,
         condition_id="0x" + "1" * 64,
         pairs=5,
-        cost_basis=4.50,
-        locked_pnl=1.00,
+        cost_basis=0.10,
+        locked_pnl=4.90,
         tx_hash="paper-test-merge",
     )
     ledger.record_resolution(
@@ -126,7 +126,7 @@ def test_market_win_rate_includes_merge_pnl_after_all_fees(tmp_path) -> None:
         up_shares_total=5,
         down_shares_total=5,
         merged_pairs=5,
-        gross_cost=4.50,
+        gross_cost=0.10,
         total_fees=0.20,
         total_payout=0.0,
     )
