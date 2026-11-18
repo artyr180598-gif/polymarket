@@ -105,6 +105,16 @@ class Ledger:
                 realized_net_pnl REAL NOT NULL,
                 fees_paid REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS telegram_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                message TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at REAL,
+                last_error TEXT
+            );
             """
         )
         # Additive migrations for auditable settlement-anchor verification.
@@ -122,6 +132,62 @@ class Ledger:
                 self.conn.execute(
                     f"ALTER TABLE resolutions ADD COLUMN {column} {definition}"
                 )
+        self.conn.commit()
+
+    def enqueue_telegram_notification(self, message: str, event_key: str) -> int:
+        """Persist a Telegram event before attempting delivery."""
+        clean = str(message or "").strip()[:3500]
+        key = str(event_key or "").strip()
+        if not clean or not key:
+            raise ValueError("Telegram outbox message and event_key are required")
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO telegram_outbox (event_key, message, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (key, clean, time.time()),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT id FROM telegram_outbox WHERE event_key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Telegram outbox insert could not be verified")
+        return int(row["id"])
+
+    def pending_telegram_notifications(self, limit: int = 500) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, event_key, message, created_at, attempts, last_error
+            FROM telegram_outbox
+            WHERE delivered_at IS NULL
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 5000)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_telegram_notification_attempt(self, notification_id: int, error: str = "") -> None:
+        self.conn.execute(
+            """
+            UPDATE telegram_outbox
+            SET attempts = attempts + 1, last_error = ?
+            WHERE id = ? AND delivered_at IS NULL
+            """,
+            (str(error or "delivery_failed")[:500], int(notification_id)),
+        )
+        self.conn.commit()
+
+    def mark_telegram_notification_delivered(self, notification_id: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE telegram_outbox
+            SET delivered_at = ?, last_error = NULL
+            WHERE id = ? AND delivered_at IS NULL
+            """,
+            (time.time(), int(notification_id)),
+        )
         self.conn.commit()
 
     def record_fill(
