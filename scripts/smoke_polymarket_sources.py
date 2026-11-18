@@ -10,9 +10,6 @@ from typing import Any
 
 import aiohttp
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bot.market_feed import PolymarketMarketFeed
-from bot.oracle_feed import PolymarketOracleFeed
 
 WALLET = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
 
