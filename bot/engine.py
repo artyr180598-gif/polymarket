@@ -44,7 +44,7 @@ class WindowState:
 
     @property
     def remain_sec(self) -> float:
-        return max(0.0, self.end_ts - time.time())
+        return self.end_ts - time.time()
 
     @property
     def net_shares(self) -> float:
@@ -654,9 +654,9 @@ class TradingEngine:
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
         if gross >= 0:
-            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\\nПрибыль: <b>${gross:+.2f}</b>\\n<code>{w.slug}</code>"
+            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\nПрибыль: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
         else:
-            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\\nУбыток: <b>${gross:+.2f}</b>\\n<code>{w.slug}</code>"
+            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\nУбыток: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
         self._log_event("INFO", msg, notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
