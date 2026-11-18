@@ -36,3 +36,23 @@ def test_duplicate_taker_rows_are_subtracted_as_a_multiset() -> None:
     )
     assert [row["execution_role"] for row in classified] == ["TAKER", "TAKER", "MAKER"]
     assert unmatched == 0
+
+
+
+def test_build_analysis_accepts_unpacked_trade_rows() -> None:
+    from scripts.analyze_target_wallet import build_analysis
+
+    taker = _row("0xabc", "5", "0.41")
+    maker = _row("0xdef", "3", "0.40")
+    analysis = build_analysis(
+        [taker, maker],
+        [taker],
+        [{"type": "TRADE", "usdc_size": "3.25"}],
+        {"volume": 8},
+        {"points": []},
+        {"all_roles_trades": 2, "taker_only_trades": 1, "activity": 1},
+    )
+    assert analysis["trade_summary"]["fills"] == 2
+    assert analysis["trade_summary"]["maker_fills"] == 1
+    assert analysis["trade_summary"]["taker_fills"] == 1
+    assert analysis["data_quality"]["pagination_pages"]["all_roles_trades"] == 2
