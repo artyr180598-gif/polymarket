@@ -207,6 +207,21 @@ class TradingEngine:
                 f"Down {window.down_shares:.2f}",
             )
 
+    def _oracle_fresh(self) -> bool:
+        if not self.trackers:
+            return False
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        return all(
+            tracker.cl_spot is not None
+            and tracker.cl_twap60 is not None
+            and now_mono - tracker.cl_recv_mono <= 5.0
+            and now_mono - tracker.cl_twap_recv_mono <= 5.0
+            and now_epoch - tracker.cl_spot_ts <= 5.0
+            and now_epoch - tracker.cl_twap60_ts <= 5.0
+            for tracker in self.trackers.values()
+        )
+
     async def _polymarket_oracle_loop(self) -> None:
         """Consume Polymarket's own Chainlink spot and settlement TWAP60 stream."""
         delay = 1.0
@@ -227,15 +242,7 @@ class TradingEngine:
                     elif kind == "chainlink_twap60":
                         tracker.on_chainlink_twap60(price, ts_ms)
                     self._oracle_last_event_ts = time.time()
-                    fresh = all(
-                        t.cl_spot is not None
-                        and t.cl_twap60 is not None
-                        and time.monotonic() - t.cl_recv_mono <= 5.0
-                        and time.monotonic() - t.cl_twap_recv_mono <= 5.0
-                        and time.time() - t.cl_spot_ts <= 5.0
-                        and time.time() - t.cl_twap60_ts <= 5.0
-                        for t in self.trackers.values()
-                    )
+                    fresh = self._oracle_fresh()
                     self._oracle_connected = fresh
                     self._price_ok = fresh
                     self._streams_ok = fresh
@@ -439,6 +446,7 @@ class TradingEngine:
             or now_mono - tr.cl_twap_recv_mono > 5.0
             or time.time() - tr.cl_spot_ts > 5.0
             or time.time() - tr.cl_twap60_ts > 5.0
+            or tr._vol_samples < 60
         ):
             return
         if w.price_to_beat is None:
@@ -817,8 +825,9 @@ class TradingEngine:
             "events": self.events[-40:],
             "fee_regime": fee_regime_label(),
             "assets": self.cfg.enabled_assets,
-            "streams_ok": self._price_ok,
-            "oracle_connected": self._oracle_connected,
+            "streams_ok": self._oracle_fresh(),
+            "oracle_connected": self._oracle_fresh(),
+            "model_ready": all(t._vol_samples >= 60 for t in self.trackers.values()),
             "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
             "oracle_last_event_ts": self._oracle_last_event_ts,
             "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
