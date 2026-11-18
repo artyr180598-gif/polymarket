@@ -294,11 +294,11 @@ class TelegramController:
 
     def _fmt_help(self) -> str:
         return (
-            "ℹ️ <b>Текущий PAPER-прототип</b>\\n━━━━━━━━━━━━━━━━\\n"
-            "• Котировки исходов: реальный Polymarket CLOB\\n"
-            "• Settlement-сигнал: Polymarket RTDS Chainlink spot + TWAP60\\n"
-            "• Победитель: только официальный Polymarket Data API resolution\\n"
-            "• Покупки и MERGE пока виртуальные, не транзакции\\n\\n"
+            "ℹ️ <b>Текущий PAPER-прототип</b>\n━━━━━━━━━━━━━━━━\n"
+            "• Котировки исходов: реальный Polymarket CLOB\n"
+            "• Settlement-сигнал: Polymarket RTDS Chainlink spot + TWAP60\n"
+            "• Победитель: только официальный Polymarket Data API resolution\n"
+            "• Покупки и MERGE пока виртуальные, не транзакции\n\n"
             "Важно: это ещё не точная копия mo-money. Его Post-Only Maker, очередь, отмены, частичные исполнения и rebates ещё нужно реализовать и проверить."
         )
 
