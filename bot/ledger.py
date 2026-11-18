@@ -365,6 +365,26 @@ class Ledger:
             "day_net_pnl": float(stats.get("today_total_net_pnl", 0.0)),
         }
 
+    def fees_for_market(self, mode: str, slug: str) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(fee), 0) AS fees FROM fills WHERE mode = ? AND slug = ?",
+            (mode, slug),
+        ).fetchone()
+        return float(row["fees"] or 0.0)
+
+    def consecutive_net_losses(self, mode: str) -> int:
+        rows = self.conn.execute(
+            "SELECT net_pnl FROM resolutions WHERE mode = ? ORDER BY ts DESC, id DESC",
+            (mode,),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if float(row["net_pnl"]) < 0:
+                count += 1
+            else:
+                break
+        return count
+
     def recent_fills(self, mode: str, limit: int = 30) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM fills WHERE mode = ? ORDER BY id DESC LIMIT ?",
