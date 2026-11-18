@@ -1,9 +1,4 @@
-"""TradingEngine — Polymarket Up/Down paper/live trading.
-
-Сделки только на Polymarket (CLOB Up/Down).
-Chainlink TWAP60 — источник резолва окон.
-Binance spot — только lead-lag сигнал для fair value (не биржа сделок).
-"""
+"""TradingEngine — Polymarket Up/Down paper/live trading."""
 
 from __future__ import annotations
 
@@ -121,11 +116,12 @@ class TradingEngine:
         else:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо-счёт ${self.cfg.bankroll_usd:.0f} · сделки на Polymarket (paper)", notify=True)
+            self._log_event("INFO", f"Демо-счёт ${self.cfg.bankroll_usd:.0f} · Polymarket paper", notify=True)
 
         self.running = True
         self._tasks = [
             asyncio.create_task(self._price_loop(), name="prices"),
+            asyncio.create_task(self._rest_price_loop(), name="rest_prices"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
@@ -164,12 +160,11 @@ class TradingEngine:
         for w in list(self.windows.values()):
             if w.mergeable_pairs >= 1.0 and not w.merge_in_flight:
                 merged += await self._execute_merge(w)
-        self._log_event("ALERT", f"СТОП: ордеров {canceled}, merge ${merged:.2f}", notify=True)
+        self._log_event("ALERT", f"СТОП: {canceled} / merge ${merged:.2f}", notify=True)
         return {"canceled": canceled, "merged_usd": round(merged, 2)}
 
     async def _price_loop(self) -> None:
         if not HAS_POLY:
-            self._log_event("WARNING", "polymarket-client не установлен", notify=True)
             while self.running:
                 await asyncio.sleep(20)
             return
@@ -188,7 +183,7 @@ class TradingEngine:
                 self._streams_ok = True
                 backoff = 3.0
                 if not notified:
-                    self._log_event("INFO", "Цены подключены (Chainlink TWAP = резолв окон Polymarket)", notify=True)
+                    self._log_event("INFO", "Цены подключены (Chainlink TWAP = резолв Polymarket)", notify=True)
                     notified = True
                 async for ev in client.stream(specs):
                     if not self.running:
@@ -217,6 +212,53 @@ class TradingEngine:
                 log.warning("stream reconnect in %.0fs: %s", backoff, e)
                 await asyncio.sleep(backoff)
                 backoff = min(90.0, backoff * 1.8)
+
+    async def _rest_price_loop(self) -> None:
+        """REST fallback for fair/PTB when RTDS is silent. Trades still on Polymarket."""
+        sym_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+        while self.running:
+            try:
+                now = time.time()
+                for asset, symbol in sym_map.items():
+                    if asset not in self.trackers:
+                        continue
+                    tr = self.trackers[asset]
+                    last = max(getattr(tr, "cl_spot_ts", 0) or 0, getattr(tr, "cl_twap60_ts", 0) or 0)
+                    if last and (now - last) < 8.0:
+                        continue
+                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+                    timeout = aiohttp.ClientTimeout(total=8)
+                    async with aiohttp.ClientSession(timeout=timeout) as s:
+                        async with s.get(url) as r:
+                            if r.status != 200:
+                                continue
+                            data = await r.json()
+                            px = float(data.get("price") or 0)
+                            if px <= 0:
+                                continue
+                            ts_ms = int(now * 1000)
+                            tr.on_binance_spot(px, ts_ms)
+                            if tr.cl_spot is None:
+                                tr.on_chainlink_spot(px, ts_ms)
+                            if tr.cl_twap60 is None:
+                                tr.on_chainlink_twap60(px, ts_ms)
+                            self._capture_boundary(asset, now, px)
+                for w in list(self.windows.values()):
+                    if w.price_to_beat is None and not w.resolved:
+                        tr = self.trackers.get(w.asset)
+                        if not tr:
+                            continue
+                        ptb = tr.lookup_twap_at(int(w.start_ts), max_diff_sec=30.0)
+                        if ptb is None and tr.cl_spot:
+                            ptb = tr.cl_spot
+                        if ptb is None and tr.cl_twap60:
+                            ptb = tr.cl_twap60
+                        if ptb:
+                            w.price_to_beat = float(ptb)
+                            self._log_event("INFO", f"{w.slug}: PTB=${ptb:,.2f}")
+            except Exception as e:
+                log.debug("rest prices: %s", e)
+            await asyncio.sleep(3.0)
 
     def _capture_boundary(self, asset: str, ts: float, twap_val: float) -> None:
         for w in self.windows.values():
@@ -268,7 +310,7 @@ class TradingEngine:
                         price_to_beat=meta.get("price_to_beat"),
                     )
                     if w.price_to_beat is None:
-                        ptb = self.trackers[asset].lookup_twap_at(float(start), max_diff_sec=15.0)
+                        ptb = self.trackers[asset].lookup_twap_at(int(start), max_diff_sec=15.0)
                         if ptb:
                             w.price_to_beat = ptb
                     self.windows[slug] = w
@@ -332,51 +374,80 @@ class TradingEngine:
         return False
 
     async def _run_strategies(self, w: WindowState) -> None:
+        tr = self.trackers[w.asset]
         if w.price_to_beat is None:
-            ptb = self.trackers[w.asset].lookup_twap_at(w.start_ts, max_diff_sec=20.0)
-            if ptb:
-                w.price_to_beat = ptb
-            else:
-                tr = self.trackers[w.asset]
-                if tr.cl_spot and w.remain_sec > 60:
-                    w.price_to_beat = tr.cl_spot
-                else:
-                    return
-        fv = self.trackers[w.asset].compute_fair_value(w.price_to_beat, w.end_ts)
+            ptb = tr.lookup_twap_at(int(w.start_ts), max_diff_sec=30.0)
+            if ptb is None and tr.cl_twap60 is not None:
+                ptb = tr.cl_twap60
+            if ptb is None and tr.cl_spot is not None:
+                ptb = tr.cl_spot
+            if ptb is None:
+                return
+            w.price_to_beat = float(ptb)
+
+        if tr.cl_spot is None and tr.cl_twap60 is not None:
+            tr.cl_spot = tr.cl_twap60
+            tr.cl_spot_ts = time.time()
+        if tr.cl_spot is None:
+            return
+
+        try:
+            fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
+        except Exception as e:
+            log.debug("fair error: %s", e)
+            return
+
         p = self.params
         tau = w.remain_sec
-        if time.monotonic() - w.last_trade_mono < 8.0:
+        if time.monotonic() - w.last_trade_mono < 10.0:
             return
-        ask_up = w.best_ask_up if 0.01 < w.best_ask_up < 0.99 else min(0.98, round(fv.prob_up + 0.03, 2))
-        bid_up = w.best_bid_up if 0.01 < w.best_bid_up < 0.99 else max(0.02, round(fv.prob_up - 0.03, 2))
+
+        has_book = 0.02 < w.best_ask_up < 0.98
+        our_bid = round(max(0.05, fv.prob_up - getattr(p, "min_maker_edge", 0.024)), 2)
 
         if getattr(p, "enable_lockin", True) and tau <= getattr(p, "lockin_start_remain_sec", 120):
-            if fv.prob_up >= getattr(p, "lockin_min_prob", 0.99):
+            if fv.prob_up >= getattr(p, "lockin_min_prob", 0.97):
                 bid = min(getattr(p, "lockin_max_bid", 0.98), round(fv.prob_up - 0.01, 2))
-                if bid >= 0.94 and w.up_shares < 40:
+                if bid >= 0.90 and w.up_shares < 40:
                     size = max(5.0, round(self.cfg.order_clip_usd / bid, 2))
                     await self._open_position(w, "Up", bid, size, "lockin")
                     return
+            if fv.prob_up <= (1.0 - getattr(p, "lockin_min_prob", 0.97)):
+                bid = min(0.98, round((1.0 - fv.prob_up) - 0.01, 2))
+                if bid >= 0.90 and w.down_shares < 40:
+                    size = max(5.0, round(self.cfg.order_clip_usd / bid, 2))
+                    await self._open_position(w, "Down", bid, size, "lockin")
+                    return
 
         if getattr(p, "enable_maker", True) and tau >= getattr(p, "maker_start_sec", 6):
-            edge = fv.prob_up - ask_up
-            lo = getattr(p, "maker_min_price", 0.30)
-            hi = getattr(p, "maker_max_price", 0.89)
-            if edge >= getattr(p, "min_maker_edge", 0.024) and lo <= fv.prob_up <= hi:
-                px = min(round(fv.prob_up - 0.005, 2), bid_up + 0.01, ask_up - 0.01)
-                if px >= lo and w.up_shares < 50:
-                    size = max(5.0, round(self.cfg.order_clip_usd / max(px, 0.05), 2))
-                    await self._open_position(w, "Up", px, size, "maker_entry")
-                    return
+            lo = getattr(p, "maker_min_price", 0.25)
+            hi = getattr(p, "maker_max_price", 0.90)
+            if lo <= our_bid <= hi and fv.prob_up >= 0.55 and w.up_shares < 45:
+                size = max(5.0, round(self.cfg.order_clip_usd / max(our_bid, 0.05), 2))
+                await self._open_position(w, "Up", our_bid, size, "maker_entry")
+                return
+            fair_down = 1.0 - fv.prob_up
+            our_bid_dn = round(max(0.05, fair_down - getattr(p, "min_maker_edge", 0.024)), 2)
+            if lo <= our_bid_dn <= hi and fair_down >= 0.55 and w.down_shares < 45:
+                size = max(5.0, round(self.cfg.order_clip_usd / max(our_bid_dn, 0.05), 2))
+                await self._open_position(w, "Down", our_bid_dn, size, "maker_entry")
+                return
+
             if w.up_shares >= 5 and w.down_shares < w.up_shares - 0.5:
                 target = 1.0 - w.entry_vwap_up - getattr(p, "take_profit_edge", 0.015)
-                if target > 0.05:
-                    need = round(w.up_shares - w.down_shares, 2)
-                    if need >= 5:
-                        await self._open_position(w, "Down", min(round(target, 2), 0.97), need, "syn_tp")
-                        return
+                need = round(w.up_shares - w.down_shares, 2)
+                if target > 0.05 and need >= 5:
+                    await self._open_position(w, "Down", min(round(target, 2), 0.97), need, "syn_tp")
+                    return
+            if w.down_shares >= 5 and w.up_shares < w.down_shares - 0.5:
+                vwap_dn = w.down_cost / w.down_shares if w.down_shares else 0.5
+                target = 1.0 - vwap_dn - getattr(p, "take_profit_edge", 0.015)
+                need = round(w.down_shares - w.up_shares, 2)
+                if target > 0.05 and need >= 5:
+                    await self._open_position(w, "Up", min(round(target, 2), 0.97), need, "syn_tp")
+                    return
 
-        if getattr(p, "enable_taker", True) and 12 <= tau <= 240 and 0.05 < w.best_ask_up < 0.95:
+        if getattr(p, "enable_taker", True) and has_book and 12 <= tau <= 240:
             fee_ps = calc_taker_fee_per_share(w.best_ask_up, w.asset, w.timeframe)
             net = fv.prob_up - w.best_ask_up - fee_ps
             min_e = getattr(p, "min_taker_net_edge_btc", 0.038) if w.asset == "BTC" else getattr(p, "min_taker_net_edge_alt", 0.024)
@@ -484,7 +555,7 @@ class TradingEngine:
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
         if winner is None and w.price_to_beat is not None:
-            tw = self.trackers[w.asset].twap60
+            tw = self.trackers[w.asset].twap60 if hasattr(self.trackers[w.asset], "twap60") else self.trackers[w.asset].cl_twap60
             if tw is not None and w.remain_sec <= 0:
                 winner = "Up" if tw >= w.price_to_beat else "Down"
         if winner is None:
@@ -529,7 +600,11 @@ class TradingEngine:
             fair = None
             if w.price_to_beat is not None:
                 try:
-                    fair = self.trackers[w.asset].compute_fair_value(w.price_to_beat, w.end_ts).prob_up
+                    tr = self.trackers[w.asset]
+                    if tr.cl_spot is None and tr.cl_twap60 is not None:
+                        tr.cl_spot = tr.cl_twap60
+                    if tr.cl_spot is not None:
+                        fair = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts)).prob_up
                 except Exception:
                     pass
             windows.append({
