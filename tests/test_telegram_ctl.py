@@ -308,9 +308,12 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
         cfg=SimpleNamespace(
             telegram_bot_token="test-token",
             telegram_chat_id="123",
-        )
+        ),
+        paused=False,
+        _notification_channel_ready=True,
     )
     controller = TelegramController(engine)
+    controller._startup_acknowledged = True
 
     class TemporarilyUnavailableSession:
         def __init__(self):
@@ -326,6 +329,8 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
 
     assert len(controller._pending_notifications) == 1
     assert unavailable.calls == 2  # HTML attempt plus plain-text fallback
+    assert engine.paused is True
+    assert engine._notification_channel_ready is False
 
     class RecoveredSession:
         def __init__(self):
@@ -342,6 +347,8 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
     assert controller._pending_notifications == []
     assert len(recovered.calls) == 1
     assert "PAPER MAKER fill BTC Up" in recovered.calls[0][1]["text"]
+    assert engine._notification_channel_ready is True
+    assert engine.paused is True  # delivery recovery never auto-resumes trading
 
 
 
