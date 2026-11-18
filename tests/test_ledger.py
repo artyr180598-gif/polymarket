@@ -135,3 +135,27 @@ def test_market_win_rate_includes_merge_pnl_after_all_fees(tmp_path) -> None:
     assert stats["win_markets"] == 1
     assert stats["win_rate_pct"] == 100.0
     assert ledger.consecutive_net_losses("paper") == 0
+
+
+
+def test_atomic_pair_fill_persists_both_legs_together(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "paper.db"))
+    common = {
+        "mode": "paper",
+        "slug": "btc-updown-5m-1795035600",
+        "condition_id": "0x" + "1" * 64,
+        "asset": "BTC",
+        "timeframe": "5m",
+        "role": "TAKER_CLOB",
+        "reason": "pair_arb",
+        "shares": 5,
+        "fee": 0.02,
+        "fair_prob": 0.5,
+    }
+    ledger.record_fills_atomic([
+        {**common, "outcome": "Up", "price": 0.48},
+        {**common, "outcome": "Down", "price": 0.49},
+    ])
+    fills = ledger.recent_fills("paper", 10)
+    assert len(fills) == 2
+    assert {row["outcome"] for row in fills} == {"Up", "Down"}
