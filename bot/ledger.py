@@ -215,10 +215,11 @@ class Ledger:
                 COALESCE(SUM(notional), 0) AS total_notional,
                 COALESCE(SUM(CASE WHEN role='MAKER' THEN notional ELSE 0 END), 0) AS maker_notional,
                 COALESCE(SUM(fee), 0) AS total_fees,
+                COALESCE(SUM(CASE WHEN ts >= ? THEN fee ELSE 0 END), 0) AS today_fees,
                 COALESCE(SUM(shares * price * (1.0 - price)), 0) AS weighted_vol
             FROM fills WHERE mode = ?
             """,
-            (mode,),
+            (today_start, mode),
         ).fetchone()
 
         r_row = self.conn.execute(
@@ -237,10 +238,11 @@ class Ledger:
         m_row = self.conn.execute(
             """
             SELECT COUNT(*) AS merge_count, COALESCE(SUM(pairs), 0) AS merged_usd,
-                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl
+                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl,
+                   COALESCE(SUM(CASE WHEN ts >= ? THEN locked_pnl ELSE 0 END), 0) AS today_merged_pnl
             FROM merges WHERE mode = ?
             """,
-            (mode,),
+            (today_start, mode),
         ).fetchone()
 
         total_fills = int(f_row["total_fills"])
@@ -261,6 +263,18 @@ class Ledger:
             "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
             "realized_net_pnl": round(float(r_row["net_pnl"]), 2),
             "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
+            "today_merged_pnl": round(float(m_row["today_merged_pnl"]), 2),
+            "today_fees": round(float(f_row["today_fees"]), 4),
+            "today_total_net_pnl": round(
+                float(r_row["today_net_pnl"])
+                + float(m_row["today_merged_pnl"])
+                - float(f_row["today_fees"]), 2
+            ),
+            "lifetime_total_net_pnl": round(
+                float(r_row["gross_pnl"])
+                + float(m_row["merged_pnl"])
+                - float(f_row["total_fees"]), 2
+            ),
             "merge_count": int(m_row["merge_count"]),
             "merged_usd": round(float(m_row["merged_usd"]), 2),
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
