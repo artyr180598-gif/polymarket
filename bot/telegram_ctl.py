@@ -152,9 +152,11 @@ class TelegramController:
         running = st.get("running")
         paused = st.get("paused")
         market_data_ready = bool(st.get("streams_ok"))
-        state_emoji = "🟢" if running and market_data_ready else ("🟠" if running else ("⏸" if paused else "⏹"))
+        model_ready = bool(st.get("model_ready"))
+        state_emoji = "🟢" if running and market_data_ready and model_ready else ("🟠" if running else ("⏸" if paused else "⏹"))
         state_txt = (
-            "торгует" if running and market_data_ready
+            "PAPER готов к сигналам" if running and market_data_ready and model_ready
+            else "накапливает данные" if running and market_data_ready
             else "ожидает Chainlink" if running
             else "пауза" if paused
             else "остановлен"
@@ -171,6 +173,8 @@ class TelegramController:
             f"Стратегия: <b>{preset_title}</b>",
             f"Режим: <b>{mode}</b>",
             "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
+            f"Oracle RTDS: <b>{'OK' if market_data_ready else 'нет свежих данных'}</b>",
+            f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
             f"",
             f"💵 Equity: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
