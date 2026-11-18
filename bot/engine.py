@@ -1,4 +1,4 @@
-"""TradingEngine — mo-money style: pair arb + balanced maker on real 5m windows."""
+"""TradingEngine — honest paper: real Gamma windows + real CLOB asks + Coinbase spot."""
 
 from __future__ import annotations
 
@@ -53,10 +53,6 @@ class WindowState:
     def mergeable_pairs(self) -> float:
         return min(self.up_shares, self.down_shares)
 
-    @property
-    def entry_vwap_up(self) -> float:
-        return self.up_cost / self.up_shares if self.up_shares > 0 else 0.0
-
 
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
@@ -107,7 +103,7 @@ class TradingEngine:
         else:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · стратегия mo-money (пара+maker)", notify=True)
+            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · цены только из CLOB Polymarket", notify=True)
         self.running = True
         self._tasks = [
             asyncio.create_task(self._rest_price_loop(), name="prices"),
@@ -115,7 +111,7 @@ class TradingEngine:
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
         ]
-        self._log_event("INFO", f"Старт · {self.cfg.trading_mode} · {self.cfg.strategy_preset}", notify=True)
+        self._log_event("INFO", f"Старт · {self.cfg.trading_mode} · honest CLOB paper", notify=True)
 
     async def stop(self) -> None:
         self.running = False
@@ -218,7 +214,7 @@ class TradingEngine:
                     self._price_ok = True
                     self._streams_ok = True
                     if not notified:
-                        self._log_event("INFO", "Цены OK (Coinbase/Kraken)", notify=True)
+                        self._log_event("INFO", "Spot OK (Coinbase/Kraken) + CLOB asks", notify=True)
                         notified = True
             except Exception as e:
                 log.warning("prices: %s", e)
@@ -294,7 +290,29 @@ class TradingEngine:
                             ptb = float(md["priceToBeat"])
                         except Exception:
                             pass
-                    return {"condition_id": str(m.get("conditionId") or ""), "up_token": str(ids[0]), "down_token": str(ids[1]), "price_to_beat": ptb}
+                    return {
+                        "condition_id": str(m.get("conditionId") or ""),
+                        "up_token": str(ids[0]),
+                        "down_token": str(ids[1]),
+                        "price_to_beat": ptb,
+                    }
+        except Exception:
+            return None
+
+    async def _clob_best_ask(self, token_id: str) -> Optional[float]:
+        """Real Polymarket CLOB best ask — price to BUY now."""
+        if not token_id:
+            return None
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                url = f"https://clob.polymarket.com/price?token_id={token_id}&side=BUY"
+                async with s.get(url) as r:
+                    if r.status != 200:
+                        return None
+                    d = await r.json()
+                    px = d.get("price")
+                    return float(px) if px is not None else None
         except Exception:
             return None
 
@@ -309,7 +327,7 @@ class TradingEngine:
                         await self._try_merge(w)
             except Exception as e:
                 log.warning("strategy: %s", e)
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.5)
 
     def _risk_halted(self) -> bool:
         if self.day_pnl <= -self.cfg.max_daily_loss_usd:
@@ -319,12 +337,11 @@ class TradingEngine:
         return False
 
     async def _run(self, w: WindowState) -> None:
-        """mo-money: pair arb if Up+Down<0.98; else balanced maker; lock-in near end."""
+        """Honest paper: entries only at REAL CLOB best-ask."""
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
-        twap = getattr(tr, "cl_twap60", None)
         if w.price_to_beat is None:
-            w.price_to_beat = spot or twap
+            w.price_to_beat = spot or getattr(tr, "cl_twap60", None)
         if w.price_to_beat is None or spot is None:
             return
         try:
@@ -332,79 +349,87 @@ class TradingEngine:
         except Exception:
             return
 
-        p = self.params
         tau = w.remain_sec
         fair_up = float(fv.prob_up)
         fair_dn = 1.0 - fair_up
-        edge = max(0.025, float(getattr(p, "min_maker_edge", 0.03)))
+        edge = 0.03
         clip = max(8.0, float(self.cfg.order_clip_usd))
         max_side = 35.0
 
-        if time.monotonic() - w.last_trade_mono < 15.0:
+        if time.monotonic() - w.last_trade_mono < 18.0:
             return
-        if tau < 10:
+        if tau < 12:
             return
 
-        # Lock-in last 90s
-        if getattr(p, "enable_lockin", True) and tau <= 90:
-            if fair_up >= 0.96 and w.up_shares < max_side:
-                px = min(0.97, round(fair_up - 0.01, 2))
-                if px >= 0.90:
-                    await self._open(w, "Up", px, max(5.0, round(clip / px, 2)), "lockin")
-                    return
-            if fair_dn >= 0.96 and w.down_shares < max_side:
-                px = min(0.97, round(fair_dn - 0.01, 2))
-                if px >= 0.90:
-                    await self._open(w, "Down", px, max(5.0, round(clip / px, 2)), "lockin")
-                    return
+        ask_up = await self._clob_best_ask(w.up_token)
+        ask_dn = await self._clob_best_ask(w.down_token)
+        if ask_up is None and ask_dn is None:
+            return
 
-        bid_up = round(max(0.05, min(0.90, fair_up - edge)), 2)
-        bid_dn = round(max(0.05, min(0.90, fair_dn - edge)), 2)
+        # Pair arb on REAL asks
+        if (
+            ask_up is not None and ask_dn is not None
+            and ask_up + ask_dn <= 0.98
+            and w.up_shares < max_side and w.down_shares < max_side
+            and abs(w.net_shares) < 8
+        ):
+            sz = max(5.0, round(clip / max(ask_up, ask_dn), 2))
+            await self._open(w, "Up", float(ask_up), sz, "pair_arb")
+            await self._open(w, "Down", float(ask_dn), sz, "pair_arb")
+            await self._try_merge(w)
+            return
 
-        # Pair arb: both sides if combined < 0.975
-        if bid_up + bid_dn <= 0.975 and w.up_shares < max_side and w.down_shares < max_side:
-            sz = max(5.0, round(clip / max(bid_up, bid_dn), 2))
-            if abs(w.net_shares) < 8:
-                await self._open(w, "Up", bid_up, sz, "pair_arb")
-                await self._open(w, "Down", bid_dn, sz, "pair_arb")
-                await self._try_merge(w)
-                return
-
-        # Complete pair if inventory skewed
-        if w.up_shares >= 8 and w.down_shares < w.up_shares:
+        if w.up_shares >= 8 and w.down_shares < w.up_shares and ask_dn is not None:
             vwap_up = w.up_cost / max(w.up_shares, 1e-9)
-            target_dn = round(min(0.90, max(0.05, 0.97 - vwap_up)), 2)
-            need = round(w.up_shares - w.down_shares, 2)
-            if need >= 5 and target_dn + vwap_up <= 0.98:
-                await self._open(w, "Down", target_dn, need, "syn_tp")
-                await self._try_merge(w)
-                return
-        if w.down_shares >= 8 and w.up_shares < w.down_shares:
+            if ask_dn + vwap_up <= 0.985:
+                need = round(w.up_shares - w.down_shares, 2)
+                if need >= 5:
+                    await self._open(w, "Down", float(ask_dn), need, "syn_tp")
+                    await self._try_merge(w)
+                    return
+        if w.down_shares >= 8 and w.up_shares < w.down_shares and ask_up is not None:
             vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
-            target_up = round(min(0.90, max(0.05, 0.97 - vwap_dn)), 2)
-            need = round(w.down_shares - w.up_shares, 2)
-            if need >= 5 and target_up + vwap_dn <= 0.98:
-                await self._open(w, "Up", target_up, need, "syn_tp")
-                await self._try_merge(w)
+            if ask_up + vwap_dn <= 0.985:
+                need = round(w.down_shares - w.up_shares, 2)
+                if need >= 5:
+                    await self._open(w, "Up", float(ask_up), need, "syn_tp")
+                    await self._try_merge(w)
+                    return
+
+        if tau <= 90:
+            if fair_up >= 0.96 and ask_up is not None and ask_up <= 0.97 and w.up_shares < max_side:
+                await self._open(w, "Up", float(ask_up), max(5.0, round(clip / ask_up, 2)), "lockin")
+                return
+            if fair_dn >= 0.96 and ask_dn is not None and ask_dn <= 0.97 and w.down_shares < max_side:
+                await self._open(w, "Down", float(ask_dn), max(5.0, round(clip / ask_dn, 2)), "lockin")
                 return
 
-        # Single-side maker: only one side per tick, prefer higher fair
-        want_up = fair_up >= 0.55 and bid_up <= fair_up - edge + 0.005 and w.up_shares < max_side
-        want_dn = fair_dn >= 0.55 and bid_dn <= fair_dn - edge + 0.005 and w.down_shares < max_side
+        want_up = (
+            ask_up is not None and fair_up >= 0.56
+            and ask_up <= fair_up - edge
+            and 0.20 <= ask_up <= 0.90
+            and w.up_shares < max_side
+        )
+        want_dn = (
+            ask_dn is not None and fair_dn >= 0.56
+            and ask_dn <= fair_dn - edge
+            and 0.20 <= ask_dn <= 0.90
+            and w.down_shares < max_side
+        )
         if want_up and want_dn:
             if fair_up >= fair_dn:
                 want_dn = False
             else:
                 want_up = False
-        if want_up and 0.25 <= bid_up <= 0.88:
-            await self._open(w, "Up", bid_up, max(5.0, round(clip / bid_up, 2)), "maker_entry")
+        if want_up:
+            await self._open(w, "Up", float(ask_up), max(5.0, round(clip / ask_up, 2)), "maker_entry")
             return
-        if want_dn and 0.25 <= bid_dn <= 0.88:
-            await self._open(w, "Down", bid_dn, max(5.0, round(clip / bid_dn, 2)), "maker_entry")
+        if want_dn:
+            await self._open(w, "Down", float(ask_dn), max(5.0, round(clip / ask_dn, 2)), "maker_entry")
             return
 
     async def _open(self, w, outcome, price, size, reason) -> None:
-        price = round(max(0.01, min(0.99, price)), 2)
+        price = round(max(0.01, min(0.99, float(price))), 2)
         size = round(max(5.0, size), 2)
         cost = price * size
         if cost > self.cash:
@@ -420,26 +445,28 @@ class TradingEngine:
             w.down_shares += size
             w.down_cost += cost
         w.last_trade_mono = time.monotonic()
-        fill = {"ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
-                "outcome": outcome, "role": "MAKER", "reason": reason, "shares": size, "price": price,
-                "fee": 0.0, "notional": cost}
+        fill = {
+            "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
+            "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
+            "fee": 0.0, "notional": cost,
+        }
         self._fill_history.insert(0, fill)
         self._fill_history = self._fill_history[:80]
         try:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="MAKER",
+                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
                 reason=reason, shares=size, price=price, fee=0.0, fair_prob=price,
-                tx_or_order_id=f"paper-{int(time.time())}",
+                tx_or_order_id=f"paper-clob-{int(time.time())}",
             )
         except Exception as e:
             log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
         why = {
-            "maker_entry": "maker vs fair",
-            "lockin": "lock-in перед закрытием",
-            "syn_tp": "добор пары для MERGE",
-            "pair_arb": "пара Up+Down < $1",
+            "maker_entry": "CLOB ask дешевле fair",
+            "lockin": "lock-in по CLOB",
+            "syn_tp": "добор пары по CLOB",
+            "pair_arb": "реальная пара CLOB < $1",
         }.get(reason, reason)
         self._log_event(
             "INFO",
