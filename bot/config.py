@@ -49,11 +49,12 @@ class StrategyParams:
 PRESETS: Dict[str, StrategyParams] = {
     "mo_money": StrategyParams(
         key="mo_money",
-        title_ru="mo-money (Maker + Merge)",
+        title_ru="mo-money research prototype (PAPER, Taker)",
         description_ru=(
-            "Рекомендуемый режим для банка €2 500: 95%+ Post-Only Maker (0% комиссии), "
-            "синтетический TP/SL через покупку противоположного исхода + авто-MERGE в pUSD, "
-            "плюс сбор 95–98¢ TWAP Lock-In и редкие снайперские Taker-входы с перевесом >3.8¢."
+            "Исследовательский PAPER-прототип, а не точная копия кошелька mo-money. "
+            "Текущая реализация моделирует taker-входы по реальному CLOB best ask и комиссию. "
+            "Post-Only Maker, очередь заявок, отмены, частичные исполнения, rebates и "
+            "полная синхронизация позиций ещё не реализованы и не должны считаться готовыми."
         ),
         enable_maker=True,
         enable_lockin=True,
