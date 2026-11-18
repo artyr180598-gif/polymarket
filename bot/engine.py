@@ -111,9 +111,17 @@ class TradingEngine:
                 "merge confirmation are not implemented. Use paper mode only."
             )
         self.executor = PaperExecutor(self.cfg.bankroll_usd)
-        self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
+        try:
+            state = self.ledger.portfolio_state(self.cfg.trading_mode, self.cfg.bankroll_usd)
+            self.cash = state["cash"]
+            self.realized_pnl = state["realized_gross_pnl"]
+            self.fees_paid = state["fees_paid"]
+            self.day_pnl = state["day_net_pnl"]
+        except Exception as exc:
+            raise RuntimeError("Cannot reconstruct PAPER account state from ledger") from exc
         self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
         self.running = True
+        await self._restore_positions()
         self._tasks = [
             asyncio.create_task(self._polymarket_oracle_loop(), name="polymarket_oracle"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
@@ -153,6 +161,51 @@ class TradingEngine:
                 merged += await self._execute_merge(w)
         self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
         return {"canceled": 0, "merged_usd": round(merged, 2)}
+
+    async def _restore_positions(self) -> None:
+        """Restore unresolved positions so restarts do not erase inventory or PnL."""
+        for position in self.ledger.open_positions(self.cfg.trading_mode):
+            slug = str(position["slug"])
+            if slug in self.windows:
+                continue
+            parts = slug.rsplit("-", 2)
+            if len(parts) != 3:
+                log.error("Cannot restore position with unexpected market slug: %s", slug)
+                continue
+            try:
+                timeframe = parts[-2]
+                start_ts = float(parts[-1])
+            except (TypeError, ValueError):
+                log.error("Cannot parse market window from slug: %s", slug)
+                continue
+            duration = 900 if timeframe == "15m" else 300 if timeframe == "5m" else 0
+            if duration <= 0:
+                log.error("Unsupported restored timeframe in slug: %s", slug)
+                continue
+            meta = await self._gamma(slug)
+            condition_id = str((meta or {}).get("condition_id") or position["condition_id"])
+            window = WindowState(
+                slug=slug,
+                asset=str(position["asset"]),
+                timeframe=timeframe,
+                condition_id=condition_id,
+                up_token=str((meta or {}).get("up_token") or ""),
+                down_token=str((meta or {}).get("down_token") or ""),
+                start_ts=start_ts,
+                end_ts=start_ts + duration,
+                price_to_beat=(meta or {}).get("price_to_beat"),
+                fee_rate=(meta or {}).get("fee_rate"),
+            )
+            window.up_shares = float(position["up_shares"])
+            window.down_shares = float(position["down_shares"])
+            window.up_cost = float(position["up_cost"])
+            window.down_cost = float(position["down_cost"])
+            self.windows[slug] = window
+            self._log_event(
+                "INFO",
+                f"Восстановлена PAPER-позиция {slug}: Up {window.up_shares:.2f}, "
+                f"Down {window.down_shares:.2f}",
+            )
 
     async def _polymarket_oracle_loop(self) -> None:
         """Consume Polymarket's own Chainlink spot and settlement TWAP60 stream."""
@@ -210,7 +263,14 @@ class TradingEngine:
             try:
                 await self._discover()
                 now = time.time()
-                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 180)]
+                dead = [
+                    s for s, w in self.windows.items()
+                    if w.resolved or (
+                        w.end_ts < now - 180
+                        and w.up_shares < 0.01
+                        and w.down_shares < 0.01
+                    )
+                ]
                 for s in dead:
                     del self.windows[s]
             except Exception as e:
@@ -704,11 +764,20 @@ class TradingEngine:
             stats = self.ledger.get_stats(self.cfg.trading_mode)
         except Exception:
             stats = {}
-        inv = 0.0
-        for w in self.windows.values():
-            if not w.resolved:
-                inv += max(0.0, w.up_cost) + max(0.0, w.down_cost)
-        equity = self.cash + inv
+        try:
+            portfolio = self.ledger.portfolio_state(self.cfg.trading_mode, self.cfg.bankroll_usd)
+            inv = float(portfolio["inventory_cost"])
+            equity = float(portfolio["equity"])
+            cash = float(portfolio["cash"])
+            self.cash = cash
+            self.realized_pnl = float(portfolio["realized_gross_pnl"])
+            self.fees_paid = float(portfolio["fees_paid"])
+            self.day_pnl = float(portfolio["day_net_pnl"])
+        except Exception as exc:
+            log.error("Unable to reconstruct ledger portfolio snapshot: %s", exc)
+            inv = 0.0
+            equity = 0.0
+            cash = 0.0
         now = time.time()
         windows = []
         for w in self.windows.values():
@@ -738,7 +807,7 @@ class TradingEngine:
             "paused": self.paused,
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
-            "cash": round(self.cash, 2),
+            "cash": round(cash, 2),
             "realized_pnl": round(self.realized_pnl, 2),
             "day_pnl": round(self.day_pnl, 2),
             "fees_paid": round(self.fees_paid, 4),
@@ -752,9 +821,9 @@ class TradingEngine:
             "oracle_connected": self._oracle_connected,
             "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
             "oracle_last_event_ts": self._oracle_last_event_ts,
-            "fill_history": self._fill_history[:20],
-            "merge_history": self._merge_history[:10],
-            "resolve_history": self._resolve_history[:10],
+            "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
+            "merge_history": self.ledger.recent_merges(self.cfg.trading_mode, 10),
+            "resolve_history": self.ledger.recent_resolutions(self.cfg.trading_mode, 10),
             "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
             "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
             "merge_profit": round(sum(x.get("locked_pnl", 0) for x in self._merge_history), 2),
