@@ -75,7 +75,7 @@ The Telegram bot provides inline buttons and native slash commands:
 - `/history` — recent resolved and fully merged markets with fee-adjusted net PnL and RTDS-to-Gamma anchor verification.
 - `/pause`, `/resume`, `/kill` — remote PAPER controls; emergency stop requires confirmation.
 
-All displayed fills, MERGEs and PnL are simulated PAPER ledger records, not real Polymarket account executions. Win/loss counts are explicitly limited to markets with an official resolution; fully merged markets remain included in lifetime PnL but are not misclassified as resolved wins or losses. Persistent history still requires a verified Railway Volume mounted at `/data`.
+All displayed fills, MERGEs and PnL are simulated PAPER ledger records, not real Polymarket account executions. The Telegram PnL summary counts completed trade units: markets with an official resolution and markets whose Up/Down inventory has been fully merged. Partial MERGEs with residual inventory are excluded from completed win/loss counts and the closed-market history until the remaining position is resolved or fully closed. Fill counts refer to execution legs, not completed trades. Remote controls accept updates only from the configured one-to-one private Telegram chat; group chats are rejected. Persistent history still requires a verified Railway Volume mounted at `/data`.
 
 ## Main modules
 
