@@ -258,9 +258,9 @@ class TelegramController:
             f"· Всего исполнений: <b>{n_fills}</b>\n"
             f"· Maker: <b>{maker_fills}</b> ({maker_fill_pct:.1f}%)\n"
             f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses})\n\n"
-            f"ℹ️ ✅/❌ только если позиция дождалась конца окна.\n"
-            f"Если всё закрыли MERGE — там 0, это нормально."
+            f"· Закрытых рынков: <b>{resolved}</b>\n"
+            f"· Прибыльных: <b>{wins}</b> · убыточных: <b>{losses}</b> · около нуля: <b>{breakeven}</b>\n\n"
+            f"ℹ️ Win/loss учитывает только рынки с официальным резолвом; полностью закрытые MERGE входят в общий PnL."
         )
 
     def _fmt_positions(self) -> str:
@@ -332,11 +332,11 @@ class TelegramController:
             rows = self.engine.ledger.market_history(self.engine.cfg.trading_mode, 15)
         except Exception as exc:
             logger.warning("market history unavailable for Telegram: %s", exc)
-            return "📚 <b>История рынков</b>\\nНе удалось прочитать журнал SQLite. Проверьте логи сервиса."
+            return "📚 <b>История рынков</b>\nНе удалось прочитать журнал SQLite. Проверьте логи сервиса."
         if not rows:
             return (
-                "📚 <b>История закрытых рынков</b>\\n━━━━━━━━━━━━━━━━\\n"
-                "Пока нет рынков с подтверждённым официальным резолвом.\\n"
+                "📚 <b>История закрытых рынков</b>\n━━━━━━━━━━━━━━━━\n"
+                "Пока нет рынков с подтверждённым официальным резолвом.\n"
                 "MERGE-события смотри в разделе «Сделки»."
             )
         lines = ["📚 <b>История закрытых рынков</b>", "━━━━━━━━━━━━━━━━"]
@@ -344,12 +344,12 @@ class TelegramController:
             net = float(row.get("market_net_pnl") or 0.0)
             icon = "✅" if net > 0.000001 else "❌" if net < -0.000001 else "➖"
             lines.append(
-                f"\\n{icon} <b>{row.get('asset', '?')} {row.get('timeframe', '')}</b> "
-                f"· net <b>\${net:+.2f}</b>\\n"
-                f"Победил: {row.get('winner', '?')} · MERGE: \${float(row.get('merge_pnl') or 0):+.2f}\\n"
+                f"\n{icon} <b>{row.get('asset', '?')} {row.get('timeframe', '')}</b> "
+                f"· net <b>${net:+.2f}</b>\n"
+                f"Победил: {row.get('winner', '?')} · MERGE: ${float(row.get('merge_pnl') or 0):+.2f}\n"
                 f"<code>{row.get('slug', '')}</code>"
             )
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     def _fmt_help(self) -> str:
         return (
