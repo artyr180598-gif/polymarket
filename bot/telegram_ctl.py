@@ -51,6 +51,7 @@ class TelegramController:
         self._session: Optional[aiohttp.ClientSession] = None
         # Engine events can arrive during startup, before the HTTP session exists.
         self._pending_notifications: list[str] = []
+        self._notification_delivery_lock = asyncio.Lock()
 
     @property
     def _base(self) -> str:
@@ -136,9 +137,9 @@ class TelegramController:
             await self._session.close()
             self._session = None
 
-    async def send(self, text: str, keyboard: Optional[Dict] = None, parse_mode: str = "HTML") -> None:
+    async def send(self, text: str, keyboard: Optional[Dict] = None, parse_mode: str = "HTML") -> bool:
         if not self.enabled or not self._session:
-            return
+            return False
         # strip backslashes that break Telegram HTML
         clean = (text or "").replace("\\", "")[:4090]
         payload: Dict[str, Any] = {
@@ -168,8 +169,12 @@ class TelegramController:
                                 "sendMessage plain rejected: status=%s response=%s",
                                 r2.status, str(result2)[:180],
                             )
+                            return False
+                        return True
+                return True
         except Exception as e:
             logger.warning("Telegram send failed: %s", e)
+            return False
 
     async def notify(self, text: str) -> None:
         msg = (text or "").strip()
@@ -182,13 +187,26 @@ class TelegramController:
             self._pending_notifications.append(msg[:3500])
             self._pending_notifications = self._pending_notifications[-100:]
             return
-        await asyncio.sleep(0.15)
-        await self.send(f"🔔 {msg}", keyboard=_kb_main())
+        self._pending_notifications.append(msg[:3500])
+        self._pending_notifications = self._pending_notifications[-100:]
+        await self._drain_pending_notifications()
 
     async def _flush_pending_notifications(self) -> None:
-        pending, self._pending_notifications = self._pending_notifications, []
-        for msg in pending:
-            await self.send(f"🔔 {msg}", keyboard=_kb_main())
+        await self._drain_pending_notifications()
+
+    async def _drain_pending_notifications(self) -> None:
+        """Deliver queued fills/events; retain each item until Telegram confirms it."""
+        if not self.enabled or self._session is None or not self._pending_notifications:
+            return
+        async with self._notification_delivery_lock:
+            while self._pending_notifications and self._session is not None:
+                msg = self._pending_notifications[0]
+                delivered = await self.send(f"🔔 {msg}", keyboard=_kb_main())
+                if not delivered:
+                    # Leave the head item queued. The polling loop retries after
+                    # the next Telegram update cycle or a reconnect.
+                    break
+                self._pending_notifications.pop(0)
 
     async def _answer_callback(self, cq_id: str) -> None:
         if self._session:
