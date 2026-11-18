@@ -822,6 +822,7 @@ class TradingEngine:
         min_price = float(self.params.maker_min_price)
         max_price = float(self.params.maker_max_price)
         now_mono = time.monotonic()
+        now_wall = time.time()
 
         for outcome, token, fair_prob in (
             ("Up", window.up_token, fair_up),
@@ -860,7 +861,7 @@ class TradingEngine:
                 order = existing[0]
                 stale_edge = fair_prob - order.price < min_edge
                 moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
-                aged = now_mono - order.created_ts > 20.0
+                aged = now_wall - order.created_ts > 20.0
                 if stale_edge or moved or aged:
                     for stale in existing:
                         await self.executor.cancel_order(stale.order_id)
