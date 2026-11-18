@@ -81,7 +81,11 @@ class PaperExecutor:
         tick_size: float = 0.01,
     ) -> Optional[str]:
         """Place post-only BUY. Rejects if would cross the spread."""
-        if not math.isfinite(tick_size) or tick_size <= 0:
+        if (
+            not all(math.isfinite(value) for value in (price, size, best_ask, bid_size_at_or_better))
+            or not math.isfinite(tick_size)
+            or tick_size <= 0
+        ):
             return None
         price = round(math.floor((price + 1e-12) / tick_size) * tick_size, 6)
         size = round(size, 2)
