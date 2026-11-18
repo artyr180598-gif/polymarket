@@ -301,7 +301,12 @@ async def check_clob_websocket(token_id: str) -> dict[str, bool]:
             if got_book and got_trade:
                 break
     finally:
-        await iterator.aclose()
+        # The SDK's websocket close can wait on the transport; bound cleanup so
+        # a read-only CI smoke test cannot hang indefinitely after its deadline.
+        try:
+            await asyncio.wait_for(iterator.aclose(), timeout=3.0)
+        except (asyncio.TimeoutError, RuntimeError):
+            pass
     if not got_book:
         raise RuntimeError("CLOB WebSocket did not deliver a book snapshot")
     return {"book_snapshot": got_book, "last_trade_event_observed": got_trade}
