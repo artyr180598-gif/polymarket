@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 from bot.ledger import Ledger
 
 
@@ -192,4 +194,47 @@ def test_resolution_persists_chainlink_anchor_reconciliation(tmp_path) -> None:
     assert row["gamma_price_to_beat"] == 62_236.25808880998
     assert row["anchor_delta"] == 0.0
     assert row["anchor_verified"] == 1
+    ledger.conn.close()
+
+
+
+def test_existing_ledger_schema_migrates_anchor_audit_columns(tmp_path) -> None:
+    db_path = tmp_path / "legacy-paper.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE resolutions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            mode TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            condition_id TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            winner TEXT NOT NULL,
+            price_to_beat REAL,
+            final_price REAL,
+            up_shares_total REAL NOT NULL,
+            down_shares_total REAL NOT NULL,
+            merged_pairs REAL NOT NULL,
+            gross_cost REAL NOT NULL,
+            total_fees REAL NOT NULL,
+            total_payout REAL NOT NULL,
+            gross_pnl REAL NOT NULL,
+            net_pnl REAL NOT NULL,
+            UNIQUE(mode, slug)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    ledger = Ledger(str(db_path))
+    columns = {
+        row["name"] for row in ledger.conn.execute("PRAGMA table_info(resolutions)")
+    }
+    assert {
+        "price_to_beat_source",
+        "gamma_price_to_beat",
+        "anchor_delta",
+        "anchor_verified",
+    }.issubset(columns)
     ledger.conn.close()
