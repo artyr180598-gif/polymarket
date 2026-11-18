@@ -116,7 +116,7 @@ class AssetPriceTracker:
         if self.cl_spot is not None and self.basis_ema is None and abs(ts - self.cl_spot_ts) <= 5.0:
             self.basis_ema = price - self.cl_spot
 
-    def lookup_twap_at(self, epoch_sec: int, max_diff_sec: float = 45.0) -> Optional[float]:
+    def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
         epoch_sec = int(epoch_sec)
         # Use source timestamps, not rounded dictionary keys, to select the
         # closest sample to the exact market boundary.
