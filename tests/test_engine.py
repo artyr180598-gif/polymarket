@@ -85,6 +85,19 @@ def test_closed_gamma_price_to_beat_is_reconciliation_fallback() -> None:
     assert source == "gamma.eventMetadata.priceToBeat"
 
 
+def test_boundary_lookup_rejects_a_twap_sample_more_than_one_second_away(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    ))
+    tracker = engine.trackers["BTC"]
+    tracker.on_chainlink_twap60(100_000.0, 1_000_000)
+    assert tracker.lookup_twap_at(1_002, max_diff_sec=1.0) is None
+    assert tracker.lookup_twap_at(1_001, max_diff_sec=1.0) == 100_000.0
+    engine.ledger.conn.close()
+
+
 def test_discovery_uses_chainlink_twap60_sample_at_window_boundary(monkeypatch) -> None:
     engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"]))
     tracker = engine.trackers["BTC"]
