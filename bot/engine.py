@@ -1350,7 +1350,6 @@ class TradingEngine:
             # guessed winner or manufacture PnL while the authoritative result is absent.
             return
         # Once Gamma publishes the settled priceToBeat, compare it with the
-        # RTDS boundary sample        # Once Gamma publishes the settled priceToBeat, compare it with the
         # RTDS boundary sample used for trading. A material mismatch is a data
         # integrity fault: persist it and halt new entries rather than hide it.
         gamma_price_to_beat = None
