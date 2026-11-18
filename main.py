@@ -43,6 +43,9 @@ def main() -> None:
             "yes" if cfg.telegram_bot_token else "NO",
             cfg.telegram_chat_id or "NO",
         )
+        # Attach the notifier before engine.start(): startup can discover and fill
+        # PAPER orders before Telegram's polling session is fully initialized.
+        engine.set_notifier(tg.notify)
         try:
             await engine.start()
         except Exception:
