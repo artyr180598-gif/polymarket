@@ -789,7 +789,9 @@ class TradingEngine:
         now = time.time()
         windows = []
         for w in self.windows.values():
-            if w.resolved or w.end_ts < now - 3:
+            if w.resolved:
+                continue
+            if w.end_ts < now - 3 and w.up_shares < 0.01 and w.down_shares < 0.01:
                 continue
             fair = None
             if w.price_to_beat is not None:
