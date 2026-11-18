@@ -308,3 +308,38 @@ def test_maker_clob_roles_are_counted_as_maker_and_history_net_is_merge_adjusted
     assert len(history) == 1
     assert history[0]["merge_pnl"] == 0.5
     assert round(history[0]["market_net_pnl"], 2) == 0.8
+
+
+
+def test_market_history_includes_fully_merged_markets_without_resolution(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "merged-history.db"))
+    for outcome in ("Up", "Down"):
+        ledger.record_fill(
+            mode="paper",
+            slug="btc-updown-5m-1795035600",
+            condition_id="0x" + "2" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome=outcome,
+            role="MAKER",
+            reason="maker_quote",
+            shares=10.0,
+            price=0.4,
+            fee=0.01,
+            fair_prob=0.5,
+        )
+    ledger.record_merge(
+        mode="paper",
+        slug="btc-updown-5m-1795035600",
+        condition_id="0x" + "2" * 64,
+        pairs=10.0,
+        cost_basis=8.0,
+        locked_pnl=2.0,
+    )
+
+    rows = ledger.market_history("paper", 10)
+    assert len(rows) == 1
+    assert rows[0]["winner"] == "MERGED"
+    assert rows[0]["merge_pnl"] == 2.0
+    assert rows[0]["market_net_pnl"] == 1.98
+    ledger.conn.close()
