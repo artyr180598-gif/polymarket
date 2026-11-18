@@ -210,23 +210,46 @@ class Ledger:
         fair_prob: float,
         tx_or_order_id: str = "",
         ts: float | None = None,
-    ) -> None:
+        notification_message: str | None = None,
+        notification_event_key: str | None = None,
+    ) -> int:
         t = ts if ts is not None else time.time()
-        self.conn.execute(
-            """
-            INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
-                               shares, price, notional, fee, fair_prob, tx_or_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                t, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
-                round(shares, 4), round(price, 4), round(shares * price, 4),
-                round(fee, 5), round(fair_prob, 4), tx_or_order_id,
-            ),
-        )
-        self.conn.commit()
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
+                                   shares, price, notional, fee, fair_prob, tx_or_order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    t, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
+                    round(shares, 4), round(price, 4), round(shares * price, 4),
+                    round(fee, 5), round(fair_prob, 4), tx_or_order_id,
+                ),
+            )
+            fill_id = int(cur.lastrowid)
+            if notification_message and notification_event_key:
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO telegram_outbox (event_key, message, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (notification_event_key, str(notification_message).strip()[:3500], t),
+                )
+            self.conn.commit()
+            return fill_id
+        except Exception:
+            self.conn.rollback()
+            raise
 
-    def record_fills_atomic(self, fills: List[Dict[str, Any]]) -> None:
+    def record_fills_atomic(
+        self,
+        fills: List[Dict[str, Any]],
+        *,
+        notification_message: str | None = None,
+        notification_event_key: str | None = None,
+    ) -> None:
         """Persist a simulated multi-leg fill as one SQLite transaction."""
         if not fills:
             return
@@ -255,6 +278,18 @@ class Ledger:
                 """,
                 rows,
             )
+            if notification_message and notification_event_key:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO telegram_outbox (event_key, message, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        notification_event_key,
+                        str(notification_message).strip()[:3500],
+                        float(fills[0].get("ts", time.time())),
+                    ),
+                )
             self.conn.commit()
         except Exception:
             self.conn.rollback()
