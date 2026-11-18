@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bot.market_feed import PolymarketMarketFeed
 from bot.oracle_feed import PolymarketOracleFeed
 
 WALLET = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
@@ -135,6 +136,34 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
     }
 
 
+async def check_clob_websocket(token_id: str) -> dict[str, bool]:
+    iterator = PolymarketMarketFeed([token_id]).events().__aiter__()
+    got_book = False
+    got_trade = False
+    deadline = time.monotonic() + 20.0
+    try:
+        while time.monotonic() < deadline:
+            try:
+                event = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
+            except asyncio.TimeoutError:
+                if got_book:
+                    break
+                continue
+            except StopAsyncIteration:
+                break
+            if event.get("type") == "book":
+                got_book = True
+            elif event.get("type") == "last_trade":
+                got_trade = True
+            if got_book and got_trade:
+                break
+    finally:
+        await iterator.aclose()
+    if not got_book:
+        raise RuntimeError("CLOB WebSocket did not deliver a book snapshot")
+    return {"book_snapshot": got_book, "last_trade_event_observed": got_trade}
+
+
 async def check_data_api(session: aiohttp.ClientSession) -> dict[str, Any]:
     payload = await get_json(
         session,
@@ -152,11 +181,19 @@ async def main() -> None:
         # RTDS uses its own SDK websocket client; HTTP checks share this session.
         rtds = await check_rtds()
         gamma_clob = await check_gamma_and_clob(session)
+        clob_ws = await check_clob_websocket(str(
+            json.loads((await get_json(
+                session,
+                "https://gamma-api.polymarket.com/events",
+                {"slug": gamma_clob["slug"]},
+            ))[0]["markets"][0]["clobTokenIds"])[0]
+        ))
         data_api = await check_data_api(session)
     print(json.dumps({
         "status": "PASS",
         "rtds_chainlink": rtds,
         "gamma_and_clob": gamma_clob,
+        "clob_websocket": clob_ws,
         "data_api_v2": data_api,
     }, indent=2))
 
