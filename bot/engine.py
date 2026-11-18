@@ -1398,7 +1398,8 @@ class TradingEngine:
             w.resolved = True
             return
 
-ost + w.down_cost)
+        payout = float(w.up_shares if winner == "Up" else w.down_shares)
+        gross_cost = float(w.up_cost + w.down_cost)
         market_fees = self.ledger.fees_for_market(self.cfg.trading_mode, w.slug)
         gross = payout - gross_cost
         net = gross - market_fees
