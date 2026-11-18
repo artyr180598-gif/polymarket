@@ -456,3 +456,62 @@ def test_telegram_controller_restores_durable_outbox_after_restart(tmp_path):
     ).fetchone()
     assert delivered["delivered_at"] is not None
     reopened_ledger.conn.close()
+
+
+def test_telegram_startup_fails_when_startup_message_is_not_acknowledged(monkeypatch):
+    class StartupResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return {"ok": True, "result": []}
+
+    class StartupSession:
+        def get(self, url, params=None):
+            return StartupResponse()
+
+        async def close(self):
+            return None
+
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+            bankroll_usd=100.0,
+            trading_mode="paper",
+            strategy_preset="mo_money",
+        ),
+        params=SimpleNamespace(title_ru="Mo Money"),
+    )
+    controller = TelegramController(engine)
+    monkeypatch.setattr("bot.telegram_ctl.aiohttp.ClientSession", lambda **kwargs: StartupSession())
+
+    async def no_op():
+        return None
+
+    async def never():
+        await asyncio.Event().wait()
+
+    async def rejected_startup_message(*args, **kwargs):
+        return False
+
+    controller._register_commands = no_op
+    controller._poll_loop = never
+    controller._notification_delivery_loop = never
+    controller.send = rejected_startup_message
+
+    async def scenario():
+        try:
+            await controller.start()
+            raise AssertionError("startup must fail if Telegram did not acknowledge its test message")
+        except RuntimeError as exc:
+            assert "not acknowledged" in str(exc)
+        finally:
+            await controller.stop()
+
+    asyncio.run(scenario())
