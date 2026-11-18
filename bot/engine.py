@@ -17,6 +17,7 @@ from .config import BotConfig, PRESETS, StrategyParams
 from .execution import PaperExecutor, LiveExecutor
 from .fees import calc_taker_fee_usdc, fee_regime_label
 from .ledger import Ledger
+from .market_feed import PolymarketMarketFeed
 from .oracle_feed import PolymarketOracleFeed
 from .twap_model import AssetPriceTracker
 
@@ -125,6 +126,10 @@ class TradingEngine:
         self._fill_history: List[Dict[str, Any]] = []
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
+        self._market_books: Dict[str, Dict[str, Any]] = {}
+        self._market_tokens_changed = asyncio.Event()
+        self._market_feed_connected = False
+        self._market_feed_last_event_mono = 0.0
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -160,6 +165,7 @@ class TradingEngine:
             self.realized_pnl = state["realized_gross_pnl"]
             self.fees_paid = state["fees_paid"]
             self.day_pnl = state["day_net_pnl"]
+            self.executor.cash = self.cash
         except Exception as exc:
             raise RuntimeError("Cannot reconstruct PAPER account state from ledger") from exc
         self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
@@ -167,6 +173,7 @@ class TradingEngine:
         await self._restore_positions()
         self._tasks = [
             asyncio.create_task(self._polymarket_oracle_loop(), name="polymarket_oracle"),
+            asyncio.create_task(self._clob_market_loop(), name="clob_market"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
@@ -175,6 +182,8 @@ class TradingEngine:
 
     async def stop(self) -> None:
         self.running = False
+        if self.executor is not None:
+            await self.executor.cancel_all()
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -182,7 +191,12 @@ class TradingEngine:
 
     def pause(self) -> None:
         self.paused = True
-        self._log_event("INFO", "Пауза", notify=True)
+        if self.executor is not None:
+            try:
+                asyncio.get_running_loop().create_task(self.executor.cancel_all())
+            except RuntimeError:
+                pass
+        self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=True)
 
     def resume(self) -> None:
         self.paused = False
@@ -202,12 +216,13 @@ class TradingEngine:
 
     async def emergency_kill(self) -> Dict[str, Any]:
         self.paused = True
+        canceled = await self.executor.cancel_all() if self.executor is not None else 0
         merged = 0.0
         for w in list(self.windows.values()):
             if w.mergeable_pairs >= 1.0 and not w.merge_in_flight:
                 merged += await self._execute_merge(w)
-        self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
-        return {"canceled": 0, "merged_usd": round(merged, 2)}
+        self._log_event("ALERT", f"СТОП · отменено maker-заявок {canceled} · merge ${merged:.2f}", notify=True)
+        return {"canceled": canceled, "merged_usd": round(merged, 2)}
 
     async def _restore_positions(self) -> None:
         """Restore unresolved positions so restarts do not erase inventory or PnL."""
@@ -500,6 +515,214 @@ class TradingEngine:
     async def _clob_best_ask(self, token_id: str):
         info = await self._clob_ask_info(token_id)
         return info[0] if info else None
+
+    def _active_market_tokens(self) -> List[str]:
+        now = time.time()
+        return sorted({
+            token
+            for window in self.windows.values()
+            if not window.resolved and window.end_ts > now - 5
+            for token in (window.up_token, window.down_token)
+            if token
+        })
+
+    async def _clob_market_loop(self) -> None:
+        """Stream real CLOB books and trades; fail closed on feed disconnect."""
+        previous_tokens: set[str] = set()
+        while self.running:
+            self._market_tokens_changed.clear()
+            token_ids = self._active_market_tokens()
+            current_tokens = set(token_ids)
+            removed = previous_tokens - current_tokens
+            if removed and self.executor is not None:
+                await self.executor.cancel_all(sorted(removed))
+                for token in removed:
+                    self._market_books.pop(token, None)
+            previous_tokens = current_tokens
+            if not token_ids:
+                await self._market_tokens_changed.wait()
+                continue
+
+            iterator = PolymarketMarketFeed(token_ids).events().__aiter__()
+            try:
+                self._market_feed_connected = True
+                self._log_event(
+                    "INFO",
+                    f"CLOB WebSocket подключён · {len(token_ids)} токенов",
+                    notify=True,
+                )
+                while self.running:
+                    next_task = asyncio.create_task(iterator.__anext__())
+                    changed_task = asyncio.create_task(self._market_tokens_changed.wait())
+                    done, pending = await asyncio.wait(
+                        {next_task, changed_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    if changed_task in done and self._market_tokens_changed.is_set():
+                        break
+                    if next_task in done:
+                        try:
+                            event = next_task.result()
+                        except StopAsyncIteration:
+                            break
+                        self._market_feed_last_event_mono = time.monotonic()
+                        await self._process_market_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._market_feed_connected = False
+                log.warning("CLOB market stream disconnected: %s", exc)
+                self._log_event("WARNING", f"CLOB WebSocket отключён: {exc}", notify=True)
+                if self.executor is not None:
+                    await self.executor.cancel_all()
+                previous_tokens = set()
+                await asyncio.sleep(2.0)
+            finally:
+                self._market_feed_connected = False
+                try:
+                    await iterator.aclose()
+                except Exception:
+                    pass
+
+    def _book_best(self, book: Dict[str, Any]) -> tuple[float, float]:
+        bids = book.get("bids") or {}
+        asks = book.get("asks") or {}
+        best_bid = max(bids) if bids else float(book.get("best_bid") or 0.0)
+        best_ask = min(asks) if asks else float(book.get("best_ask") or 1.0)
+        return float(best_bid), float(best_ask)
+
+    async def _process_market_event(self, event: Dict[str, Any]) -> None:
+        token = str(event.get("asset_id") or "")
+        if not token or self.executor is None:
+            return
+        book = self._market_books.setdefault(
+            token,
+            {"bids": {}, "asks": {}, "best_bid": 0.0, "best_ask": 1.0, "tick_size": 0.01},
+        )
+        kind = event.get("type")
+        if kind == "book":
+            book["bids"] = {float(p): float(s) for p, s in event.get("bids", []) if float(s) > 0}
+            book["asks"] = {float(p): float(s) for p, s in event.get("asks", []) if float(s) > 0}
+            book["tick_size"] = float(event.get("tick_size") or book["tick_size"])
+        elif kind == "price_change":
+            side = str(event.get("side") or "").upper()
+            levels = book["bids"] if side == "BUY" else book["asks"] if side == "SELL" else None
+            if levels is not None:
+                price = float(event.get("price") or 0.0)
+                size = float(event.get("size") or 0.0)
+                if size <= 0:
+                    levels.pop(price, None)
+                else:
+                    levels[price] = size
+            if event.get("best_bid") is not None:
+                book["best_bid"] = float(event["best_bid"])
+            if event.get("best_ask") is not None:
+                book["best_ask"] = float(event["best_ask"])
+        elif kind == "best_bid_ask":
+            if event.get("best_bid") is not None:
+                book["best_bid"] = float(event["best_bid"])
+            if event.get("best_ask") is not None:
+                book["best_ask"] = float(event["best_ask"])
+        elif kind == "tick_size_change":
+            tick = float(event.get("tick_size") or 0.0)
+            if tick > 0:
+                book["tick_size"] = tick
+        elif kind != "last_trade":
+            return
+
+        best_bid, best_ask = self._book_best(book)
+        book["best_bid"], book["best_ask"] = best_bid, best_ask
+        book["recv_mono"] = time.monotonic()
+        trade_price = float(event["price"]) if kind == "last_trade" else None
+        trade_size = float(event.get("size") or 0.0) if kind == "last_trade" else 0.0
+        trade_side = str(event.get("side") or "") if kind == "last_trade" else ""
+        fills = self.executor.on_book_and_tape(
+            token,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            last_trade_price=trade_price,
+            last_trade_size=trade_size,
+            last_trade_side=trade_side,
+        )
+        for fill in fills:
+            await self._record_maker_fill(fill)
+
+    async def _record_maker_fill(self, fill: Any) -> None:
+        window = None
+        outcome = ""
+        for candidate in self.windows.values():
+            if candidate.up_token == fill.asset_id:
+                window, outcome = candidate, "Up"
+                break
+            if candidate.down_token == fill.asset_id:
+                window, outcome = candidate, "Down"
+                break
+        if window is None:
+            self.executor.rollback_fill(fill)
+            return
+
+        fair_prob = 0.5
+        tracker = self.trackers.get(window.asset)
+        if tracker is not None and window.price_to_beat is not None and tracker.cl_spot is not None:
+            try:
+                fv = tracker.compute_fair_value(float(window.price_to_beat), float(window.end_ts))
+                fair_prob = float(fv.prob_up if outcome == "Up" else 1.0 - fv.prob_up)
+            except Exception:
+                pass
+        try:
+            self.ledger.record_fill(
+                mode=self.cfg.trading_mode,
+                slug=window.slug,
+                condition_id=window.condition_id,
+                asset=window.asset,
+                timeframe=window.timeframe,
+                outcome=outcome,
+                role="MAKER",
+                reason="maker_quote",
+                shares=float(fill.size),
+                price=float(fill.price),
+                fee=0.0,
+                fair_prob=fair_prob,
+                tx_or_order_id=f"paper-maker-{fill.order_id}-{time.time_ns()}",
+            )
+        except Exception as exc:
+            self.executor.rollback_fill(fill)
+            self.paused = True
+            await self.executor.cancel_all()
+            log.exception("Maker PAPER fill not persisted; trading paused: %s", exc)
+            self._log_event("ALERT", "Ошибка записи maker-fill в SQLite · торговля остановлена", notify=True)
+            return
+
+        if outcome == "Up":
+            window.up_shares += float(fill.size)
+            window.up_cost += float(fill.price) * float(fill.size)
+        else:
+            window.down_shares += float(fill.size)
+            window.down_cost += float(fill.price) * float(fill.size)
+        window.last_trade_mono = time.monotonic()
+        self.cash -= float(fill.price) * float(fill.size)
+        self._fill_history.insert(0, {
+            "ts": fill.ts,
+            "slug": window.slug,
+            "outcome": outcome,
+            "role": "MAKER",
+            "shares": fill.size,
+            "price": fill.price,
+            "fee": 0.0,
+            "reason": "maker_quote",
+        })
+        self._fill_history = self._fill_history[:80]
+        self._log_event(
+            "INFO",
+            f"🟢 PAPER MAKER fill {window.asset} {outcome}: "
+            f"{fill.size:.2f} шт. × \${fill.price:.4f} · очередь пройдена · "
+            f"<code>{window.slug}</code>",
+            notify=True,
+        )
 
     async def _strategy_loop(self) -> None:
         while self.running:
