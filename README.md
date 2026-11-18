@@ -28,6 +28,17 @@ The next implementation stages are:
 
 No stage should be described as complete until its tests and data coverage are documented.
 
+### Collect the target wallet's raw history
+
+Run the read-only collector from a machine with internet access:
+
+```bash
+python scripts/analyze_target_wallet.py --wallet 0x32ed2e546b187ca15e2841edc82b22c713cf8ec3 --out-dir artifacts/mo_money
+```
+
+It paginates the public Data API v2 trades feed with both taker-only settings, activity (including MERGE/REDEEM/rebate events), and official user PnL endpoints. It stores raw JSONL pages plus an analysis report. Maker classification is derived by multiset subtraction of the taker-only feed from the all-roles feed; check the report's unmatched count and raw files before using it as strategy ground truth.
+
+
 ## Railway deployment notes
 
 - Use TRADING_MODE=paper.
