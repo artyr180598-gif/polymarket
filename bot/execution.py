@@ -211,6 +211,14 @@ class PaperExecutor:
                             o.remaining = 0.0
         return new_fills
 
+    def confirm_fill(self, fill: PaperFill) -> None:
+        """Forget a fill after the engine has durably committed it to SQLite."""
+        if fill in self.fills:
+            self.fills.remove(fill)
+        order = self.orders.get(fill.order_id)
+        if order is not None and order.status == "filled":
+            self.orders.pop(fill.order_id, None)
+
     def rollback_fill(self, fill: PaperFill) -> bool:
         """Undo an unpersisted simulated fill while retaining its cash reservation."""
         if fill not in self.fills:
