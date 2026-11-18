@@ -286,3 +286,55 @@ def test_binance_basis_tracker_rejects_out_of_order_spot_updates() -> None:
     tracker.on_binance_spot(99_010.0, 999_000)
     assert tracker.bn_spot == 100_010.0
     assert tracker.bn_spot_ts == 1_000.0
+
+
+
+def test_anchor_mismatch_halts_resume_even_after_engine_restart(tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "anchor-mismatch.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.ledger.record_anchor_check(
+        mode="paper",
+        slug="btc-updown-5m-anchor-mismatch",
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=100_000.10,
+        anchor_delta=0.10,
+        anchor_verified=False,
+    )
+    engine.ledger.conn.close()
+
+    restarted = TradingEngine(cfg)
+    assert restarted._risk_halted() is True
+    assert restarted.resume() is False
+    assert restarted.paused is True
+    assert restarted._risk_halt_active is True
+    assert "manual investigation required" in restarted._risk_halt_reason
+    restarted.ledger.conn.close()
+
+
+def test_resume_refuses_to_bypass_daily_loss_limit(tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "daily-loss-halt.db"),
+        max_daily_loss_usd=10.0,
+    )
+    engine = TradingEngine(cfg)
+    engine.ledger.record_merge(
+        mode="paper",
+        slug="btc-updown-5m-daily-loss",
+        condition_id="0x" + "4" * 64,
+        pairs=1.0,
+        cost_basis=12.0,
+        locked_pnl=-11.0,
+        tx_hash="paper-risk-test",
+    )
+
+    assert engine.resume() is False
+    assert engine.paused is True
+    assert "Daily net loss limit reached" in engine._risk_halt_reason
+    engine.ledger.conn.close()
