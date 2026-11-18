@@ -83,9 +83,14 @@ class PaperExecutor:
     ) -> Optional[str]:
         """Place post-only BUY. Rejects if would cross the spread."""
         if (
-            not all(math.isfinite(value) for value in (price, size, best_ask, bid_size_at_or_better))
-            or not math.isfinite(tick_size)
+            not all(
+                math.isfinite(value)
+                for value in (price, size, best_bid, best_ask, bid_size_at_or_better, tick_size)
+            )
             or tick_size <= 0
+            or best_bid < 0
+            or not 0 < best_ask < 1
+            or bid_size_at_or_better < 0
         ):
             return None
         price = round(math.floor((price + 1e-12) / tick_size) * tick_size, 6)
@@ -128,8 +133,10 @@ class PaperExecutor:
         timeframe: str = "5m",
     ) -> Optional[PaperFill]:
         """FAK-style taker buy at best_ask."""
+        if not math.isfinite(size) or not math.isfinite(best_ask):
+            return None
         size = round(size, 2)
-        if size < 5.0 or best_ask <= 0 or best_ask >= 1:
+        if size < 5.0 or not 0 < best_ask < 1:
             return None
         fee = calc_taker_fee_usdc(size, best_ask, asset, timeframe)
         cost = best_ask * size + fee
@@ -161,6 +168,14 @@ class PaperExecutor:
         """Progress queue and generate maker fills when tape eats through us."""
         now = time.time()
         new_fills: List[PaperFill] = []
+        if (
+            not math.isfinite(best_bid)
+            or not math.isfinite(best_ask)
+            or best_bid < 0
+            or not 0 < best_ask < 1
+            or best_bid >= best_ask
+        ):
+            return new_fills
         for oid, o in list(self.orders.items()):
             if o.status != "open" or o.asset_id != asset_id:
                 continue
@@ -190,28 +205,29 @@ class PaperExecutor:
             volume_before_us = max(0.0, last_trade_size - queue_ahead_before)
             o.queue_ahead = max(0.0, queue_ahead_before - last_trade_size)
             # Fill only from tape volume remaining after the queue ahead.
-            if volume_before_us > 0:
-                    fill_size = min(o.remaining, volume_before_us)
-                    if fill_size >= 0.01:
-                        o.remaining = round(o.remaining - fill_size, 4)
-                        self.positions[asset_id] = self.positions.get(asset_id, 0.0) + fill_size
-                        # Maker fee = 0; reserved cash already deducted at limit price
-                        # Refund difference if any (we reserved at limit)
-                        fill = PaperFill(
-                            order_id=oid,
-                            asset_id=asset_id,
-                            price=o.price,
-                            size=fill_size,
-                            fee=0.0,
-                            role="MAKER",
-                            ts=now,
-                            queue_ahead_before=queue_ahead_before,
-                        )
-                        self.fills.append(fill)
-                        new_fills.append(fill)
-                        if o.remaining < 0.01:
-                            o.status = "filled"
-                            o.remaining = 0.0
+            if volume_before_us <= 0:
+                continue
+            fill_size = min(o.remaining, volume_before_us)
+            if fill_size < 0.01:
+                continue
+            o.remaining = round(o.remaining - fill_size, 4)
+            self.positions[asset_id] = self.positions.get(asset_id, 0.0) + fill_size
+            # Maker fee = 0; cash for the full resting order was reserved on entry.
+            fill = PaperFill(
+                order_id=oid,
+                asset_id=asset_id,
+                price=o.price,
+                size=fill_size,
+                fee=0.0,
+                role="MAKER",
+                ts=now,
+                queue_ahead_before=queue_ahead_before,
+            )
+            self.fills.append(fill)
+            new_fills.append(fill)
+            if o.remaining < 0.01:
+                o.status = "filled"
+                o.remaining = 0.0
         return new_fills
 
     def confirm_fill(self, fill: PaperFill) -> None:
