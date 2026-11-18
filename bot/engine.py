@@ -1,4 +1,4 @@
-"""TradingEngine — Polymarket Up/Down paper/live trading."""
+"""TradingEngine — Polymarket paper/live. Prices via Coinbase REST (EU-safe)."""
 
 from __future__ import annotations
 
@@ -20,13 +20,6 @@ from .twap_model import AssetPriceTracker
 log = logging.getLogger(__name__)
 NotifyFn = Callable[[str], Any]
 
-try:
-    from polymarket import AsyncPublicClient
-    from polymarket.streams import CryptoPricesChainlinkTwapSpec, CryptoPricesSpec
-    HAS_POLY = True
-except ImportError:
-    HAS_POLY = False
-
 
 @dataclass
 class WindowState:
@@ -44,11 +37,6 @@ class WindowState:
     down_shares: float = 0.0
     up_cost: float = 0.0
     down_cost: float = 0.0
-    open_orders: Dict[str, str] = field(default_factory=dict)
-    best_bid_up: float = 0.0
-    best_ask_up: float = 1.0
-    best_bid_down: float = 0.0
-    best_ask_down: float = 1.0
     last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
@@ -89,13 +77,13 @@ class TradingEngine:
         self.events: List[str] = []
         self._notify_cb: Optional[NotifyFn] = None
         self._streams_ok = False
+        self._price_ok = False
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
 
     def _log_event(self, level: str, msg: str, notify: bool = False) -> None:
-        line = f"{time.strftime('%H:%M:%S')} | {level} | {msg}"
-        self.events.append(line)
+        self.events.append(f"{time.strftime('%H:%M:%S')} | {level} | {msg}")
         if len(self.events) > 200:
             self.events = self.events[-150:]
         log.info("%s", msg)
@@ -110,18 +98,17 @@ class TradingEngine:
                 pass
 
     async def start(self) -> None:
-        if self.cfg.trading_mode == "live" and self.cfg.has_live_credentials:
+        if self.cfg.trading_mode == "live" and getattr(self.cfg, "has_live_credentials", False):
             self.executor = LiveExecutor(self.cfg)
             await self.executor.start()
         else:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо-счёт ${self.cfg.bankroll_usd:.0f} · Polymarket paper", notify=True)
+            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · paper Polymarket", notify=True)
 
         self.running = True
         self._tasks = [
-            asyncio.create_task(self._price_loop(), name="prices"),
-            asyncio.create_task(self._rest_price_loop(), name="rest_prices"),
+            asyncio.create_task(self._rest_price_loop(), name="prices"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
@@ -153,139 +140,103 @@ class TradingEngine:
 
     async def emergency_kill(self) -> Dict[str, Any]:
         self.paused = True
-        canceled = 0
-        if self.executor and hasattr(self.executor, "cancel_all"):
-            canceled = await self.executor.cancel_all()
         merged = 0.0
         for w in list(self.windows.values()):
             if w.mergeable_pairs >= 1.0 and not w.merge_in_flight:
                 merged += await self._execute_merge(w)
-        self._log_event("ALERT", f"СТОП: {canceled} / merge ${merged:.2f}", notify=True)
-        return {"canceled": canceled, "merged_usd": round(merged, 2)}
+        self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
+        return {"canceled": 0, "merged_usd": round(merged, 2)}
 
-    async def _price_loop(self) -> None:
-        if not HAS_POLY:
-            while self.running:
-                await asyncio.sleep(20)
-            return
-        cl_syms = [f"{a.lower()}/usd" for a in self.cfg.enabled_assets]
-        bn_syms = [f"{a.lower()}usdt" for a in self.cfg.enabled_assets]
-        notified = False
-        backoff = 3.0
-        while self.running:
+    async def _fetch_spot(self, asset: str) -> Optional[float]:
+        timeout = aiohttp.ClientTimeout(total=8)
+        cb = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}.get(asset)
+        if cb:
             try:
-                client = AsyncPublicClient()
-                specs = [
-                    CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=cl_syms),
-                    CryptoPricesSpec(topic="prices.crypto.chainlink", symbols=cl_syms),
-                    CryptoPricesSpec(topic="prices.crypto.binance", symbols=bn_syms),
-                ]
-                self._streams_ok = True
-                backoff = 3.0
-                if not notified:
-                    self._log_event("INFO", "Цены подключены (Chainlink TWAP = резолв Polymarket)", notify=True)
-                    notified = True
-                async for ev in client.stream(specs):
-                    if not self.running:
-                        break
-                    try:
-                        topic = str(getattr(ev, "topic", "") or "")
-                        sym = str(getattr(ev, "symbol", "") or "").lower()
-                        val = float(getattr(ev, "value", getattr(ev, "price", 0)) or 0)
-                        ts_ms = int(getattr(ev, "timestamp", time.time() * 1000) or time.time() * 1000)
-                        asset = next((a for a in self.cfg.enabled_assets if a.lower() in sym), None)
-                        if not asset or val <= 0:
-                            continue
-                        tr = self.trackers[asset]
-                        if "twap" in topic:
-                            tr.on_chainlink_twap60(val, ts_ms)
-                            self._capture_boundary(asset, ts_ms / 1000.0, val)
-                        elif "binance" in topic:
-                            tr.on_binance_spot(val, ts_ms)
-                        else:
-                            tr.on_chainlink_spot(val, ts_ms)
-                    except Exception:
-                        pass
-                await asyncio.sleep(1.0)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(f"https://api.coinbase.com/v2/prices/{cb}/spot") as r:
+                        if r.status == 200:
+                            d = await r.json()
+                            px = float((d.get("data") or {}).get("amount") or 0)
+                            if px > 0:
+                                return px
             except Exception as e:
-                self._streams_ok = False
-                log.warning("stream reconnect in %.0fs: %s", backoff, e)
-                await asyncio.sleep(backoff)
-                backoff = min(90.0, backoff * 1.8)
+                log.debug("coinbase %s: %s", asset, e)
+        kr = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}.get(asset)
+        if kr:
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(f"https://api.kraken.com/0/public/Ticker?pair={kr}") as r:
+                        if r.status == 200:
+                            d = await r.json()
+                            for v in (d.get("result") or {}).values():
+                                c0 = (v.get("c") or [None])[0]
+                                if c0:
+                                    px = float(c0)
+                                    if px > 0:
+                                        return px
+            except Exception as e:
+                log.debug("kraken %s: %s", asset, e)
+        return None
 
     async def _rest_price_loop(self) -> None:
-        """REST fallback for fair/PTB when RTDS is silent. Trades still on Polymarket."""
-        sym_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+        notified = False
         while self.running:
             try:
                 now = time.time()
-                for asset, symbol in sym_map.items():
-                    if asset not in self.trackers:
+                ok_any = False
+                for asset in list(self.cfg.enabled_assets):
+                    tr = self.trackers.get(asset)
+                    if not tr:
                         continue
-                    tr = self.trackers[asset]
-                    last = max(getattr(tr, "cl_spot_ts", 0) or 0, getattr(tr, "cl_twap60_ts", 0) or 0)
-                    if last and (now - last) < 8.0:
+                    px = await self._fetch_spot(asset)
+                    if not px:
                         continue
-                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
-                    timeout = aiohttp.ClientTimeout(total=8)
-                    async with aiohttp.ClientSession(timeout=timeout) as s:
-                        async with s.get(url) as r:
-                            if r.status != 200:
-                                continue
-                            data = await r.json()
-                            px = float(data.get("price") or 0)
-                            if px <= 0:
-                                continue
-                            ts_ms = int(now * 1000)
-                            tr.on_binance_spot(px, ts_ms)
-                            if tr.cl_spot is None:
-                                tr.on_chainlink_spot(px, ts_ms)
-                            if tr.cl_twap60 is None:
-                                tr.on_chainlink_twap60(px, ts_ms)
-                            self._capture_boundary(asset, now, px)
-                for w in list(self.windows.values()):
-                    if w.price_to_beat is None and not w.resolved:
-                        tr = self.trackers.get(w.asset)
-                        if not tr:
+                    ok_any = True
+                    ts_ms = int(now * 1000)
+                    tr.on_binance_spot(px, ts_ms)
+                    tr.on_chainlink_spot(px, ts_ms)
+                    tr.on_chainlink_twap60(px, ts_ms)
+                    for w in self.windows.values():
+                        if w.asset != asset:
                             continue
-                        ptb = tr.lookup_twap_at(int(w.start_ts), max_diff_sec=30.0)
-                        if ptb is None and tr.cl_spot:
-                            ptb = tr.cl_spot
-                        if ptb is None and tr.cl_twap60:
-                            ptb = tr.cl_twap60
-                        if ptb:
-                            w.price_to_beat = float(ptb)
-                            self._log_event("INFO", f"{w.slug}: PTB=${ptb:,.2f}")
-            except Exception as e:
-                log.debug("rest prices: %s", e)
-            await asyncio.sleep(3.0)
+                        if w.price_to_beat is None and -5 <= (now - w.start_ts) <= 30:
+                            w.price_to_beat = px
+                        if w.final_price is None and -5 <= (now - w.end_ts) <= 30:
+                            w.final_price = px
 
-    def _capture_boundary(self, asset: str, ts: float, twap_val: float) -> None:
-        for w in self.windows.values():
-            if w.asset != asset:
-                continue
-            if w.price_to_beat is None and -2.0 <= (ts - w.start_ts) <= 15.0:
-                w.price_to_beat = twap_val
-                self._log_event("INFO", f"{w.slug}: priceToBeat=${twap_val:,.2f}")
-            if w.final_price is None and -2.0 <= (ts - w.end_ts) <= 15.0:
-                w.final_price = twap_val
+                for w in list(self.windows.values()):
+                    if w.resolved or w.price_to_beat is not None:
+                        continue
+                    tr = self.trackers.get(w.asset)
+                    if not tr:
+                        continue
+                    ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
+                    if ptb:
+                        w.price_to_beat = float(ptb)
+
+                if ok_any:
+                    self._price_ok = True
+                    self._streams_ok = True
+                    if not notified:
+                        self._log_event("INFO", "Цены OK (Coinbase/Kraken)", notify=True)
+                        notified = True
+            except Exception as e:
+                log.warning("prices: %s", e)
+            await asyncio.sleep(2.0)
 
     async def _discovery_loop(self) -> None:
         while self.running:
             try:
-                await self._discover_windows()
-                self._prune_windows()
+                await self._discover()
+                now = time.time()
+                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 60 and w.mergeable_pairs < 0.5)]
+                for s in dead:
+                    del self.windows[s]
             except Exception as e:
                 log.warning("discovery: %s", e)
             await asyncio.sleep(4)
 
-    def _prune_windows(self) -> None:
-        now = time.time()
-        dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 60 and w.mergeable_pairs < 0.5)]
-        for s in dead:
-            del self.windows[s]
-
-    async def _discover_windows(self) -> None:
+    async def _discover(self) -> None:
         now = time.time()
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
@@ -299,7 +250,7 @@ class TradingEngine:
                     slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
                     if slug in self.windows:
                         continue
-                    meta = await self._fetch_gamma(slug)
+                    meta = await self._gamma(slug)
                     if not meta:
                         continue
                     w = WindowState(
@@ -310,18 +261,18 @@ class TradingEngine:
                         price_to_beat=meta.get("price_to_beat"),
                     )
                     if w.price_to_beat is None:
-                        ptb = self.trackers[asset].lookup_twap_at(int(start), max_diff_sec=15.0)
+                        tr = self.trackers[asset]
+                        ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
                         if ptb:
-                            w.price_to_beat = ptb
+                            w.price_to_beat = float(ptb)
                     self.windows[slug] = w
-                    self._log_event("INFO", f"Окно Polymarket: {slug} τ={w.remain_sec:.0f}s")
+                    self._log_event("INFO", f"Окно {slug} τ={w.remain_sec:.0f}s")
 
-    async def _fetch_gamma(self, slug: str):
-        url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+    async def _gamma(self, slug: str) -> Optional[Dict[str, Any]]:
         try:
             timeout = aiohttp.ClientTimeout(total=12)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url) as r:
+                async with s.get(f"https://gamma-api.polymarket.com/events?slug={slug}") as r:
                     if r.status != 200:
                         return None
                     data = await r.json()
@@ -358,9 +309,9 @@ class TradingEngine:
             try:
                 if not self.paused and not self._risk_halted():
                     for w in list(self.windows.values()):
-                        if w.resolved or w.remain_sec < 10:
+                        if w.resolved or w.remain_sec < 12:
                             continue
-                        await self._run_strategies(w)
+                        await self._run(w)
                         await self._try_merge(w)
             except Exception as e:
                 log.warning("strategy: %s", e)
@@ -373,100 +324,72 @@ class TradingEngine:
             return True
         return False
 
-    async def _run_strategies(self, w: WindowState) -> None:
+    async def _run(self, w: WindowState) -> None:
         tr = self.trackers[w.asset]
+        spot = getattr(tr, "cl_spot", None)
+        twap = getattr(tr, "cl_twap60", None)
         if w.price_to_beat is None:
-            ptb = tr.lookup_twap_at(int(w.start_ts), max_diff_sec=30.0)
-            if ptb is None and tr.cl_twap60 is not None:
-                ptb = tr.cl_twap60
-            if ptb is None and tr.cl_spot is not None:
-                ptb = tr.cl_spot
-            if ptb is None:
-                return
-            w.price_to_beat = float(ptb)
-
-        if tr.cl_spot is None and tr.cl_twap60 is not None:
-            tr.cl_spot = tr.cl_twap60
-            tr.cl_spot_ts = time.time()
-        if tr.cl_spot is None:
+            w.price_to_beat = spot or twap
+        if w.price_to_beat is None or spot is None:
             return
-
         try:
             fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
         except Exception as e:
-            log.debug("fair error: %s", e)
+            log.debug("fair: %s", e)
             return
 
         p = self.params
         tau = w.remain_sec
-        if time.monotonic() - w.last_trade_mono < 10.0:
+        if time.monotonic() - w.last_trade_mono < 12.0:
             return
 
-        has_book = 0.02 < w.best_ask_up < 0.98
-        our_bid = round(max(0.05, fv.prob_up - getattr(p, "min_maker_edge", 0.024)), 2)
-
-        if getattr(p, "enable_lockin", True) and tau <= getattr(p, "lockin_start_remain_sec", 120):
-            if fv.prob_up >= getattr(p, "lockin_min_prob", 0.97):
-                bid = min(getattr(p, "lockin_max_bid", 0.98), round(fv.prob_up - 0.01, 2))
-                if bid >= 0.90 and w.up_shares < 40:
+        if getattr(p, "enable_lockin", True) and tau <= 120:
+            if fv.prob_up >= 0.97 and w.up_shares < 40:
+                bid = min(0.98, round(fv.prob_up - 0.01, 2))
+                if bid >= 0.90:
                     size = max(5.0, round(self.cfg.order_clip_usd / bid, 2))
-                    await self._open_position(w, "Up", bid, size, "lockin")
+                    await self._open(w, "Up", bid, size, "lockin")
                     return
-            if fv.prob_up <= (1.0 - getattr(p, "lockin_min_prob", 0.97)):
-                bid = min(0.98, round((1.0 - fv.prob_up) - 0.01, 2))
-                if bid >= 0.90 and w.down_shares < 40:
+            if fv.prob_up <= 0.03 and w.down_shares < 40:
+                bid = min(0.98, round(1.0 - fv.prob_up - 0.01, 2))
+                if bid >= 0.90:
                     size = max(5.0, round(self.cfg.order_clip_usd / bid, 2))
-                    await self._open_position(w, "Down", bid, size, "lockin")
+                    await self._open(w, "Down", bid, size, "lockin")
                     return
 
-        if getattr(p, "enable_maker", True) and tau >= getattr(p, "maker_start_sec", 6):
-            lo = getattr(p, "maker_min_price", 0.25)
-            hi = getattr(p, "maker_max_price", 0.90)
-            if lo <= our_bid <= hi and fv.prob_up >= 0.55 and w.up_shares < 45:
-                size = max(5.0, round(self.cfg.order_clip_usd / max(our_bid, 0.05), 2))
-                await self._open_position(w, "Up", our_bid, size, "maker_entry")
-                return
-            fair_down = 1.0 - fv.prob_up
-            our_bid_dn = round(max(0.05, fair_down - getattr(p, "min_maker_edge", 0.024)), 2)
-            if lo <= our_bid_dn <= hi and fair_down >= 0.55 and w.down_shares < 45:
-                size = max(5.0, round(self.cfg.order_clip_usd / max(our_bid_dn, 0.05), 2))
-                await self._open_position(w, "Down", our_bid_dn, size, "maker_entry")
-                return
+        if getattr(p, "enable_maker", True) and tau >= 8:
+            edge = getattr(p, "min_maker_edge", 0.024)
+            if fv.prob_up >= 0.55 and w.up_shares < 45:
+                px = round(max(0.05, min(0.90, fv.prob_up - edge)), 2)
+                if 0.25 <= px <= 0.90:
+                    size = max(5.0, round(self.cfg.order_clip_usd / px, 2))
+                    await self._open(w, "Up", px, size, "maker_entry")
+                    return
+            fair_dn = 1.0 - fv.prob_up
+            if fair_dn >= 0.55 and w.down_shares < 45:
+                px = round(max(0.05, min(0.90, fair_dn - edge)), 2)
+                if 0.25 <= px <= 0.90:
+                    size = max(5.0, round(self.cfg.order_clip_usd / px, 2))
+                    await self._open(w, "Down", px, size, "maker_entry")
+                    return
 
             if w.up_shares >= 5 and w.down_shares < w.up_shares - 0.5:
                 target = 1.0 - w.entry_vwap_up - getattr(p, "take_profit_edge", 0.015)
                 need = round(w.up_shares - w.down_shares, 2)
                 if target > 0.05 and need >= 5:
-                    await self._open_position(w, "Down", min(round(target, 2), 0.97), need, "syn_tp")
-                    return
-            if w.down_shares >= 5 and w.up_shares < w.down_shares - 0.5:
-                vwap_dn = w.down_cost / w.down_shares if w.down_shares else 0.5
-                target = 1.0 - vwap_dn - getattr(p, "take_profit_edge", 0.015)
-                need = round(w.down_shares - w.up_shares, 2)
-                if target > 0.05 and need >= 5:
-                    await self._open_position(w, "Up", min(round(target, 2), 0.97), need, "syn_tp")
+                    await self._open(w, "Down", min(round(target, 2), 0.97), need, "syn_tp")
                     return
 
-        if getattr(p, "enable_taker", True) and has_book and 12 <= tau <= 240:
-            fee_ps = calc_taker_fee_per_share(w.best_ask_up, w.asset, w.timeframe)
-            net = fv.prob_up - w.best_ask_up - fee_ps
-            min_e = getattr(p, "min_taker_net_edge_btc", 0.038) if w.asset == "BTC" else getattr(p, "min_taker_net_edge_alt", 0.024)
-            if net >= min_e and w.up_shares < 40:
-                size = max(5.0, round(self.cfg.order_clip_usd / w.best_ask_up, 2))
-                await self._open_position(w, "Up", w.best_ask_up, size, "taker", taker=True)
-
-    async def _open_position(self, w, outcome, price, size, reason, taker=False) -> None:
+    async def _open(self, w, outcome, price, size, reason) -> None:
         price = round(max(0.01, min(0.99, price)), 2)
         size = round(max(5.0, size), 2)
         cost = price * size
-        if cost > self.cash + 1e-6:
-            size = max(5.0, round((self.cash * 0.95) / max(price, 0.01), 2))
+        if cost > self.cash:
+            size = max(5.0, round(self.cash * 0.95 / max(price, 0.01), 2))
             cost = price * size
             if size < 5:
                 return
-        role = "TAKER" if taker else "MAKER"
-        fee = calc_taker_fee_per_share(price, w.asset, w.timeframe) * size if taker else 0.0
-        self.cash -= cost + fee
+        self.cash -= cost
         if outcome == "Up":
             w.up_shares += size
             w.up_cost += cost
@@ -474,22 +397,20 @@ class TradingEngine:
             w.down_shares += size
             w.down_cost += cost
         w.last_trade_mono = time.monotonic()
-        self.fees_paid += fee
         try:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role=role,
-                reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
+                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="MAKER",
+                reason=reason, shares=size, price=price, fee=0.0, fair_prob=price,
                 tx_or_order_id=f"paper-{int(time.time())}",
             )
         except Exception:
             pass
-        fee_s = f" fee ${fee:.3f}" if fee else " 0% fee"
-        self._log_event("INFO", f"{'⚡' if taker else '🟢'} {role} {outcome} {size:.1f}@{price:.2f} {w.asset} [{reason}]{fee_s}\n<code>{w.slug}</code>", notify=True)
+        self._log_event("INFO", f"🟢 MAKER {outcome} {size:.1f}@{price:.2f} {w.asset} [{reason}]\n<code>{w.slug}</code>", notify=True)
 
     async def _try_merge(self, w) -> None:
         pairs = w.mergeable_pairs
-        if pairs < 5.0 and not (pairs >= 1.0 and abs(w.net_shares) < 0.5):
+        if pairs < 5 and not (pairs >= 1 and abs(w.net_shares) < 0.5):
             return
         if w.merge_in_flight:
             return
@@ -497,14 +418,14 @@ class TradingEngine:
 
     async def _execute_merge(self, w) -> float:
         pairs = round(w.mergeable_pairs, 4)
-        if pairs < 1.0:
+        if pairs < 1:
             return 0.0
         w.merge_in_flight = True
         try:
-            up_part = (pairs / w.up_shares) * w.up_cost if w.up_shares > 0 else 0.0
-            dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares > 0 else 0.0
+            up_part = (pairs / w.up_shares) * w.up_cost if w.up_shares else 0.0
+            dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares else 0.0
             cost = up_part + dn_part
-            locked = pairs * 1.0 - cost
+            locked = pairs - cost
             w.up_shares = max(0.0, w.up_shares - pairs)
             w.down_shares = max(0.0, w.down_shares - pairs)
             w.up_cost = max(0.0, w.up_cost - up_part)
@@ -514,12 +435,11 @@ class TradingEngine:
             try:
                 self.ledger.record_merge(
                     mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                    pairs=pairs, cost_basis=cost, locked_pnl=locked,
-                    tx_hash=f"paper-merge-{int(time.time())}",
+                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}",
                 )
             except Exception:
                 pass
-            self._log_event("INFO", f"♻️ MERGE {pairs:.1f} пар → ${locked:+.2f} · <code>{w.slug}</code>", notify=True)
+            self._log_event("INFO", f"♻️ MERGE {pairs:.1f} → ${locked:+.2f}\n<code>{w.slug}</code>", notify=True)
             return pairs
         finally:
             w.merge_in_flight = False
@@ -530,18 +450,17 @@ class TradingEngine:
                 for w in list(self.windows.values()):
                     if w.resolved or w.remain_sec > -15:
                         continue
-                    await self._resolve_window(w)
+                    await self._resolve(w)
             except Exception as e:
                 log.warning("resolve: %s", e)
             await asyncio.sleep(6)
 
-    async def _resolve_window(self, w) -> None:
+    async def _resolve(self, w) -> None:
         winner = None
         try:
-            url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url) as r:
+                async with s.get(f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}") as r:
                     if r.status == 200:
                         data = await r.json()
                         items = data.get("data") if isinstance(data, dict) else data
@@ -555,36 +474,31 @@ class TradingEngine:
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
         if winner is None and w.price_to_beat is not None:
-            tw = self.trackers[w.asset].twap60 if hasattr(self.trackers[w.asset], "twap60") else self.trackers[w.asset].cl_twap60
-            if tw is not None and w.remain_sec <= 0:
-                winner = "Up" if tw >= w.price_to_beat else "Down"
+            spot = getattr(self.trackers[w.asset], "cl_spot", None)
+            if spot is not None:
+                winner = "Up" if spot >= w.price_to_beat else "Down"
         if winner is None:
             return
-        if winner == "Up":
-            payout = w.up_shares * 1.0
-            gross = payout - w.up_cost - w.down_cost
-        else:
-            payout = w.down_shares * 1.0
-            gross = payout - w.up_cost - w.down_cost
+        payout = (w.up_shares if winner == "Up" else w.down_shares)
+        gross = payout - w.up_cost - w.down_cost
         self.cash += payout
-        net = gross
-        self.realized_pnl += net
-        self.day_pnl += net
-        self.consecutive_losses = self.consecutive_losses + 1 if net < 0 else 0
+        self.realized_pnl += gross
+        self.day_pnl += gross
+        self.consecutive_losses = self.consecutive_losses + 1 if gross < 0 else 0
         try:
             self.ledger.record_resolution(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
                 price_to_beat=w.price_to_beat, final_price=w.final_price,
                 up_shares=w.up_shares, down_shares=w.down_shares,
-                gross_pnl=gross, fees=0.0, net_pnl=net,
+                gross_pnl=gross, fees=0.0, net_pnl=gross,
             )
         except Exception:
             pass
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
-        emoji = "✅" if net >= 0 else "❌"
-        self._log_event("INFO", f"{emoji} RESOLVED <b>{winner}</b> · Net <b>${net:+.2f}</b>\n<code>{w.slug}</code>", notify=True)
+        emoji = "✅" if gross >= 0 else "❌"
+        self._log_event("INFO", f"{emoji} RESOLVED {winner} · ${gross:+.2f}\n<code>{w.slug}</code>", notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
         try:
@@ -599,22 +513,20 @@ class TradingEngine:
                 continue
             fair = None
             if w.price_to_beat is not None:
-                try:
-                    tr = self.trackers[w.asset]
-                    if tr.cl_spot is None and tr.cl_twap60 is not None:
-                        tr.cl_spot = tr.cl_twap60
-                    if tr.cl_spot is not None:
+                tr = self.trackers[w.asset]
+                if getattr(tr, "cl_spot", None) is not None:
+                    try:
                         fair = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts)).prob_up
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             windows.append({
                 "slug": w.slug, "asset": w.asset,
                 "remain_sec": round(w.remain_sec, 1),
                 "price_to_beat": w.price_to_beat,
                 "fair_up": round(fair, 4) if fair is not None else None,
-                "best_ask_up": w.best_ask_up, "best_bid_up": w.best_bid_up,
                 "net_shares": round(w.net_shares, 2),
-                "up_shares": round(w.up_shares, 2), "down_shares": round(w.down_shares, 2),
+                "up_shares": round(w.up_shares, 2),
+                "down_shares": round(w.down_shares, 2),
                 "mergeable": round(w.mergeable_pairs, 2),
             })
         windows.sort(key=lambda x: x["remain_sec"])
@@ -627,11 +539,11 @@ class TradingEngine:
             "cash": round(self.cash, 2),
             "realized_pnl": round(self.realized_pnl, 2),
             "day_pnl": round(self.day_pnl, 2),
-            "total_exposure": round(sum(max(w.up_shares, w.down_shares) * 0.5 for w in self.windows.values() if not w.resolved), 2),
+            "total_exposure": 0.0,
             "stats": stats,
             "windows": windows,
             "events": self.events[-40:],
             "fee_regime": fee_regime_label(),
             "assets": self.cfg.enabled_assets,
-            "streams_ok": self._streams_ok,
+            "streams_ok": self._price_ok,
         }
