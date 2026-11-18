@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bot.oracle_feed import PolymarketOracleFeed
 
 
 WALLET = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
@@ -195,7 +200,10 @@ async def check_boundary_twap_vs_gamma(
             if asset == "BTC" and kind == "chainlink_twap60" and start_ts - 2 <= ts <= start_ts + 2:
                 samples.append((ts, price))
     finally:
-        await iterator.aclose()
+        try:
+            await asyncio.wait_for(iterator.aclose(), timeout=5.0)
+        except (asyncio.TimeoutError, RuntimeError):
+            pass
 
     if not samples:
         raise RuntimeError("No BTC Chainlink TWAP60 samples observed within ±2s of the next 5m boundary")
