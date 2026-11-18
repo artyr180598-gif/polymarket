@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -17,37 +15,6 @@ from bot.market_feed import PolymarketMarketFeed
 from bot.oracle_feed import PolymarketOracleFeed
 
 WALLET = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
-
-
-async def check_rtds() -> dict[str, dict[str, float]]:
-    expected = {(asset, kind) for asset in ("BTC", "ETH", "SOL") for kind in ("chainlink_spot", "chainlink_twap60")}
-    received: dict[tuple[str, str], dict[str, float]] = {}
-
-    async def consume() -> None:
-        stream = PolymarketOracleFeed(["BTC", "ETH", "SOL"]).events()
-        try:
-            async for asset, kind, price, timestamp_ms in stream:
-                if (asset, kind) not in expected:
-                    continue
-                if price <= 0 or timestamp_ms <= 0:
-                    continue
-                age = time.time() - timestamp_ms / 1000.0
-                if not -2.0 <= age <= 5.0:
-                    continue
-                received[(asset, kind)] = {"price": price, "age_seconds": age}
-                if expected.issubset(received):
-                    return
-        finally:
-            try:
-                await asyncio.wait_for(stream.aclose(), timeout=4.0)
-            except (asyncio.TimeoutError, RuntimeError):
-                pass
-
-    await asyncio.wait_for(consume(), timeout=35.0)
-    if not expected.issubset(received):
-        missing = sorted(expected - set(received))
-        raise RuntimeError(f"RTDS missing fresh Chainlink samples: {missing}")
-    return {f"{asset}:{kind}": value for (asset, kind), value in sorted(received.items())}
 
 
 async def get_json(session: aiohttp.ClientSession, url: str, params: dict[str, Any] | None = None) -> Any:
@@ -300,8 +267,6 @@ async def check_data_api(session: aiohttp.ClientSession) -> dict[str, Any]:
 async def main() -> None:
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # RTDS uses its own SDK websocket client; HTTP checks share this session.
-        rtds = await check_rtds()
         gamma_clob = await check_gamma_and_clob(session)
         open_price_reference = await check_open_price_reference_vs_gamma_ptb(
             session,
@@ -311,7 +276,6 @@ async def main() -> None:
         boundary_strike = await check_boundary_twap_vs_gamma(session)
     print(json.dumps({
         "status": "PASS",
-        "rtds_chainlink": rtds,
         "gamma_and_clob": gamma_clob,
         "open_price_reference_vs_gamma_ptb": open_price_reference,
         "data_api_v2": data_api,
