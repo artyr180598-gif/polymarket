@@ -207,3 +207,20 @@ def test_telegram_resume_reports_risk_halt_instead_of_claiming_success():
     reply, _keyboard = asyncio.run(controller._handle("resume"))
     assert "Возобновление заблокировано" in reply
     assert "Chainlink/Gamma" in reply
+
+
+
+def test_telegram_help_explains_history_and_risk_controls():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+            strategy_preset="mo_money",
+        ),
+        params=SimpleNamespace(title_ru="Mo Money"),
+    )
+    controller = TelegramController(engine)
+    message = controller._fmt_help()
+    assert "gross, комиссии и net" in message
+    assert "отдельным ногам исполнения" not in message
+    assert "расхождению Chainlink/Gamma" in message
