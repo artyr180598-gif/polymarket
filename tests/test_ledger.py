@@ -370,3 +370,42 @@ def test_market_history_excludes_anchor_only_windows_without_trades(tmp_path) ->
 
     assert ledger.market_history("paper", 10) == []
     ledger.conn.close()
+
+
+
+def test_combined_daily_pnl_deducts_fees_once_across_merge_and_resolution(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "combined-daily-pnl.db"))
+    slug = "btc-updown-5m-1795035600"
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.40, fee=0.10)
+    _record_buy(ledger, slug=slug, outcome="Down", shares=10, price=0.50, fee=0.10)
+    ledger.record_merge(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        pairs=5,
+        cost_basis=4.50,
+        locked_pnl=0.50,
+        tx_hash="paper-test-partial-merge",
+    )
+    ledger.record_resolution(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100000.0,
+        final_price=100001.0,
+        up_shares_total=5,
+        down_shares_total=5,
+        merged_pairs=5,
+        gross_cost=4.50,
+        total_fees=0.20,
+        total_payout=5.0,
+    )
+
+    stats = ledger.get_stats("paper")
+    # Gross: $0.50 merge + $0.50 resolution; the $0.20 fees are deducted once.
+    assert round(stats["today_total_net_pnl"], 2) == 0.80
+    assert round(stats["lifetime_total_net_pnl"], 2) == 0.80
+    ledger.conn.close()
