@@ -57,7 +57,6 @@ class TelegramController:
 
     async def start(self) -> None:
         if not self.enabled:
-            logger.info("Telegram disabled")
             return
         self._running = True
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40))
@@ -127,6 +126,7 @@ class TelegramController:
         day_e = "📈" if day >= 0 else "📉"
         wins = int(st.get("wins") or 0)
         losses = int(st.get("losses") or 0)
+        n_fills = stats.get("total_fills", 0) or len(st.get("fill_history") or [])
         lines = [
             f"{state_emoji} <b>PolyBot — {state_txt}</b>",
             "━━━━━━━━━━━━━━━━",
@@ -137,7 +137,7 @@ class TelegramController:
             f"💸 Cash: ${cash:,.2f}",
             f"{day_e} Сегодня: <b>{day_s}</b>",
             "",
-            f"Входов: {stats.get('total_fills', 0) or len(st.get('fill_history') or [])}",
+            f"Входов: {n_fills}",
             f"MERGE: {stats.get('merge_count', 0)} (${stats.get('merged_locked_pnl', 0):+.2f})",
             f"Окна: ✅ {wins} / ❌ {losses} · винрейт {stats.get('win_rate_pct', 0)}%",
             f"Realized: ${stats.get('realized_net_pnl', 0):+.2f}",
@@ -169,6 +169,7 @@ class TelegramController:
         realized = stats.get("realized_net_pnl", 0) or 0
         wins = int(st.get("wins") or 0)
         losses = int(st.get("losses") or 0)
+        n_fills = stats.get("total_fills", 0) or len(st.get("fill_history") or [])
         emoji = "📈" if pnl >= 0 else "📉"
         return (
             f"💰 <b>Прибыль и убытки (демо)</b>\n"
@@ -179,12 +180,11 @@ class TelegramController:
             f"{emoji} Итого: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
             f"Сегодня: <b>${day:+.2f}</b>\n\n"
             f"· Realized: <b>${realized:+.2f}</b>\n"
-            f"· Входов (ставок): {stats.get('total_fills', 0) or len(st.get('fill_history') or [])}\n"
+            f"· Входов (ставок): {n_fills}\n"
             f"· MERGE: {stats.get('merge_count', 0)} (locked ${stats.get('merged_locked_pnl', 0):+.2f})\n"
             f"· Окна ✅ прибыльных: {wins}\n"
             f"· Окна ❌ убыточных: {losses}\n"
-            f"· Винрейт: {stats.get('win_rate_pct', 0)}%\n"
-            f"· Комиссии: ${stats.get('total_fees', 0):.4f}\n\n"
+            f"· Винрейт: {stats.get('win_rate_pct', 0)}%\n\n"
             f"<i>Минус = убыток на демо-счёте.</i>"
         )
 
@@ -212,33 +212,56 @@ class TelegramController:
 
     def _fmt_fills(self) -> str:
         st = self.engine.snapshot()
-        fills = st.get("fill_history") or []
+        fills = list(st.get("fill_history") or [])
         if not fills:
             try:
                 fills = self.engine.ledger.recent_fills(self.engine.cfg.trading_mode, limit=15)
             except Exception:
                 fills = []
-        merges = st.get("merge_history") or []
-        resolves = st.get("resolve_history") or []
+        events = st.get("events") or getattr(self.engine, "events", []) or []
+        if not fills:
+            for line in reversed(events):
+                if "Купил" in line or "MAKER" in line:
+                    fills.append({"raw": line})
+                    if len(fills) >= 12:
+                        break
+        merges = list(st.get("merge_history") or [])
+        if not merges:
+            for line in reversed(events):
+                if "MERGE" in line:
+                    merges.append({"raw": line})
+                    if len(merges) >= 5:
+                        break
+        resolves = list(st.get("resolve_history") or [])
+        if not resolves:
+            for line in reversed(events):
+                if "Окно закрылось" in line or "RESOLVED" in line:
+                    resolves.append({"raw": line})
+                    if len(resolves) >= 5:
+                        break
         wins = int(st.get("wins") or 0)
         losses = int(st.get("losses") or 0)
         stats = st.get("stats") or {}
         n_fills = len(getattr(self.engine, "_fill_history", None) or fills)
-
         lines = [
             "📋 <b>История сделок</b> (демо)",
             "━━━━━━━━━━━━━━━━",
             f"Всего входов: <b>{n_fills}</b>",
-            f"MERGE: {len(getattr(self.engine, '_merge_history', []) or merges)} · ${st.get('merge_profit', 0):+.2f}",
-            f"Окна: ✅ {wins} прибыльных / ❌ {losses} убыточных",
+            f"MERGE: {len(getattr(self.engine, '_merge_history', None) or merges)}",
+            f"Окна: ✅ {wins} / ❌ {losses}",
             f"Realized: ${stats.get('realized_net_pnl', 0):+.2f}",
             "",
-            "<b>Последние покупки:</b>",
+            "<b>Последние:</b>",
         ]
-        if not fills:
-            lines.append("пока пусто (жди 🟢 уведомление)")
-        else:
-            for f in fills[:12]:
+        if not fills and not merges and not resolves:
+            lines.append("пока пусто — после 🟢 Купил появится здесь")
+        for f in fills[:12]:
+            if f.get("raw"):
+                raw = f["raw"]
+                if " | " in raw:
+                    raw = raw.split(" | ", 2)[-1]
+                lines.append(f"• {raw[:120]}")
+            else:
                 outcome = f.get("outcome") or "?"
                 side = "ВВЕРХ" if str(outcome).lower() in ("up", "yes") else (
                     "ВНИЗ" if str(outcome).lower() in ("down", "no") else str(outcome)
@@ -246,29 +269,36 @@ class TelegramController:
                 shares = float(f.get("shares") or 0)
                 price = float(f.get("price") or 0)
                 asset = f.get("asset") or ""
-                slug = (f.get("slug") or "")[:20]
-                lines.append(f"🟢 {side} {asset} {shares:.1f}×{price*100:.0f}¢ · <code>{slug}</code>")
+                lines.append(f"🟢 {side} {asset} {shares:.1f}×{price*100:.0f}¢")
         if merges:
             lines.append("")
             lines.append("<b>MERGE:</b>")
             for m in merges[:5]:
-                lines.append(f"♻️ {m.get('pairs', 0):.0f} пар → ${m.get('locked_pnl', 0):+.2f}")
+                if m.get("raw"):
+                    raw = m["raw"].split(" | ", 2)[-1] if " | " in m["raw"] else m["raw"]
+                    lines.append(f"♻️ {raw[:100]}")
+                else:
+                    lines.append(f"♻️ {m.get('pairs', 0):.0f} пар → ${m.get('locked_pnl', 0):+.2f}")
         if resolves:
             lines.append("")
             lines.append("<b>Закрытие окон:</b>")
             for r in resolves[:5]:
-                g = float(r.get("gross") or r.get("pnl") or 0)
-                e = "✅" if g >= 0 else "❌"
-                lines.append(f"{e} {r.get('winner', '?')} ${g:+.2f} · <code>{(r.get('slug') or '')[:18]}</code>")
+                if r.get("raw"):
+                    raw = r["raw"].split(" | ", 2)[-1] if " | " in r["raw"] else r["raw"]
+                    lines.append(f"• {raw[:100]}")
+                else:
+                    g = float(r.get("gross") or 0)
+                    e = "✅" if g >= 0 else "❌"
+                    lines.append(f"{e} ${g:+.2f}")
         return "\n".join(lines)
 
     def _fmt_help(self) -> str:
         return (
             "ℹ️ <b>Помощь</b>\n━━━━━━━━━━━━━━━━\n"
             "Демо на живых окнах Polymarket.\n"
-            "📊 Статус · 💰 PnL (прибыль/убыток)\n"
-            "📈 Позиции · 📋 История сделок\n"
-            "В истории: входы, MERGE, ✅/❌ по окнам."
+            "📊 Статус · 💰 PnL\n"
+            "📈 Позиции · 📋 История\n"
+            "В истории: входы, MERGE, закрытия окон."
         )
 
     def _fmt_presets(self) -> str:
