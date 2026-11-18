@@ -502,10 +502,11 @@ class TradingEngine:
                 fee_dn = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
                 total = sz * (ask_up + ask_dn) + fee_up + fee_dn
                 if total < sz * 0.998:
-                    await self._open(w, "Up", float(ask_up), sz, "pair_arb", fee=fee_up, fair_prob=fair_up)
-                    await self._open(w, "Down", float(ask_dn), sz, "pair_arb", fee=fee_dn, fair_prob=fair_dn)
-                    await self._try_merge(w)
-                    return
+                    if await self._open_pair(
+                        w, float(ask_up), float(ask_dn), sz, fee_up, fee_dn, fair_up, fair_dn
+                    ):
+                        await self._try_merge(w)
+                        return
 
         if w.up_shares >= 6 and w.down_shares < w.up_shares and ask_dn is not None:
             need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
@@ -569,6 +570,72 @@ class TradingEngine:
                 fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
                 await self._open(w, "Down", float(ask_dn), sz, "taker_entry", fee=fee, fair_prob=fair_dn)
                 return
+
+    async def _open_pair(
+        self,
+        w: WindowState,
+        price_up: float,
+        price_down: float,
+        size: float,
+        fee_up: float,
+        fee_down: float,
+        fair_up: float,
+        fair_down: float,
+    ) -> bool:
+        """All-or-nothing PAPER accounting for a paired Up/Down entry."""
+        if size < 5.0 or not (0 < price_up < 1 and 0 < price_down < 1):
+            return False
+        if fee_up < 0 or fee_down < 0:
+            return False
+        combined_cost = size * (price_up + price_down) + fee_up + fee_down
+        window_exposure = w.up_cost + w.down_cost
+        total_exposure = sum(
+            max(0.0, item.up_cost) + max(0.0, item.down_cost)
+            for item in self.windows.values() if not item.resolved
+        )
+        if window_exposure + combined_cost > self.cfg.max_window_risk_usd:
+            return False
+        if total_exposure + combined_cost > self.cfg.max_total_exposure_usd:
+            return False
+        if combined_cost > self.cash + 1e-9:
+            return False
+        ts = time.time()
+        fills = [
+            {
+                "ts": ts, "mode": self.cfg.trading_mode, "slug": w.slug,
+                "condition_id": w.condition_id, "asset": w.asset, "timeframe": w.timeframe,
+                "outcome": "Up", "role": "TAKER_CLOB", "reason": "pair_arb",
+                "shares": size, "price": price_up, "fee": fee_up, "fair_prob": fair_up,
+                "tx_or_order_id": f"paper-pair-up-{time.time_ns()}",
+            },
+            {
+                "ts": ts, "mode": self.cfg.trading_mode, "slug": w.slug,
+                "condition_id": w.condition_id, "asset": w.asset, "timeframe": w.timeframe,
+                "outcome": "Down", "role": "TAKER_CLOB", "reason": "pair_arb",
+                "shares": size, "price": price_down, "fee": fee_down, "fair_prob": fair_down,
+                "tx_or_order_id": f"paper-pair-down-{time.time_ns()}",
+            },
+        ]
+        try:
+            self.ledger.record_fills_atomic(fills)
+        except Exception as exc:
+            log.exception("PAPER pair not persisted; refusing both legs: %s", exc)
+            return False
+        w.up_shares += size
+        w.down_shares += size
+        w.up_cost += size * price_up
+        w.down_cost += size * price_down
+        w.last_trade_mono = time.monotonic()
+        self.cash -= combined_cost
+        self.fees_paid += fee_up + fee_down
+        self._log_event(
+            "INFO",
+            f"🟢 PAPER-пара Up/Down {w.asset}: {size:.2f} + {size:.2f} шт; "
+            f"цены {price_up:.4f}/{price_down:.4f}; комиссии ${fee_up + fee_down:.4f}; "
+            f"общая стоимость ${combined_cost:.4f}\n<code>{w.slug}</code>",
+            notify=True,
+        )
+        return True
 
     async def _open(self, w, outcome, price, size, reason, fee: float = 0.0, fair_prob: Optional[float] = None) -> None:
         price = float(price)  # preserve exact CLOB tick price; never round a real quote
