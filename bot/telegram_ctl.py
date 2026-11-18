@@ -46,6 +46,9 @@ class TelegramController:
         self.chat_id = str(engine.cfg.telegram_chat_id or "").strip()
         self.enabled = bool(self.token and self.chat_id)
         self._task: Optional[asyncio.Task] = None
+        self._notification_task: Optional[asyncio.Task] = None
+        self._notification_retry_interval = 1.0
+        self._notification_wakeup = asyncio.Event()
         self._running = False
         self._offset = 0
         self._session: Optional[aiohttp.ClientSession] = None
@@ -88,6 +91,9 @@ class TelegramController:
                         self._offset = max(int(item["update_id"]) for item in pending) + 1
         except Exception as exc:
             logger.warning("Could not prime Telegram update offset: %s", exc)
+        self._notification_task = asyncio.create_task(
+            self._notification_delivery_loop(), name="telegram_notification_delivery"
+        )
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
         preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
@@ -127,12 +133,15 @@ class TelegramController:
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._notification_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._notification_task = None
         if self._session:
             await self._session.close()
             self._session = None
@@ -182,14 +191,11 @@ class TelegramController:
             return
         if not self.enabled:
             return
-        if self._session is None:
-            # Do not drop fills/position-open events emitted during engine startup.
-            self._pending_notifications.append(msg[:3500])
-            self._pending_notifications = self._pending_notifications[-100:]
-            return
         self._pending_notifications.append(msg[:3500])
         self._pending_notifications = self._pending_notifications[-100:]
-        await self._drain_pending_notifications()
+        self._notification_wakeup.set()
+        if self._session is not None:
+            await self._drain_pending_notifications()
 
     async def _flush_pending_notifications(self) -> None:
         await self._drain_pending_notifications()
@@ -203,10 +209,26 @@ class TelegramController:
                 msg = self._pending_notifications[0]
                 delivered = await self.send(f"🔔 {msg}", keyboard=_kb_main())
                 if not delivered:
-                    # Leave the head item queued. The polling loop retries after
-                    # the next Telegram update cycle or a reconnect.
+                    # Leave the head item queued. The dedicated delivery worker
+                    # retries independently of Telegram's long-poll command loop.
                     break
                 self._pending_notifications.pop(0)
+
+    async def _notification_delivery_loop(self) -> None:
+        """Retry queued trade events independently from the long-polling bot loop."""
+        while self._running:
+            self._notification_wakeup.clear()
+            await self._drain_pending_notifications()
+            try:
+                await asyncio.wait_for(
+                    self._notification_wakeup.wait(),
+                    timeout=self._notification_retry_interval if self._pending_notifications else None,
+                )
+            except asyncio.TimeoutError:
+                # A failed delivery is retried after a short bounded delay.
+                continue
+            except asyncio.CancelledError:
+                raise
 
     async def _answer_callback(self, cq_id: str) -> None:
         if self._session:
