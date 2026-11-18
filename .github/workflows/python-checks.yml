@@ -1,5 +1,10 @@
 name: Python checks
 
+# Keep only the newest validation for each PR/branch while runners are queued.
+concurrency:
+  group: python-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
   workflow_dispatch:
