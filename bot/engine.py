@@ -1,4 +1,4 @@
-"""TradingEngine — honest paper: real CLOB depth + taker fees + real windows."""
+"""TradingEngine — honest paper: real CLOB best-ask + depth + taker fees."""
 
 from __future__ import annotations
 
@@ -111,7 +111,7 @@ class TradingEngine:
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
         ]
-        self._log_event("INFO", f"Старт · honest paper (depth+fees)", notify=True)
+        self._log_event("INFO", "Старт · honest paper (best-ask fix)", notify=True)
 
     async def stop(self) -> None:
         self.running = False
@@ -300,32 +300,43 @@ class TradingEngine:
             return None
 
     async def _clob_ask_info(self, token_id: str):
-        """(best_ask, size_at_ask) from real CLOB book, or None."""
+        """(best_ask, size_at_best_ask). Book asks are often high→low; use /price for best."""
         if not token_id:
             return None
         try:
             timeout = aiohttp.ClientTimeout(total=6)
             async with aiohttp.ClientSession(timeout=timeout) as s:
+                best_px = None
+                depth = 12.0
+                async with s.get(
+                    f"https://clob.polymarket.com/price?token_id={token_id}&side=BUY"
+                ) as r:
+                    if r.status == 200:
+                        pd = await r.json()
+                        if pd.get("price") is not None:
+                            best_px = float(pd["price"])
                 async with s.get(f"https://clob.polymarket.com/book?token_id={token_id}") as r:
                     if r.status == 200:
                         d = await r.json()
                         asks = d.get("asks") or []
-                        if asks:
-                            best = asks[0]
-                            px = float(best.get("price") or 0)
-                            sz = float(best.get("size") or 0)
-                            if px > 0:
-                                return (px, max(0.0, sz))
-                async with s.get(
-                    f"https://clob.polymarket.com/price?token_id={token_id}&side=BUY"
-                ) as r2:
-                    if r2.status != 200:
-                        return None
-                    pd = await r2.json()
-                    px = pd.get("price")
-                    if px is None:
-                        return None
-                    return (float(px), 12.0)
+                        levels = []
+                        for a in asks:
+                            try:
+                                px = float(a.get("price") or 0)
+                                sz = float(a.get("size") or 0)
+                            except Exception:
+                                continue
+                            if px > 0 and sz > 0:
+                                levels.append((px, sz))
+                        if levels:
+                            min_px = min(px for px, _ in levels)
+                            if best_px is None:
+                                best_px = min_px
+                            depth = sum(sz for px, sz in levels if abs(px - best_px) < 0.015)
+                            depth = max(depth, 5.0)
+                if best_px is None or best_px <= 0:
+                    return None
+                return (best_px, float(depth))
         except Exception:
             return None
 
@@ -344,7 +355,7 @@ class TradingEngine:
                         await self._try_merge(w)
             except Exception as e:
                 log.warning("strategy: %s", e)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(1.5)
 
     def _risk_halted(self) -> bool:
         if self.day_pnl <= -self.cfg.max_daily_loss_usd:
@@ -354,7 +365,6 @@ class TradingEngine:
         return False
 
     async def _run(self, w: WindowState) -> None:
-        """Honest paper: CLOB depth + taker fees."""
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
         if w.price_to_beat is None:
@@ -369,11 +379,11 @@ class TradingEngine:
         tau = w.remain_sec
         fair_up = float(fv.prob_up)
         fair_dn = 1.0 - fair_up
-        edge = 0.035
+        edge = 0.03
         clip = max(8.0, float(self.cfg.order_clip_usd))
         max_side = 25.0
 
-        if time.monotonic() - w.last_trade_mono < 25.0:
+        if time.monotonic() - w.last_trade_mono < 12.0:
             return
         if tau < 15:
             return
@@ -386,64 +396,71 @@ class TradingEngine:
         ask_up, depth_up = up_info if up_info else (None, 0.0)
         ask_dn, depth_dn = dn_info if dn_info else (None, 0.0)
 
+        if ask_up is not None and ask_dn is not None and int(time.time()) % 30 < 2:
+            log.info(
+                "CLOB %s ask_up=%.3f(d=%.0f) ask_dn=%.3f(d=%.0f) sum=%.3f",
+                w.asset, ask_up, depth_up, ask_dn, depth_dn, ask_up + ask_dn,
+            )
+
+        # Pair arb after fees
         if ask_up is not None and ask_dn is not None and abs(w.net_shares) < 5:
-            max_by_book = min(depth_up, depth_dn) * 0.40
-            sz = min(clip / max(ask_up, ask_dn, 0.05), max_by_book, 18.0)
+            max_by_book = min(depth_up, depth_dn) * 0.45
+            sz = min(clip / max(ask_up, ask_dn, 0.05), max_by_book, 20.0)
             sz = round(max(0.0, sz), 2)
-            if sz >= 5.0 and (ask_up + ask_dn) <= 0.97:
+            if sz >= 5.0 and (ask_up + ask_dn) <= 0.985:
                 fee_up = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
                 fee_dn = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
                 total = sz * (ask_up + ask_dn) + fee_up + fee_dn
-                if total < sz * 0.995:
+                if total < sz * 0.998:
                     await self._open(w, "Up", float(ask_up), sz, "pair_arb", fee=fee_up)
                     await self._open(w, "Down", float(ask_dn), sz, "pair_arb", fee=fee_dn)
                     await self._try_merge(w)
                     return
 
         if w.up_shares >= 6 and w.down_shares < w.up_shares and ask_dn is not None:
-            need = round(min(w.up_shares - w.down_shares, depth_dn * 0.4, 18.0), 2)
+            need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
                 fee = calc_taker_fee_usdc(need, ask_dn, w.asset, w.timeframe)
-                if need * ask_dn + fee + need * vwap_up < need * 0.995:
+                if need * ask_dn + fee + need * vwap_up < need * 0.998:
                     await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee)
                     await self._try_merge(w)
                     return
         if w.down_shares >= 6 and w.up_shares < w.down_shares and ask_up is not None:
-            need = round(min(w.down_shares - w.up_shares, depth_up * 0.4, 18.0), 2)
+            need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
                 fee = calc_taker_fee_usdc(need, ask_up, w.asset, w.timeframe)
-                if need * ask_up + fee + need * vwap_dn < need * 0.995:
+                if need * ask_up + fee + need * vwap_dn < need * 0.998:
                     await self._open(w, "Up", float(ask_up), need, "syn_tp", fee=fee)
                     await self._try_merge(w)
                     return
 
-        if tau <= 80:
-            if fair_up >= 0.97 and ask_up is not None and ask_up <= 0.96 and w.up_shares < max_side:
-                sz = round(min(clip / ask_up, depth_up * 0.4, 12.0), 2)
+        if tau <= 90:
+            if fair_up >= 0.96 and ask_up is not None and ask_up <= 0.97 and w.up_shares < max_side:
+                sz = round(min(clip / ask_up, depth_up * 0.45, 15.0), 2)
                 if sz >= 5:
                     fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
                     await self._open(w, "Up", float(ask_up), sz, "lockin", fee=fee)
                     return
-            if fair_dn >= 0.97 and ask_dn is not None and ask_dn <= 0.96 and w.down_shares < max_side:
-                sz = round(min(clip / ask_dn, depth_dn * 0.4, 12.0), 2)
+            if fair_dn >= 0.96 and ask_dn is not None and ask_dn <= 0.97 and w.down_shares < max_side:
+                sz = round(min(clip / ask_dn, depth_dn * 0.45, 15.0), 2)
                 if sz >= 5:
                     fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
                     await self._open(w, "Down", float(ask_dn), sz, "lockin", fee=fee)
                     return
 
         want_up = (
-            ask_up is not None and fair_up >= 0.58
+            ask_up is not None and fair_up >= 0.56
             and ask_up <= fair_up - edge
-            and 0.22 <= ask_up <= 0.88
-            and w.up_shares < max_side and depth_up >= 8
+            and 0.20 <= ask_up <= 0.90
+            and w.up_shares < max_side and depth_up >= 5
         )
         want_dn = (
-            ask_dn is not None and fair_dn >= 0.58
+            ask_dn is not None and fair_dn >= 0.56
             and ask_dn <= fair_dn - edge
-            and 0.22 <= ask_dn <= 0.88
-            and w.down_shares < max_side and depth_dn >= 8
+            and 0.20 <= ask_dn <= 0.90
+            and w.down_shares < max_side and depth_dn >= 5
         )
         if want_up and want_dn:
             if fair_up >= fair_dn:
@@ -451,13 +468,13 @@ class TradingEngine:
             else:
                 want_up = False
         if want_up:
-            sz = round(min(clip / ask_up, depth_up * 0.35, 12.0), 2)
+            sz = round(min(clip / ask_up, depth_up * 0.4, 15.0), 2)
             if sz >= 5:
                 fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
                 await self._open(w, "Up", float(ask_up), sz, "maker_entry", fee=fee)
                 return
         if want_dn:
-            sz = round(min(clip / ask_dn, depth_dn * 0.35, 12.0), 2)
+            sz = round(min(clip / ask_dn, depth_dn * 0.4, 15.0), 2)
             if sz >= 5:
                 fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
                 await self._open(w, "Down", float(ask_dn), sz, "maker_entry", fee=fee)
