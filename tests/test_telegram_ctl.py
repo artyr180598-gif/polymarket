@@ -296,3 +296,44 @@ def test_telegram_queues_startup_trade_notifications_until_session_is_ready():
     assert len(session.calls) == 1
     assert "Купил ВВЕРХ" in session.calls[0][1]["text"]
     assert session.calls[0][1]["chat_id"] == "123"
+
+
+def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class TemporarilyUnavailableSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, json):
+            self.calls += 1
+            return FakeResponse(503, {"ok": False, "description": "temporarily unavailable"})
+
+    unavailable = TemporarilyUnavailableSession()
+    controller._session = unavailable
+    asyncio.run(controller.notify("🟢 PAPER MAKER fill BTC Up: 5 shares"))
+
+    assert len(controller._pending_notifications) == 1
+    assert unavailable.calls == 2  # HTML attempt plus plain-text fallback
+
+    class RecoveredSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json):
+            self.calls.append((url, dict(json)))
+            return FakeResponse(200, {"ok": True, "result": {"message_id": 8}})
+
+    recovered = RecoveredSession()
+    controller._session = recovered
+    asyncio.run(controller._flush_pending_notifications())
+
+    assert controller._pending_notifications == []
+    assert len(recovered.calls) == 1
+    assert "PAPER MAKER fill BTC Up" in recovered.calls[0][1]["text"]
