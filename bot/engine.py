@@ -97,13 +97,17 @@ class TradingEngine:
                 pass
 
     async def start(self) -> None:
-        if self.cfg.trading_mode == "live" and getattr(self.cfg, "has_live_credentials", False):
-            self.executor = LiveExecutor(self.cfg)
-            await self.executor.start()
-        else:
-            self.executor = PaperExecutor(self.cfg.bankroll_usd)
-            self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · CLOB depth + taker fee", notify=True)
+        # SAFETY INTERLOCK: live execution is not implemented end-to-end yet.
+        # _open() currently mutates the local ledger and _execute_merge() credits
+        # local cash; neither path is backed by confirmed CLOB fills / on-chain txs.
+        if self.cfg.trading_mode == "live":
+            raise RuntimeError(
+                "LIVE trading is disabled: order/fill reconciliation and on-chain "
+                "merge confirmation are not implemented. Use paper mode only."
+            )
+        self.executor = PaperExecutor(self.cfg.bankroll_usd)
+        self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
+        self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
         self.running = True
         self._tasks = [
             asyncio.create_task(self._rest_price_loop(), name="prices"),
@@ -191,9 +195,10 @@ class TradingEngine:
                         continue
                     ok_any = True
                     ts_ms = int(now * 1000)
+                    # Coinbase/Kraken REST spot is NOT Chainlink oracle data.
+                    # Do not relabel it as Chainlink spot/TWAP: the strategy requires
+                    # the actual market settlement feed before it can calculate fair value.
                     tr.on_binance_spot(px, ts_ms)
-                    tr.on_chainlink_spot(px, ts_ms)
-                    tr.on_chainlink_twap60(px, ts_ms)
                     for w in self.windows.values():
                         if w.asset != asset:
                             continue
