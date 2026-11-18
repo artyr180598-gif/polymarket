@@ -83,7 +83,7 @@ class TelegramController:
             f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>{preset_title}</b>\n"
             f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
             f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
-            "Рыночные котировки: Polymarket CLOB; settlement Chainlink feed: не подключён",
+            "Котировки: Polymarket CLOB; oracle: RTDS Chainlink spot + TWAP60.\n"\n            "Сделки и MERGE — виртуальные; это ещё не точная копия Maker-стратегии mo-money.",
             keyboard=_kb_main(),
         )
 
@@ -294,13 +294,12 @@ class TelegramController:
 
     def _fmt_help(self) -> str:
         return (
-            "ℹ️ <b>Как зарабатывает бот</b>\n━━━━━━━━━━━━━━━━\n"
-            "1) Покупает Up и Down в CLOB\n"
-            "2) Если вместе дешевле $1 (после fee)\n"
-            "3) MERGE → получает $1 за пару\n"
-            "Разница = прибыль\n\n"
-            "✅/❌ окна — только если не сделали MERGE\n"
-            "и дождались конца 5 минут."
+            "ℹ️ <b>Текущий PAPER-прототип</b>\\n━━━━━━━━━━━━━━━━\\n"
+            "• Котировки исходов: реальный Polymarket CLOB\\n"
+            "• Settlement-сигнал: Polymarket RTDS Chainlink spot + TWAP60\\n"
+            "• Победитель: только официальный Polymarket Data API resolution\\n"
+            "• Покупки и MERGE пока виртуальные, не транзакции\\n\\n"
+            "Важно: это ещё не точная копия mo-money. Его Post-Only Maker, очередь, отмены, частичные исполнения и rebates ещё нужно реализовать и проверить."
         )
 
     def _fmt_presets(self) -> str:
