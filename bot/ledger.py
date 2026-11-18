@@ -115,6 +115,9 @@ class Ledger:
                 delivered_at REAL,
                 last_error TEXT
             );
+
+            CREATE INDEX IF NOT EXISTS idx_telegram_outbox_pending
+            ON telegram_outbox (delivered_at, id);
             """
         )
         # Additive migrations for auditable settlement-anchor verification.
