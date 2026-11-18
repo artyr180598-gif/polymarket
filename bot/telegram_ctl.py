@@ -139,11 +139,13 @@ class TelegramController:
         day = st.get("day_pnl", 0) or stats.get("today_net_pnl", 0) or 0
         day_s = f"+${day:.2f}" if day >= 0 else f"-${abs(day):.2f}"
         fees = float(st.get("fees_paid", 0) or 0)
+        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
         lines = [
             f"{state_emoji} <b>PolyBot — {state_txt}</b>",
             "━━━━━━━━━━━━━━━━",
-            f"Стратегия: <b>mo-money</b> · CLOB+fee",
+            f"Стратегия: <b>{preset_title}</b>",
             f"Режим: <b>{mode}</b>",
+            "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
             f"",
             f"💵 Equity: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
@@ -170,6 +172,7 @@ class TelegramController:
         bank = float(self.engine.cfg.bankroll_usd)
         fees = float(st.get("fees_paid", 0) or getattr(self.engine, "fees_paid", 0) or 0)
         pnl = equity - bank
+        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
         day = float(st.get("day_pnl", 0) or 0)
         res_pnl = float(stats.get("realized_net_pnl", 0) or 0)
         merge_pnl = float(st.get("merge_profit", 0) or stats.get("merged_locked_pnl", 0) or 0)
@@ -180,18 +183,20 @@ class TelegramController:
         n_merge = int(stats.get("merge_count", 0) or len(st.get("merge_history") or []))
         emoji = "📈" if pnl >= 0 else "📉"
         return (
-            f"💰 <b>Прибыль и убытки (демо)</b>\n"
+            f"💰 <b>PnL — PAPER / виртуальный учёт</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"Старт: <b>${bank:,.0f}</b>\n"
-            f"Equity: <b>${equity:,.2f}</b>\n"
+            f"Стратегия: <b>{preset_title}</b>\n"
+            f"Стартовый виртуальный банк: <b>${bank:,.0f}</b>\n"
+            f"Equity (cash + открытые позиции по себестоимости): <b>${equity:,.2f}</b>\n"
             f"Cash: ${cash:,.2f}\n"
-            f"{emoji} Итого: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
-            f"Сегодня: <b>${day:+.2f}</b>\n"
-            f"Комиссии (taker): <b>−${fees:.2f}</b>\n\n"
-            f"<b>Откуда плюс/минус</b>\n"
-            f"· MERGE (пары): <b>${merge_pnl:+.2f}</b>\n"
-            f"· Окна до конца: <b>${res_pnl:+.2f}</b>\n"
-            f"· Чистыми ≈ Equity − старт (уже минус fee)\n\n"
+            f"{emoji} Изменение equity: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
+            f"Дневной PnL движка: <b>${day:+.2f}</b>\n"
+            f"Комиссии, учтённые симулятором: <b>−${fees:.2f}</b>\n\n"
+            f"<b>Компоненты (не складывать повторно с Equity)</b>\n"
+            f"· MERGE зафиксировано: <b>${merge_pnl:+.2f}</b>\n"
+            f"· Разрешённые рынки, net по Ledger: <b>${res_pnl:+.2f}</b>\n"
+            f"· Важно: открытые позиции оцениваются по себестоимости, не по mark-to-market.\n"
+            f"· Это симуляция; не фактический PnL аккаунта Polymarket.\n\n"
             f"📊 Журнал\n"
             f"· Ставок: <b>{n_fills}</b>\n"
             f"· MERGE: <b>{n_merge}</b>\n"
@@ -224,6 +229,12 @@ class TelegramController:
         stats = st.get("stats") or {}
         fills = list(st.get("fill_history") or [])
         merges = list(st.get("merge_history") or [])
+        # Pull persisted history so Telegram remains accurate after process restart.
+        try:
+            fills = self.engine.ledger.recent_fills(self.engine.cfg.trading_mode, 30)
+            merges = self.engine.ledger.recent_merges(self.engine.cfg.trading_mode, 15)
+        except Exception as exc:
+            logger.warning("ledger history unavailable for Telegram: %s", exc)
         merge_pnl = float(st.get("merge_profit", 0) or stats.get("merged_locked_pnl", 0) or 0)
         n_fills = int(stats.get("total_fills", 0) or len(fills))
         lines = [
