@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -34,6 +35,7 @@ class WindowState:
     end_ts: float
     price_to_beat: Optional[float] = None
     final_price: Optional[float] = None
+    fee_rate: Optional[float] = None
     up_shares: float = 0.0
     down_shares: float = 0.0
     up_cost: float = 0.0
@@ -238,6 +240,7 @@ class TradingEngine:
                         up_token=meta["up_token"], down_token=meta["down_token"],
                         start_ts=float(start), end_ts=float(end),
                         price_to_beat=meta.get("price_to_beat"),
+                        fee_rate=meta.get("fee_rate"),
                     )
                     if w.price_to_beat is None:
                         tr = self.trackers[asset]
@@ -271,13 +274,31 @@ class TradingEngine:
                     if md.get("priceToBeat"):
                         try:
                             ptb = float(md["priceToBeat"])
-                        except Exception:
+                        except (TypeError, ValueError):
                             pass
+                    fee_schedule = m.get("feeSchedule") or ev.get("feeSchedule") or {}
+                    if isinstance(fee_schedule, str):
+                        try:
+                            fee_schedule = json.loads(fee_schedule)
+                        except (TypeError, ValueError):
+                            fee_schedule = {}
+                    fee_rate = None
+                    if isinstance(fee_schedule, dict) and fee_schedule.get("rate") is not None:
+                        try:
+                            candidate_rate = float(fee_schedule["rate"])
+                            if 0.0 <= candidate_rate <= 1.0:
+                                fee_rate = candidate_rate
+                        except (TypeError, ValueError):
+                            pass
+                    condition_id = str(m.get("conditionId") or "")
+                    if not condition_id:
+                        return None
                     return {
-                        "condition_id": str(m.get("conditionId") or ""),
+                        "condition_id": condition_id,
                         "up_token": str(ids[0]),
                         "down_token": str(ids[1]),
                         "price_to_beat": ptb,
+                        "fee_rate": fee_rate,
                     }
         except Exception:
             return None
@@ -336,7 +357,12 @@ class TradingEngine:
             await asyncio.sleep(1.5)
 
     def _risk_halted(self) -> bool:
-        if self.day_pnl <= -self.cfg.max_daily_loss_usd:
+        try:
+            ledger_stats = self.ledger.get_stats(self.cfg.trading_mode)
+            current_day_pnl = float(ledger_stats.get("today_total_net_pnl", self.day_pnl))
+        except Exception:
+            current_day_pnl = self.day_pnl
+        if current_day_pnl <= -self.cfg.max_daily_loss_usd:
             return True
         if self.cfg.max_consecutive_losses > 0 and self.consecutive_losses >= self.cfg.max_consecutive_losses:
             return True
@@ -398,12 +424,12 @@ class TradingEngine:
             sz = min(clip / max(ask_up, ask_dn, 0.05), max_by_book, 20.0)
             sz = round(max(0.0, sz), 2)
             if sz >= 5.0 and (ask_up + ask_dn) <= 0.985:
-                fee_up = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
-                fee_dn = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
+                fee_up = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe, market_override_rate=w.fee_rate)
+                fee_dn = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
                 total = sz * (ask_up + ask_dn) + fee_up + fee_dn
                 if total < sz * 0.998:
-                    await self._open(w, "Up", float(ask_up), sz, "pair_arb", fee=fee_up)
-                    await self._open(w, "Down", float(ask_dn), sz, "pair_arb", fee=fee_dn)
+                    await self._open(w, "Up", float(ask_up), sz, "pair_arb", fee=fee_up, fair_prob=fair_up)
+                    await self._open(w, "Down", float(ask_dn), sz, "pair_arb", fee=fee_dn, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
 
@@ -411,18 +437,18 @@ class TradingEngine:
             need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
-                fee = calc_taker_fee_usdc(need, ask_dn, w.asset, w.timeframe)
+                fee = calc_taker_fee_usdc(need, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
                 if need * ask_dn + fee + need * vwap_up < need * 0.998:
-                    await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee)
+                    await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
         if w.down_shares >= 6 and w.up_shares < w.down_shares and ask_up is not None:
             need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
-                fee = calc_taker_fee_usdc(need, ask_up, w.asset, w.timeframe)
+                fee = calc_taker_fee_usdc(need, ask_up, w.asset, w.timeframe, market_override_rate=w.fee_rate)
                 if need * ask_up + fee + need * vwap_dn < need * 0.998:
-                    await self._open(w, "Up", float(ask_up), need, "syn_tp", fee=fee)
+                    await self._open(w, "Up", float(ask_up), need, "syn_tp", fee=fee, fair_prob=fair_up)
                     await self._try_merge(w)
                     return
 
@@ -430,14 +456,14 @@ class TradingEngine:
             if fair_up >= 0.96 and ask_up is not None and ask_up <= 0.97 and w.up_shares < max_side:
                 sz = round(min(clip / ask_up, depth_up * 0.45, 15.0), 2)
                 if sz >= 5:
-                    fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
-                    await self._open(w, "Up", float(ask_up), sz, "lockin", fee=fee)
+                    fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe, market_override_rate=w.fee_rate)
+                    await self._open(w, "Up", float(ask_up), sz, "lockin", fee=fee, fair_prob=fair_up)
                     return
             if fair_dn >= 0.96 and ask_dn is not None and ask_dn <= 0.97 and w.down_shares < max_side:
                 sz = round(min(clip / ask_dn, depth_dn * 0.45, 15.0), 2)
                 if sz >= 5:
-                    fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
-                    await self._open(w, "Down", float(ask_dn), sz, "lockin", fee=fee)
+                    fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
+                    await self._open(w, "Down", float(ask_dn), sz, "lockin", fee=fee, fair_prob=fair_dn)
                     return
 
         want_up = (
@@ -460,26 +486,40 @@ class TradingEngine:
         if want_up:
             sz = round(min(clip / ask_up, depth_up * 0.4, 15.0), 2)
             if sz >= 5:
-                fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
-                await self._open(w, "Up", float(ask_up), sz, "maker_entry", fee=fee)
+                fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe, market_override_rate=w.fee_rate)
+                await self._open(w, "Up", float(ask_up), sz, "taker_entry", fee=fee, fair_prob=fair_up)
                 return
         if want_dn:
             sz = round(min(clip / ask_dn, depth_dn * 0.4, 15.0), 2)
             if sz >= 5:
-                fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
-                await self._open(w, "Down", float(ask_dn), sz, "maker_entry", fee=fee)
+                fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
+                await self._open(w, "Down", float(ask_dn), sz, "taker_entry", fee=fee, fair_prob=fair_dn)
                 return
 
-    async def _open(self, w, outcome, price, size, reason, fee: float = 0.0) -> None:
-        price = round(max(0.01, min(0.99, float(price))), 2)
-        size = round(max(5.0, float(size)), 2)
+    async def _open(self, w, outcome, price, size, reason, fee: float = 0.0, fair_prob: Optional[float] = None) -> None:
+        price = round(float(price), 2)
+        size = round(float(size), 2)
         fee = float(fee or 0.0)
+        if not (0.0 < price < 1.0) or size < 5.0 or fee < 0.0:
+            return
+        window_exposure = w.up_cost + w.down_cost
+        total_exposure = sum(
+            max(0.0, item.up_cost) + max(0.0, item.down_cost)
+            for item in self.windows.values() if not item.resolved
+        )
         cost = price * size + fee
+        if window_exposure + cost > self.cfg.max_window_risk_usd:
+            return
+        if total_exposure + cost > self.cfg.max_total_exposure_usd:
+            return
         if cost > self.cash:
-            size = max(5.0, round((self.cash * 0.95 - fee) / max(price, 0.01), 2))
-            cost = price * size + fee
-            if size < 5:
+            affordable = max(0.0, (self.cash - fee) / price)
+            size = math.floor(affordable * 100.0) / 100.0
+            if size < 5.0:
                 return
+            cost = price * size + fee
+        if cost > self.cash + 1e-9:
+            return
         self.cash -= cost
         self.fees_paid += fee
         if outcome == "Up":
@@ -500,14 +540,14 @@ class TradingEngine:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
-                reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
+                reason=reason, shares=size, price=price, fee=fee, fair_prob=float(fair_prob if fair_prob is not None else price),
                 tx_or_order_id=f"paper-clob-{int(time.time())}",
             )
         except Exception as e:
             log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
         why = {
-            "maker_entry": "CLOB ask дешевле fair",
+            "taker_entry": "CLOB ask дешевле fair (Taker PAPER simulation)",
             "lockin": "lock-in по CLOB",
             "syn_tp": "добор пары по CLOB",
             "pair_arb": "пара CLOB+fee < $1",
