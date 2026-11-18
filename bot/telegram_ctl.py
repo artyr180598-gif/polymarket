@@ -81,7 +81,7 @@ class TelegramController:
             f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>{preset_title}</b>\n"
             f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
             f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
-            "Strike: Polymarket crypto-price openPrice; oracle: RTDS Chainlink spot + TWAP60.\n"
+            "Strike: RTDS Chainlink TWAP60 captured at exact window start; settled Gamma priceToBeat is the reconciliation source. Frontend openPrice is reference only.\n"
             "Maker PAPER: post-only + видимая очередь CLOB; rebates не моделируются.\n"
             "Сделки и MERGE виртуальные; точная копия mo-money и прибыльность не подтверждены.",
             keyboard=_kb_main(),
@@ -173,7 +173,7 @@ class TelegramController:
             "пауза" if paused
             else "PAPER готов к сигналам" if running and market_data_ready and model_ready
             else "накапливает волатильность" if running and market_data_ready
-            else "ожидает Polymarket openPrice" if running and oracle_ready and clob_ready and not strike_ready
+            else "ожидает Chainlink TWAP60 на границе окна" if running and oracle_ready and clob_ready and not strike_ready
             else "ожидает CLOB WebSocket" if running and oracle_ready and not clob_ready
             else "ожидает Chainlink RTDS" if running
             else "остановлен"
@@ -191,7 +191,7 @@ class TelegramController:
             f"Режим: <b>{mode}</b>",
             "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
             f"Chainlink RTDS: <b>{'OK' if oracle_ready else 'нет свежих данных'}</b>",
-            f"Polymarket openPrice: <b>{'OK' if strike_ready else 'ожидание'}</b>",
+            f"Chainlink TWAP60 anchor: <b>{'OK' if strike_ready else 'ожидание'}</b>",
             f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
             f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
             f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв ${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
