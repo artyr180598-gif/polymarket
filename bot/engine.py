@@ -609,6 +609,25 @@ class TradingEngine:
             {"bids": {}, "asks": {}, "best_bid": 0.0, "best_ask": 1.0, "tick_size": 0.01},
         )
         kind = event.get("type")
+        if self.paused or self._risk_halt_active:
+            await self.executor.cancel_all()
+            return
+        if kind == "last_trade":
+            active_window = next(
+                (
+                    candidate for candidate in self.windows.values()
+                    if candidate.up_token == token or candidate.down_token == token
+                ),
+                None,
+            )
+            if (
+                active_window is None
+                or active_window.price_to_beat is None
+                or active_window.remain_sec <= 15
+                or not self._oracle_fresh()
+            ):
+                await self.executor.cancel_all([token])
+                return
         if kind == "book":
             book["bids"] = {float(p): float(s) for p, s in event.get("bids", []) if float(s) > 0}
             book["asks"] = {float(p): float(s) for p, s in event.get("asks", []) if float(s) > 0}
@@ -839,7 +858,8 @@ class TradingEngine:
                 moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
                 aged = now_mono - order.created_ts > 20.0
                 if stale_edge or moved or aged:
-                    await self.executor.cancel_order(order.order_id)
+                    for stale in existing:
+                        await self.executor.cancel_order(stale.order_id)
                 else:
                     # Keep queue priority while the quote remains competitive.
                     for extra in existing[1:]:
