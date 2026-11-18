@@ -72,7 +72,15 @@ def _select_live_strike(event: dict[str, Any], open_price: Optional[float]) -> t
         except (TypeError, ValueError):
             pass
 
-    closed = event.get("closed") is True or str(event.get("closed", "")).lower() == "true"
+    market_closed = any(
+        market.get("closed") is True or str(market.get("closed", "")).lower() == "true"
+        for market in (event.get("markets") or [])[:1]
+    )
+    closed = (
+        event.get("closed") is True
+        or str(event.get("closed", "")).lower() == "true"
+        or market_closed
+    )
     if not closed:
         return None, ""
     for source in (event, *(event.get("markets") or [])[:1]):
