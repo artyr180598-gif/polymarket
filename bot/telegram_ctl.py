@@ -69,6 +69,23 @@ class TelegramController:
                 raise RuntimeError("Cannot restore pending Telegram notifications")
         self._notification_delivery_lock = asyncio.Lock()
 
+    def _load_persisted_notifications(self) -> None:
+        """Append the next durable batch without duplicating already loaded IDs."""
+        if self.ledger is None:
+            return
+        known = {item for item in self._pending_notification_ids if item is not None}
+        try:
+            for item in self.ledger.pending_telegram_notifications(limit=5000):
+                notification_id = int(item["id"])
+                if notification_id in known:
+                    continue
+                self._pending_notifications.append(str(item["message"]))
+                self._pending_notification_ids.append(notification_id)
+                self._pending_notification_keys.append(str(item["event_key"]))
+                known.add(notification_id)
+        except Exception:
+            logger.exception("Could not load next Telegram outbox batch")
+
     @property
     def _base(self) -> str:
         return f"https://api.telegram.org/bot{self.token}"
@@ -226,7 +243,10 @@ class TelegramController:
 
     async def _drain_pending_notifications(self) -> None:
         """Deliver queued fills/events; retain each item until Telegram confirms it."""
-        if not self.enabled or self._session is None or not self._pending_notifications:
+        if not self.enabled or self._session is None:
+            return
+        self._load_persisted_notifications()
+        if not self._pending_notifications:
             return
         async with self._notification_delivery_lock:
             while self._pending_notifications and self._session is not None:
@@ -264,6 +284,8 @@ class TelegramController:
                 self._pending_notifications.pop(0)
                 self._pending_notification_ids.pop(0)
                 self._pending_notification_keys.pop(0)
+                if not self._pending_notifications:
+                    self._load_persisted_notifications()
 
     async def _notification_delivery_loop(self) -> None:
         """Retry queued trade events independently from the long-polling bot loop."""
