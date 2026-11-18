@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from bot.telegram_ctl import TelegramController
+from bot.ledger import Ledger
 
 
 class FakeResponse:
@@ -398,3 +399,56 @@ def test_telegram_notification_queue_does_not_silently_drop_older_events():
         assert controller._pending_notifications[-1] == "trade-event-124"
 
     asyncio.run(scenario())
+
+
+def test_telegram_controller_restores_durable_outbox_after_restart(tmp_path):
+    db_path = str(tmp_path / "telegram-controller-outbox.db")
+    ledger = Ledger(db_path)
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        ledger=ledger,
+    )
+    first_controller = TelegramController(engine)
+    asyncio.run(first_controller.notify("🟢 PAPER fill BTC Up: 5 shares"))
+    queued = ledger.pending_telegram_notifications()
+    assert len(queued) == 1
+    notification_id = queued[0]["id"]
+    ledger.conn.close()
+
+    reopened_ledger = Ledger(db_path)
+    restarted_engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        ledger=reopened_ledger,
+    )
+    restarted_controller = TelegramController(restarted_engine)
+    assert restarted_controller._pending_notifications == [
+        "🟢 PAPER fill BTC Up: 5 shares"
+    ]
+
+    class SuccessfulSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json):
+            self.calls.append((url, dict(json)))
+            return FakeResponse(200, {"ok": True, "result": {"message_id": 99}})
+
+    session = SuccessfulSession()
+    restarted_controller._session = session
+    asyncio.run(restarted_controller._flush_pending_notifications())
+
+    assert len(session.calls) == 1
+    assert restarted_controller._pending_notifications == []
+    assert reopened_ledger.pending_telegram_notifications() == []
+    delivered = reopened_ledger.conn.execute(
+        "SELECT delivered_at FROM telegram_outbox WHERE id = ?",
+        (notification_id,),
+    ).fetchone()
+    assert delivered["delivered_at"] is not None
+    reopened_ledger.conn.close()
