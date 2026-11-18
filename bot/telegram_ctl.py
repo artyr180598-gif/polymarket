@@ -567,6 +567,7 @@ class TelegramController:
         assert self._session
         while self._running:
             try:
+                await self._drain_pending_notifications()
                 params = {"offset": self._offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}
                 async with self._session.get(f"{self._base}/getUpdates", params=params) as r:
                     if r.status != 200:
