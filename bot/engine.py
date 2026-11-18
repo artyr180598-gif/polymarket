@@ -679,10 +679,16 @@ class TradingEngine:
         if total_exposure + cost > self.cfg.max_total_exposure_usd:
             return
         if cost > self.cash:
-            affordable = max(0.0, (self.cash - fee) / price)
+            affordable = max(0.0, self.cash / (price + calc_taker_fee_usdc(
+                1.0, price, w.asset, w.timeframe, market_override_rate=w.fee_rate
+            )))
             size = math.floor(affordable * 100.0) / 100.0
             if size < 5.0:
                 return
+            # Recalculate the exact fee for the reduced share quantity.
+            fee = calc_taker_fee_usdc(
+                size, price, w.asset, w.timeframe, market_override_rate=w.fee_rate
+            )
             cost = price * size + fee
         if cost > self.cash + 1e-9:
             return
