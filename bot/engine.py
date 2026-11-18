@@ -337,9 +337,16 @@ class TradingEngine:
                         return None
                     ptb = None
                     md = ev.get("eventMetadata") or {}
-                    if md.get("priceToBeat"):
+                    if isinstance(md, str):
                         try:
-                            ptb = float(md["priceToBeat"])
+                            md = json.loads(md)
+                        except (TypeError, ValueError):
+                            md = {}
+                    if isinstance(md, dict) and md.get("priceToBeat") is not None:
+                        try:
+                            candidate_ptb = float(md["priceToBeat"])
+                            if candidate_ptb > 0:
+                                ptb = candidate_ptb
                         except (TypeError, ValueError):
                             pass
                     fee_schedule = m.get("feeSchedule") or ev.get("feeSchedule") or {}
