@@ -1365,13 +1365,19 @@ class TradingEngine:
             if w.price_to_beat is None:
                 w.price_to_beat = gamma_price_to_beat
                 w.price_to_beat_source = "gamma.eventMetadata.priceToBeat"
-            else:
+            elif str(w.price_to_beat_source).startswith("rtds."):
+                # Only an independently captured RTDS value can be verified
+                # against Gamma. Comparing Gamma with itself after restart
+                # would create a false-positive "verified" status.
                 anchor_delta = abs(float(w.price_to_beat) - gamma_price_to_beat)
                 anchor_verified = anchor_delta <= 0.01
                 if not anchor_verified:
                     self.paused = True
                     if self.executor is not None:
-                        await self.executor.cancel_all()
+                        try:
+                            await self.executor.cancel_all()
+                        except Exception:
+                            log.exception("Could not cancel PAPER quotes after anchor mismatch")
                     self._log_event(
                         "ALERT",
                         f"Несовпадение стартового Chainlink TWAP/Gamma priceToBeat: "
@@ -1421,7 +1427,7 @@ class TradingEngine:
         elif anchor_verified is False:
             msg += f"\n⚠️ Несовпадение стартового TWAP · Δ ${anchor_delta:.4f} · бот на паузе"
         else:
-            msg += "\nПроверка стартового TWAP: Gamma-сверка пока недоступна"
+            msg += "\nНезависимая RTDS/Gamma-сверка не выполнена"
         msg += f"\n<code>{w.slug}</code>"
         self._log_event("INFO", msg, notify=True)
 
