@@ -353,3 +353,20 @@ def test_market_history_includes_fully_merged_markets_without_resolution(tmp_pat
     assert rows[0]["market_net_pnl"] == 1.98
     assert rows[0]["anchor_verified"] == 1
     ledger.conn.close()
+
+
+
+def test_market_history_excludes_anchor_only_windows_without_trades(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "anchor-only-history.db"))
+    ledger.record_anchor_check(
+        mode="paper",
+        slug="btc-updown-5m-no-trades",
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+    )
+
+    assert ledger.market_history("paper", 10) == []
+    ledger.conn.close()
