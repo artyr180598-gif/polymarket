@@ -80,7 +80,9 @@ def test_telegram_market_history_renders_net_pnl():
             telegram_bot_token="test-token",
             telegram_chat_id="123",
         ),
-        ledger=SimpleNamespace(market_history=lambda mode, limit: [{
+        ledger=SimpleNamespace(
+            pending_telegram_notifications=lambda limit=5000: [],
+            market_history=lambda mode, limit: [{
             "asset": "BTC",
             "timeframe": "5m",
             "winner": "Up",
@@ -173,7 +175,9 @@ def test_telegram_positions_show_ledger_cost_basis_and_fees():
             "remain_sec": 120,
             "fair_up": 0.61,
         }]},
-        ledger=SimpleNamespace(open_positions=lambda mode: [{
+        ledger=SimpleNamespace(
+            pending_telegram_notifications=lambda limit=5000: [],
+            open_positions=lambda mode: [{
             "slug": "btc-updown-5m-test",
             "asset": "BTC",
             "timeframe": "5m",
