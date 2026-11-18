@@ -191,8 +191,9 @@ class TelegramController:
             return
         if not self.enabled:
             return
+        # Never discard an older fill notification to enforce an arbitrary
+        # in-memory cap. Durable SQLite outbox is the next persistence step.
         self._pending_notifications.append(msg[:3500])
-        self._pending_notifications = self._pending_notifications[-100:]
         self._notification_wakeup.set()
         if self._session is not None:
             await self._drain_pending_notifications()
