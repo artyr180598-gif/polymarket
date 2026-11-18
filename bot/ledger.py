@@ -578,7 +578,7 @@ class Ledger:
                 COALESCE(f.fees, 0) AS fees,
                 COALESCE(r.gross_pnl, 0) + COALESCE(m.merge_pnl, 0)
                     - COALESCE(f.fees, 0) AS market_net_pnl,
-                COALESCE(r.price_to_beat_source, a.price_to_beat_source, '') AS price_to_beat_source,
+                COALESCE(NULLIF(r.price_to_beat_source, ''), a.price_to_beat_source, '') AS price_to_beat_source,
                 COALESCE(r.gamma_price_to_beat, a.gamma_price_to_beat) AS gamma_price_to_beat,
                 COALESCE(r.anchor_delta, a.anchor_delta) AS anchor_delta,
                 COALESCE(r.anchor_verified, a.anchor_verified) AS anchor_verified
