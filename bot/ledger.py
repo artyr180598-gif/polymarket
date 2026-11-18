@@ -13,14 +13,14 @@ class Ledger:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         parent = os.path.dirname(os.path.abspath(db_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         try:
-            if parent:
-                os.makedirs(parent, exist_ok=True)
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        except Exception:
-            fallback = "/tmp/polybot.db"
-            self.db_path = fallback
-            self.conn = sqlite3.connect(fallback, check_same_thread=False)
+        except Exception as exc:
+            # Never silently switch to /tmp: that would make the bot appear to
+            # retain its history while writing to disposable storage.
+            raise RuntimeError(f"Cannot open configured ledger database {db_path!r}") from exc
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
