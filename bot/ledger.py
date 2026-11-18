@@ -557,8 +557,6 @@ class Ledger:
                 SELECT mode, slug FROM resolutions WHERE mode = ?
                 UNION
                 SELECT mode, slug FROM merges WHERE mode = ?
-                UNION
-                SELECT mode, slug FROM anchor_checks WHERE mode = ?
             ),
             merge_stats AS (
                 SELECT mode, slug, SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
@@ -593,7 +591,7 @@ class Ledger:
             ORDER BY ts DESC, s.slug DESC
             LIMIT ?
             """,
-            (mode, mode, mode, mode, max(1, min(int(limit), 100))),
+            (mode, mode, mode, max(1, min(int(limit), 100))),
         ).fetchall()
         return [dict(row) for row in rows]
 
