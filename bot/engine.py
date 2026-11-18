@@ -725,6 +725,7 @@ class TradingEngine:
             self._log_event("ALERT", "Ошибка записи maker-fill в SQLite · торговля остановлена", notify=True)
             return
 
+        self.executor.confirm_fill(fill)
         if outcome == "Up":
             window.up_shares += float(fill.size)
             window.up_cost += float(fill.price) * float(fill.size)
