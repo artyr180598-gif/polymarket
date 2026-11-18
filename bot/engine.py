@@ -575,6 +575,10 @@ class TradingEngine:
                         try:
                             event = next_task.result()
                         except StopAsyncIteration:
+                            self._market_feed_connected = False
+                            if self.executor is not None:
+                                await self.executor.cancel_all()
+                            previous_tokens = set()
                             break
                         self._market_feed_last_event_mono = time.monotonic()
                         self._market_feed_connected = True
