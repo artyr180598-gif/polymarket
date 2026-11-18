@@ -380,3 +380,21 @@ def test_telegram_background_worker_retries_without_waiting_for_poll_cycle():
         assert controller._pending_notifications == []
 
     asyncio.run(scenario())
+
+
+def test_telegram_notification_queue_does_not_silently_drop_older_events():
+    async def scenario():
+        engine = SimpleNamespace(
+            cfg=SimpleNamespace(
+                telegram_bot_token="test-token",
+                telegram_chat_id="123",
+            )
+        )
+        controller = TelegramController(engine)
+        for index in range(125):
+            await controller.notify(f"trade-event-{index}")
+        assert len(controller._pending_notifications) == 125
+        assert controller._pending_notifications[0] == "trade-event-0"
+        assert controller._pending_notifications[-1] == "trade-event-124"
+
+    asyncio.run(scenario())
