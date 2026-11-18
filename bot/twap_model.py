@@ -126,10 +126,15 @@ class AssetPriceTracker:
                 best = val
         if best is not None and best_d <= max_diff_sec:
             return best
-        # hist search
-        for ts, val in reversed(self.cl_twap_hist):
-            if abs(ts - epoch_sec) <= max_diff_sec:
-                return val
+        # Choose the nearest timestamp, not simply the newest sample inside
+        # the tolerance. This matters when recovering an exact market boundary.
+        nearest = min(
+            self.cl_twap_hist,
+            key=lambda item: abs(item[0] - epoch_sec),
+            default=None,
+        )
+        if nearest is not None and abs(nearest[0] - epoch_sec) <= max_diff_sec:
+            return nearest[1]
         return None
 
     @property
