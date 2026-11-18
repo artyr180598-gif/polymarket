@@ -110,7 +110,7 @@ def test_unpersisted_maker_fill_can_be_rolled_back(monkeypatch) -> None:
         10.0,
         best_bid=0.39,
         best_ask=0.42,
-        bid_size_at_or_better=0.0,
+        bid_size_at_or_better=4.0,
     ))
     assert order_id is not None
     fills = executor.on_book_and_tape(
@@ -118,11 +118,12 @@ def test_unpersisted_maker_fill_can_be_rolled_back(monkeypatch) -> None:
         best_bid=0.40,
         best_ask=0.42,
         last_trade_price=0.40,
-        last_trade_size=10.0,
+        last_trade_size=14.0,
         last_trade_side="SELL",
     )
     assert len(fills) == 1
     assert executor.rollback_fill(fills[0]) is True
     assert executor.orders[order_id].status == "open"
     assert executor.orders[order_id].remaining == 10.0
+    assert executor.orders[order_id].queue_ahead == 4.0
     assert executor.positions["token-up"] == 0.0
