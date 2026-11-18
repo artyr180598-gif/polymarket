@@ -162,6 +162,14 @@ class TradingEngine:
         except Exception as exc:
             raise RuntimeError("Cannot reconstruct PAPER account state from ledger") from exc
         self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
+        if self._risk_halted():
+            self.paused = True
+            self._risk_halt_active = True
+            self._log_event(
+                "ALERT",
+                f"Startup held by risk guard: {self._risk_halt_reason}",
+                notify=True,
+            )
         self.running = True
         await self._restore_positions()
         self._tasks = [
