@@ -83,10 +83,18 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
     )
     if not isinstance(book.get("asks"), list) or not isinstance(book.get("bids"), list):
         raise RuntimeError("CLOB book response is missing asks/bids arrays")
+    event_metadata = event.get("eventMetadata") or {}
+    if isinstance(event_metadata, str):
+        try:
+            event_metadata = json.loads(event_metadata)
+        except (TypeError, ValueError):
+            event_metadata = {}
     return {
         "slug": slug,
         "condition_id": market.get("conditionId"),
-        "price_to_beat_available": bool((event.get("eventMetadata") or {}).get("priceToBeat")),
+        "price_to_beat_available": bool(
+            isinstance(event_metadata, dict) and event_metadata.get("priceToBeat")
+        ),
         "clob_asks": len(book["asks"]),
         "clob_bids": len(book["bids"]),
     }
