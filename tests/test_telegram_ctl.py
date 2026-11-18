@@ -157,3 +157,36 @@ def test_telegram_resume_does_not_claim_to_start_stopped_engine():
     controller = TelegramController(engine)
     reply, _keyboard = asyncio.run(controller._handle("resume"))
     assert "Движок остановлен" in reply
+
+
+
+def test_telegram_positions_show_ledger_cost_basis_and_fees():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            trading_mode="paper",
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        snapshot=lambda: {"windows": [{
+            "slug": "btc-updown-5m-test",
+            "remain_sec": 120,
+            "fair_up": 0.61,
+        }]},
+        ledger=SimpleNamespace(open_positions=lambda mode: [{
+            "slug": "btc-updown-5m-test",
+            "asset": "BTC",
+            "timeframe": "5m",
+            "up_shares": 10.0,
+            "down_shares": 5.0,
+            "up_cost": 4.0,
+            "down_cost": 2.5,
+            "up_fees": 0.10,
+            "down_fees": 0.05,
+        }]),
+    )
+    controller = TelegramController(engine)
+    message = controller._fmt_positions()
+    assert "Себестоимость: <b>$6.50</b>" in message
+    assert "комиссии входа: −$0.15" in message
+    assert "↑ 10.00 @ 40.0¢" in message
+    assert "↓ 5.00 @ 50.0¢" in message
