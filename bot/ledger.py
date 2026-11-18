@@ -226,11 +226,22 @@ class Ledger:
             """
             SELECT
                 COUNT(*) AS resolved_mkts,
-                COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS win_mkts,
-                COALESCE(SUM(gross_pnl), 0) AS gross_pnl,
-                COALESCE(SUM(net_pnl), 0) AS net_pnl,
-                COALESCE(SUM(CASE WHEN ts >= ? THEN net_pnl ELSE 0 END), 0) AS today_net_pnl
-            FROM resolutions WHERE mode = ?
+                COALESCE(SUM(CASE
+                    WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) > 0
+                    THEN 1 ELSE 0 END), 0) AS win_mkts,
+                COALESCE(SUM(r.gross_pnl), 0) AS gross_pnl,
+                COALESCE(SUM(r.net_pnl), 0) AS net_pnl,
+                COALESCE(SUM(CASE WHEN r.ts >= ? THEN r.net_pnl ELSE 0 END), 0) AS today_net_pnl
+            FROM resolutions r
+            LEFT JOIN (
+                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl
+                FROM merges GROUP BY mode, slug
+            ) m ON m.mode = r.mode AND m.slug = r.slug
+            LEFT JOIN (
+                SELECT mode, slug, SUM(fee) AS fees
+                FROM fills GROUP BY mode, slug
+            ) f ON f.mode = r.mode AND f.slug = r.slug
+            WHERE r.mode = ?
             """,
             (today_start, mode),
         ).fetchone()
@@ -380,12 +391,26 @@ class Ledger:
 
     def consecutive_net_losses(self, mode: str) -> int:
         rows = self.conn.execute(
-            "SELECT net_pnl FROM resolutions WHERE mode = ? ORDER BY ts DESC, id DESC",
+            """
+            SELECT
+                r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS market_net_pnl
+            FROM resolutions r
+            LEFT JOIN (
+                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl
+                FROM merges GROUP BY mode, slug
+            ) m ON m.mode = r.mode AND m.slug = r.slug
+            LEFT JOIN (
+                SELECT mode, slug, SUM(fee) AS fees
+                FROM fills GROUP BY mode, slug
+            ) f ON f.mode = r.mode AND f.slug = r.slug
+            WHERE r.mode = ?
+            ORDER BY r.ts DESC, r.id DESC
+            """,
             (mode,),
         ).fetchall()
         count = 0
         for row in rows:
-            if float(row["net_pnl"]) < 0:
+            if float(row["market_net_pnl"]) < 0:
                 count += 1
             else:
                 break
