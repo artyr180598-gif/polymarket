@@ -254,7 +254,7 @@ async def run(wallet: str, output_dir: Path) -> dict[str, Any]:
         activity_task = fetch_feed(session, "/v2/activity", {
             "user": wallet, "limit": PAGE_SIZE, "start": 1,
         })
-        all_rows, taker_rows, activity_rows = await asyncio.gather(
+        all_result, taker_result, activity_result = await asyncio.gather(
             all_task, taker_task, activity_task
         )
         user_stats_payload, user_pnl_payload = await asyncio.gather(
@@ -262,25 +262,28 @@ async def run(wallet: str, output_dir: Path) -> dict[str, Any]:
             _get_json(session, "/v2/user-pnl", {"user": wallet, "interval": "max", "fidelity": "1d"}),
         )
 
+    all_trade_rows, all_pages = all_result
+    taker_trade_rows, taker_pages = taker_result
+    activity_trade_rows, activity_pages = activity_result
     user_stats = user_stats_payload.get("data") or {}
     user_pnl = user_pnl_payload.get("data") or {}
     analysis = build_analysis(
-        all_rows,
-        taker_rows,
-        activity_rows,
+        all_trade_rows,
+        taker_trade_rows,
+        activity_trade_rows,
         user_stats,
         user_pnl,
         {
-            "all_roles_trades": all_rows[1],
-            "taker_only_trades": taker_rows[1],
-            "activity": activity_rows[1],
+            "all_roles_trades": all_pages,
+            "taker_only_trades": taker_pages,
+            "activity": activity_pages,
         },
     )
     analysis["wallet"] = wallet
     for filename, rows in (
-        ("trades_all_roles.jsonl", all_rows[0]),
-        ("trades_taker_only.jsonl", taker_rows[0]),
-        ("activity.jsonl", activity_rows[0]),
+        ("trades_all_roles.jsonl", all_trade_rows),
+        ("trades_taker_only.jsonl", taker_trade_rows),
+        ("activity.jsonl", activity_trade_rows),
     ):
         with (output_dir / filename).open("w", encoding="utf-8") as handle:
             for row in rows:
