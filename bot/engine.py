@@ -757,6 +757,139 @@ class TradingEngine:
             return True
         return False
 
+    async def _cancel_window_maker_orders(self, window: WindowState) -> None:
+        if self.executor is None:
+            return
+        await self.executor.cancel_all([window.up_token, window.down_token])
+
+    async def _update_maker_quotes(
+        self,
+        window: WindowState,
+        fair_up: float,
+        fair_down: float,
+    ) -> None:
+        if self.executor is None:
+            return
+        if (
+            not self.params.enable_maker
+            or not self._market_feed_connected
+            or window.price_to_beat is None
+            or window.remain_sec <= 15
+            or time.time() - window.start_ts < float(self.params.maker_start_sec)
+        ):
+            await self._cancel_window_maker_orders(window)
+            return
+
+        # Empirical median maker fill sizes from the target wallet's 5m history.
+        # These are conservative PAPER seed sizes, not a claim of exact wallet sizing.
+        size_caps = {"BTC": 12.0, "ETH": 11.0, "SOL": 8.0}
+        min_size = float(self.params.maker_min_size)
+        min_edge = float(self.params.min_maker_edge)
+        min_price = float(self.params.maker_min_price)
+        max_price = float(self.params.maker_max_price)
+        now_mono = time.monotonic()
+
+        for outcome, token, fair_prob in (
+            ("Up", window.up_token, fair_up),
+            ("Down", window.down_token, fair_down),
+        ):
+            book = self._market_books.get(token)
+            if not book or now_mono - float(book.get("recv_mono", 0.0)) > 5.0:
+                await self.executor.cancel_all([token])
+                continue
+            best_bid, best_ask = self._book_best(book)
+            tick = float(book.get("tick_size") or 0.01)
+            if (
+                tick <= 0
+                or best_bid <= 0
+                or best_ask >= 1
+                or best_bid >= best_ask
+            ):
+                await self.executor.cancel_all([token])
+                continue
+
+            # Improve the best bid by one tick where the spread permits, but
+            # never cross the ask. This is a post-only quote, not a taker fill.
+            raw_quote = min(best_bid + tick, best_ask - tick)
+            quote_price = round(math.floor((raw_quote + 1e-12) / tick) * tick, 6)
+            if (
+                quote_price < min_price
+                or quote_price > max_price
+                or quote_price >= best_ask - 1e-9
+                or fair_prob - quote_price < min_edge
+            ):
+                await self.executor.cancel_all([token])
+                continue
+
+            existing = self.executor.get_open_orders(token)
+            if existing:
+                order = existing[0]
+                stale_edge = fair_prob - order.price < min_edge
+                moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
+                aged = now_mono - order.created_ts > 20.0
+                if stale_edge or moved or aged:
+                    await self.executor.cancel_order(order.order_id)
+                else:
+                    # Keep queue priority while the quote remains competitive.
+                    for extra in existing[1:]:
+                        await self.executor.cancel_order(extra.order_id)
+                    continue
+
+            reserved_total = sum(
+                order.price * order.remaining for order in self.executor.get_open_orders()
+            )
+            window_reserved = sum(
+                order.price * order.remaining
+                for token_id in (window.up_token, window.down_token)
+                for order in self.executor.get_open_orders(token_id)
+            )
+            window_exposure = window.up_cost + window.down_cost + window_reserved
+            total_exposure = sum(
+                max(0.0, item.up_cost) + max(0.0, item.down_cost)
+                for item in self.windows.values() if not item.resolved
+            ) + reserved_total
+            if window_exposure >= self.cfg.max_window_risk_usd:
+                continue
+            if total_exposure >= self.cfg.max_total_exposure_usd:
+                continue
+
+            size = min(
+                size_caps.get(window.asset, 8.0),
+                float(self.cfg.order_clip_usd) / quote_price,
+            )
+            available_cash = min(self.cash, self.executor.cash)
+            size = min(size, max(0.0, available_cash / quote_price))
+            size = math.floor(size * 100.0) / 100.0
+            cost = quote_price * size
+            if (
+                size < min_size
+                or window_exposure + cost > self.cfg.max_window_risk_usd
+                or total_exposure + cost > self.cfg.max_total_exposure_usd
+            ):
+                continue
+
+            queue_ahead = sum(
+                level_size
+                for level_price, level_size in (book.get("bids") or {}).items()
+                if float(level_price) >= quote_price - 1e-9
+            )
+            order_id = await self.executor.place_post_only_buy(
+                asset_id=token,
+                price=quote_price,
+                size=size,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                bid_size_at_or_better=queue_ahead,
+                tick_size=tick,
+            )
+            if order_id:
+                self._log_event(
+                    "INFO",
+                    f"📌 PAPER post-only {window.asset} {outcome}: "
+                    f"{size:.2f} шт. по \${quote_price:.4f}; очередь впереди {queue_ahead:.2f}",
+                    notify=False,
+                )
+
     async def _run(self, w: WindowState) -> None:
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
@@ -770,8 +903,10 @@ class TradingEngine:
             or time.time() - tr.cl_twap60_ts > 5.0
             or tr._vol_samples < 60
         ):
+            await self._cancel_window_maker_orders(w)
             return
         if w.price_to_beat is None:
+            await self._cancel_window_maker_orders(w)
             return
         try:
             fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
@@ -785,9 +920,13 @@ class TradingEngine:
         clip = max(8.0, float(self.cfg.order_clip_usd))
         max_side = 25.0
 
-        if time.monotonic() - w.last_trade_mono < 12.0:
-            return
+        await self._update_maker_quotes(w, fair_up, fair_dn)
         if tau < 15:
+            await self._cancel_window_maker_orders(w)
+            return
+        if not self.params.enable_taker:
+            return
+        if time.monotonic() - w.last_trade_mono < 12.0:
             return
 
         up_info = await self._clob_ask_info(w.up_token)
@@ -841,7 +980,7 @@ class TradingEngine:
                     await self._try_merge(w)
                     return
 
-        if tau <= 90:
+        if self.params.enable_lockin and tau <= 90:
             if fair_up >= 0.96 and ask_up is not None and ask_up <= 0.97 and w.up_shares < max_side:
                 sz = round(min(clip / ask_up, depth_up * 0.45, 15.0), 2)
                 if sz >= 5:
