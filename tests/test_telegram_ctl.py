@@ -190,3 +190,20 @@ def test_telegram_positions_show_ledger_cost_basis_and_fees():
     assert "комиссии входа: −$0.15" in message
     assert "↑ 10.00 @ 40.0¢" in message
     assert "↓ 5.00 @ 50.0¢" in message
+
+
+
+def test_telegram_resume_reports_risk_halt_instead_of_claiming_success():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        running=True,
+        _risk_halt_reason="Chainlink/Gamma settlement-anchor mismatch",
+        resume=lambda: False,
+    )
+    controller = TelegramController(engine)
+    reply, _keyboard = asyncio.run(controller._handle("resume"))
+    assert "Возобновление заблокировано" in reply
+    assert "Chainlink/Gamma" in reply
