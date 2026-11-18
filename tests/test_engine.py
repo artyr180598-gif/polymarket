@@ -86,3 +86,85 @@ def test_closed_gamma_price_to_beat_is_reconciliation_fallback() -> None:
     )
     assert value == 62_000.0
     assert source == "gamma.eventMetadata.priceToBeat"
+
+
+
+def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-900",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
+
+    orders = engine.executor.get_open_orders("up-token")
+    assert len(orders) == 1
+    assert orders[0].price == 0.41
+    assert orders[0].size == 12.0
+    assert engine.executor.cash == 100.0 - 0.41 * 12.0
+
+
+def test_maker_quotes_are_not_created_without_live_clob_feed(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-900",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
+
+    assert engine.executor.get_open_orders("up-token") == []
