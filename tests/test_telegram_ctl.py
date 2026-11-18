@@ -95,3 +95,24 @@ def test_telegram_market_history_renders_net_pnl():
     assert "$+0.80" in message
     assert "TWAP сверён" in message
     assert "btc-updown-5m-test" in message
+
+
+
+def test_telegram_registers_native_command_menu():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+    session = FakeSession()
+    controller._session = session
+
+    asyncio.run(controller._register_commands())
+
+    assert len(session.calls) == 1
+    url, payload = session.calls[0]
+    assert url.endswith("/setMyCommands")
+    commands = {item["command"] for item in payload["commands"]}
+    assert {"status", "pnl", "positions", "fills", "history", "pause", "resume", "kill", "help"} <= commands
