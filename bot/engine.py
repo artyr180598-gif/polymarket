@@ -661,7 +661,8 @@ class TradingEngine:
 
         best_bid, best_ask = self._book_best(book)
         book["best_bid"], book["best_ask"] = best_bid, best_ask
-        book["recv_mono"] = time.monotonic()
+        if kind in ("book", "price_change", "best_bid_ask", "tick_size_change"):
+            book["recv_mono"] = time.monotonic()
         trade_price = float(event["price"]) if kind == "last_trade" else None
         trade_size = float(event.get("size") or 0.0) if kind == "last_trade" else 0.0
         trade_side = str(event.get("side") or "") if kind == "last_trade" else ""
@@ -948,7 +949,11 @@ class TradingEngine:
         tau = w.remain_sec
         fair_up = float(fv.prob_up)
         fair_dn = 1.0 - fair_up
-        edge = 0.03
+        edge = (
+            self.params.min_taker_net_edge_btc
+            if w.asset == "BTC"
+            else self.params.min_taker_net_edge_alt
+        )
         clip = max(8.0, float(self.cfg.order_clip_usd))
         max_side = 25.0
 
