@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from bot.config import BotConfig
-from bot.engine import TradingEngine, WindowState, _select_live_strike
+from bot.engine import TradingEngine, WindowState, _select_closed_gamma_strike
 
 
 def test_expired_window_reports_negative_remaining_time(monkeypatch) -> None:
@@ -23,7 +23,7 @@ def test_expired_window_reports_negative_remaining_time(monkeypatch) -> None:
 
 
 
-def test_discovery_retries_until_polymarket_open_price_is_available(monkeypatch) -> None:
+def test_discovery_uses_only_near_exact_rtds_sample_for_existing_window(monkeypatch) -> None:
     engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"]))
     slug = "btc-updown-5m-900"
     engine.windows[slug] = WindowState(
@@ -38,18 +38,12 @@ def test_discovery_retries_until_polymarket_open_price_is_available(monkeypatch)
         price_to_beat=None,
         last_ptb_retry_mono=time.monotonic() - 6.0,
     )
+    engine.trackers["BTC"].on_chainlink_twap60(100_000.25, 900_000)
     calls: list[str] = []
 
     async def fake_gamma(requested_slug: str):
         calls.append(requested_slug)
-        return {
-            "condition_id": "0x" + "1" * 64,
-            "up_token": "up-token",
-            "down_token": "down-token",
-            "price_to_beat": 100_000.25,
-            "price_to_beat_source": "polymarket_crypto_price.openPrice",
-            "fee_rate": 0.25,
-        }
+        return None
 
     engine._gamma = fake_gamma  # type: ignore[method-assign]
     monkeypatch.setattr("bot.engine.time.time", lambda: 1_000.0)
@@ -57,7 +51,8 @@ def test_discovery_retries_until_polymarket_open_price_is_available(monkeypatch)
     asyncio.run(engine._discover())
 
     assert engine.windows[slug].price_to_beat == 100_000.25
-    assert calls.count(slug) == 1
+    assert engine.windows[slug].price_to_beat_source == "rtds.chainlink_twap60.near_exact_window_start"
+    assert slug not in calls
 
 
 
@@ -85,7 +80,7 @@ def test_closed_gamma_price_to_beat_is_reconciliation_fallback() -> None:
     assert source == "gamma.eventMetadata.priceToBeat"
 
 
-def test_boundary_lookup_rejects_a_twap_sample_more_than_one_second_away(tmp_path) -> None:
+def test_boundary_lookup_rejects_samples_more_than_half_a_second_away(tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],
         enabled_timeframes=["5m"],
@@ -93,9 +88,21 @@ def test_boundary_lookup_rejects_a_twap_sample_more_than_one_second_away(tmp_pat
     ))
     tracker = engine.trackers["BTC"]
     tracker.on_chainlink_twap60(100_000.0, 1_000_000)
-    assert tracker.lookup_twap_at(1_002, max_diff_sec=1.0) is None
-    assert tracker.lookup_twap_at(1_001, max_diff_sec=1.0) == 100_000.0
+    assert tracker.lookup_twap_at(1_000.0, max_diff_sec=0.5) == 100_000.0
+    assert tracker.lookup_twap_at(1_000.6, max_diff_sec=0.5) is None
+    assert tracker.lookup_twap_at(1_001.0, max_diff_sec=0.5) is None
     engine.ledger.conn.close()
+
+
+def test_twap_boundary_lookup_uses_original_fractional_timestamp() -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    tracker = AssetPriceTracker("BTC")
+    tracker.on_chainlink_twap60(100_000.0, 1_000_000)
+    tracker.on_chainlink_twap60(100_001.0, 1_000_600)
+    assert tracker.lookup_twap_at(1_000.0, max_diff_sec=0.0) == 100_000.0
+    assert tracker.lookup_twap_at(1_000.6, max_diff_sec=0.0) == 100_001.0
+    assert tracker.lookup_twap_at(1_000.0, max_diff_sec=0.1) == 100_000.0
 
 
 def test_discovery_uses_chainlink_twap60_sample_at_window_boundary(monkeypatch) -> None:
@@ -119,7 +126,7 @@ def test_discovery_uses_chainlink_twap60_sample_at_window_boundary(monkeypatch) 
 
     window = engine.windows["btc-updown-5m-900"]
     assert window.price_to_beat == 62_236.25808880998
-    assert window.price_to_beat_source == "rtds.chainlink_twap60.window_start"
+    assert window.price_to_beat_source == "rtds.chainlink_twap60.near_exact_window_start"
 
 
 
