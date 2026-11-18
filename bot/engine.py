@@ -392,12 +392,12 @@ class TradingEngine:
                     slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
                     existing = self.windows.get(slug)
                     if existing is not None:
-                        # Wait for a near-exact RTDS TWAP60 sample at this window
-                        # boundary. Gamma priceToBeat is only a post-close fallback;
-                        # never replace a missing live boundary sample with frontend openPrice.
+                        # Restored positions may start before Gamma metadata is
+                        # reachable. Retry token/condition metadata as well as the
+                        # settlement anchor; never leave an untradable ghost window.
                         now_mono = time.monotonic()
+                        tracker = self.trackers.get(asset)
                         if existing.price_to_beat is None:
-                            tracker = self.trackers.get(asset)
                             boundary = (
                                 tracker.lookup_twap_at(int(start), max_diff_sec=0.5)
                                 if tracker is not None else None
@@ -405,14 +405,33 @@ class TradingEngine:
                             if boundary is not None and boundary > 0:
                                 existing.price_to_beat = float(boundary)
                                 existing.price_to_beat_source = "rtds.chainlink_twap60.near_exact_window_start"
-                            elif now_mono - existing.last_ptb_retry_mono >= 5.0:
-                                existing.last_ptb_retry_mono = now_mono
-                                refreshed = await self._gamma(slug)
-                                if refreshed and refreshed.get("price_to_beat") is not None:
+                        needs_metadata = (
+                            not existing.up_token
+                            or not existing.down_token
+                            or not existing.condition_id
+                            or existing.fee_rate is None
+                            or existing.price_to_beat is None
+                        )
+                        if needs_metadata and now_mono - existing.last_ptb_retry_mono >= 5.0:
+                            existing.last_ptb_retry_mono = now_mono
+                            refreshed = await self._gamma(slug)
+                            if refreshed:
+                                tokens_changed = False
+                                if not existing.condition_id and refreshed.get("condition_id"):
+                                    existing.condition_id = str(refreshed["condition_id"])
+                                if not existing.up_token and refreshed.get("up_token"):
+                                    existing.up_token = str(refreshed["up_token"])
+                                    tokens_changed = True
+                                if not existing.down_token and refreshed.get("down_token"):
+                                    existing.down_token = str(refreshed["down_token"])
+                                    tokens_changed = True
+                                if existing.price_to_beat is None and refreshed.get("price_to_beat") is not None:
                                     existing.price_to_beat = float(refreshed["price_to_beat"])
-                                    existing.price_to_beat_source = str(refreshed.get("price_to_beat_source", "" ))
-                                if existing.fee_rate is None and refreshed and refreshed.get("fee_rate") is not None:
+                                    existing.price_to_beat_source = str(refreshed.get("price_to_beat_source", ""))
+                                if existing.fee_rate is None and refreshed.get("fee_rate") is not None:
                                     existing.fee_rate = float(refreshed["fee_rate"])
+                                if tokens_changed:
+                                    self._market_tokens_changed.set()
                         continue
                     meta = await self._gamma(slug)
                     if not meta:
