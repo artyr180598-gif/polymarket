@@ -76,3 +76,24 @@ def test_resolved_market_is_removed_from_open_inventory(tmp_path) -> None:
     assert round(state["cash"], 2) == 100.80
     assert round(state["inventory_cost"], 2) == 0.0
     assert round(state["equity"], 2) == 100.80
+
+
+
+def test_daily_net_pnl_deducts_fees_exactly_once(tmp_path) -> None:
+    import time
+
+    ledger = Ledger(str(tmp_path / "paper.db"))
+    slug = "btc-updown-5m-1795035600"
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.40, fee=0.10)
+    _record_buy(ledger, slug=slug, outcome="Down", shares=10, price=0.50, fee=0.10)
+    ledger.record_merge(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        pairs=10,
+        cost_basis=9.0,
+        locked_pnl=1.0,
+        tx_hash="paper-test-merge",
+    )
+    stats = ledger.get_stats("paper")
+    assert round(stats["today_total_net_pnl"], 2) == 0.80
