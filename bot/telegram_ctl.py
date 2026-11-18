@@ -57,11 +57,13 @@ class TelegramController:
         self.ledger = getattr(engine, "ledger", None)
         self._pending_notifications: list[str] = []
         self._pending_notification_ids: list[Optional[int]] = []
+        self._pending_notification_keys: list[Optional[str]] = []
         if self.ledger is not None:
             try:
                 for item in self.ledger.pending_telegram_notifications():
                     self._pending_notifications.append(str(item["message"]))
                     self._pending_notification_ids.append(int(item["id"]))
+                    self._pending_notification_keys.append(str(item["event_key"]))
             except Exception:
                 logger.exception("Could not restore Telegram notification outbox")
                 raise RuntimeError("Cannot restore pending Telegram notifications")
@@ -203,16 +205,18 @@ class TelegramController:
         if not self.enabled:
             return
         clean = msg[:3500]
+        event_key = uuid.uuid4().hex
         notification_id: Optional[int] = None
         if self.ledger is not None:
             try:
-                notification_id = self.ledger.enqueue_telegram_notification(
-                    clean, uuid.uuid4().hex
-                )
+                notification_id = self.ledger.enqueue_telegram_notification(clean, event_key)
             except Exception:
-                logger.exception("Could not persist Telegram notification; retaining in memory")
+                # Keep the event in memory and retry the durable insert before
+                # any network send; never acknowledge an unpersisted event.
+                logger.exception("Could not persist Telegram notification yet")
         self._pending_notifications.append(clean)
         self._pending_notification_ids.append(notification_id)
+        self._pending_notification_keys.append(event_key if self.ledger is not None else None)
         self._notification_wakeup.set()
         if self._session is not None:
             await self._drain_pending_notifications()
@@ -228,6 +232,16 @@ class TelegramController:
             while self._pending_notifications and self._session is not None:
                 msg = self._pending_notifications[0]
                 notification_id = self._pending_notification_ids[0]
+                event_key = self._pending_notification_keys[0]
+                if self.ledger is not None and notification_id is None:
+                    try:
+                        notification_id = self.ledger.enqueue_telegram_notification(
+                            msg, str(event_key or uuid.uuid4().hex)
+                        )
+                        self._pending_notification_ids[0] = notification_id
+                    except Exception:
+                        logger.exception("Telegram outbox insert retry failed; not sending unpersisted event")
+                        break
                 delivered = await self.send(f"🔔 {msg}", keyboard=_kb_main())
                 if not delivered:
                     if notification_id is not None and self.ledger is not None:
@@ -249,6 +263,7 @@ class TelegramController:
                         break
                 self._pending_notifications.pop(0)
                 self._pending_notification_ids.pop(0)
+                self._pending_notification_keys.pop(0)
 
     async def _notification_delivery_loop(self) -> None:
         """Retry queued trade events independently from the long-polling bot loop."""
