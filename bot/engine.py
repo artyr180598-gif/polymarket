@@ -386,14 +386,14 @@ class TradingEngine:
                         continue
                     tracker = self.trackers.get(asset)
                     boundary = (
-                        tracker.lookup_twap_at(int(start), max_diff_sec=1.0)
+                        tracker.lookup_twap_at(float(start), max_diff_sec=0.5)
                         if tracker is not None else None
                     )
                     strike = meta.get("price_to_beat")
                     strike_source = meta.get("price_to_beat_source", "")
                     if strike is None and boundary is not None and boundary > 0:
                         strike = float(boundary)
-                        strike_source = "rtds.chainlink_twap60.window_start"
+                        strike_source = "rtds.chainlink_twap60.near_exact_window_start"
                     w = WindowState(
                         slug=slug, asset=asset, timeframe=tf,
                         condition_id=meta["condition_id"],
