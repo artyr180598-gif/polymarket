@@ -175,3 +175,35 @@ def test_maker_fill_ignores_invalid_book_snapshot(monkeypatch) -> None:
     ) == []
     assert executor.orders[order_id].status == "open"
     assert executor.positions == {}
+
+
+
+def test_post_only_buy_rejects_crossed_book() -> None:
+    executor = PaperExecutor(100.0)
+    assert asyncio.run(executor.place_post_only_buy(
+        "token-up", 0.40, 10.0,
+        best_bid=0.43, best_ask=0.42,
+        bid_size_at_or_better=0.0,
+    )) is None
+
+
+def test_maker_fill_rejects_out_of_range_binary_trade_price(monkeypatch) -> None:
+    executor = PaperExecutor(100.0)
+    executor._latency_sec = 0.0
+    monkeypatch.setattr("bot.execution.time.time", lambda: 100.0)
+    order_id = asyncio.run(executor.place_post_only_buy(
+        "token-up", 0.40, 10.0,
+        best_bid=0.39, best_ask=0.42,
+        bid_size_at_or_better=0.0,
+    ))
+    assert order_id is not None
+    assert executor.on_book_and_tape(
+        "token-up",
+        best_bid=0.40,
+        best_ask=0.42,
+        last_trade_price=-0.01,
+        last_trade_size=10.0,
+        last_trade_side="SELL",
+    ) == []
+    assert executor.orders[order_id].status == "open"
+    assert executor.positions == {}
