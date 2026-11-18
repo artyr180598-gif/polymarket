@@ -380,6 +380,43 @@ class TradingEngine:
 
     async def _discover(self) -> None:
         now = time.time()
+        # Rehydrate older unresolved windows independently of current/next
+        # market discovery. A restart can occur after a market has expired;
+        # those positions still need token IDs for resolution and UI tracking.
+        for restored in list(self.windows.values()):
+            if restored.resolved:
+                continue
+            needs_metadata = (
+                not restored.up_token
+                or not restored.down_token
+                or not restored.condition_id
+                or restored.fee_rate is None
+                or restored.price_to_beat is None
+            )
+            now_mono = time.monotonic()
+            if not needs_metadata or now_mono - restored.last_ptb_retry_mono < 5.0:
+                continue
+            restored.last_ptb_retry_mono = now_mono
+            refreshed = await self._gamma(restored.slug)
+            if not refreshed:
+                continue
+            tokens_changed = False
+            if not restored.condition_id and refreshed.get("condition_id"):
+                restored.condition_id = str(refreshed["condition_id"])
+            if not restored.up_token and refreshed.get("up_token"):
+                restored.up_token = str(refreshed["up_token"])
+                tokens_changed = True
+            if not restored.down_token and refreshed.get("down_token"):
+                restored.down_token = str(refreshed["down_token"])
+                tokens_changed = True
+            if restored.price_to_beat is None and refreshed.get("price_to_beat") is not None:
+                restored.price_to_beat = float(refreshed["price_to_beat"])
+                restored.price_to_beat_source = str(refreshed.get("price_to_beat_source", ""))
+            if restored.fee_rate is None and refreshed.get("fee_rate") is not None:
+                restored.fee_rate = float(refreshed["fee_rate"])
+            if tokens_changed:
+                self._market_tokens_changed.set()
+
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
                 sec = 300 if tf == "5m" else 900
