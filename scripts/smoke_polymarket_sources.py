@@ -131,13 +131,13 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
         "gamma_price_to_beat_available": bool(
             isinstance(event_metadata, dict) and event_metadata.get("priceToBeat")
         ),
-        "polymarket_crypto_price_open": open_prices,
+        "polymarket_crypto_price_open_reference_only": open_prices,
         "clob_asks": len(book["asks"]),
         "clob_bids": len(book["bids"]),
     }
 
 
-async def check_strike_reconciliation(
+async def check_open_price_reference_vs_gamma_ptb(
     session: aiohttp.ClientSession,
     current_start_ts: int,
 ) -> dict[str, float]:
@@ -188,15 +188,15 @@ async def check_strike_reconciliation(
         raise RuntimeError(f"Polymarket crypto-price missing historical openPrice for {slug}")
     open_price = float(payload["openPrice"])
     delta = abs(open_price - gamma_strike)
-    if delta > 0.01:
-        raise RuntimeError(
-            f"Strike mismatch for {slug}: crypto-price openPrice={open_price}, "
-            f"Gamma priceToBeat={gamma_strike}, delta={delta}"
-        )
+    # This difference is expected on current 5m/15m markets: openPrice is a
+    # frontend reference, while settlement uses Chainlink TWAP60 at the window
+    # boundary. Report it; never require equality or use openPrice as the strike.
     return {
-        "crypto_price_open": open_price,
-        "gamma_price_to_beat": gamma_strike,
+        "crypto_price_open_reference_only": open_price,
+        "gamma_settlement_price_to_beat": gamma_strike,
         "absolute_delta": delta,
+        "matches_within_one_cent": delta <= 0.01,
+        "open_price_is_not_the_live_settlement_anchor": True,
     }
 
 
@@ -245,7 +245,7 @@ async def main() -> None:
         # RTDS uses its own SDK websocket client; HTTP checks share this session.
         rtds = await check_rtds()
         gamma_clob = await check_gamma_and_clob(session)
-        strike_reconciliation = await check_strike_reconciliation(
+        open_price_reference = await check_open_price_reference_vs_gamma_ptb(
             session,
             int(gamma_clob["slug"].rsplit("-", 1)[1]),
         )
@@ -255,7 +255,7 @@ async def main() -> None:
         "status": "PASS",
         "rtds_chainlink": rtds,
         "gamma_and_clob": gamma_clob,
-        "strike_reconciliation": strike_reconciliation,
+        "open_price_reference_vs_gamma_ptb": open_price_reference,
         "clob_websocket": clob_ws,
         "data_api_v2": data_api,
     }, indent=2))
