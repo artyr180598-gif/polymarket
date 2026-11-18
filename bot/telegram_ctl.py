@@ -336,7 +336,7 @@ class TelegramController:
                     f"{p.get('asset', '?')} {p.get('timeframe', '')} · "
                     f"⏱ {w.get('remain_sec', 0) or 0:.0f}s · fair Up {fair_s}\n"
                     f"{up_s} · {down_s}\n"
-                    f"Себестоимость: <b>${up_cost + down_cost:.2f}</b> · 
+                    f"Себестоимость: <b>${up_cost + down_cost:.2f}</b> · "
                     f"комиссии входа: −${fees:.2f}"
                 )
             lines.append("\nСебестоимость не является текущей рыночной оценкой позиции.")
