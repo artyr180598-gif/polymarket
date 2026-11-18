@@ -150,8 +150,14 @@ class TelegramController:
         mode = (st.get("mode") or "paper").upper()
         running = st.get("running")
         paused = st.get("paused")
-        state_emoji = "🟢" if running else ("⏸" if paused else "⏹")
-        state_txt = "торгует" if running else ("пауза" if paused else "остановлен")
+        market_data_ready = bool(st.get("streams_ok"))
+        state_emoji = "🟢" if running and market_data_ready else ("🟠" if running else ("⏸" if paused else "⏹"))
+        state_txt = (
+            "торгует" if running and market_data_ready
+            else "ожидает Chainlink" if running
+            else "пауза" if paused
+            else "остановлен"
+        )
         equity = st.get("equity", 0) or 0
         cash = st.get("cash", 0) or 0
         day = stats.get("today_total_net_pnl", 0)
@@ -168,7 +174,7 @@ class TelegramController:
             f"💵 Equity: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
-            f"수수료 Fees: −${fees:.2f}".replace("수수료 ", ""),
+            f"Комиссии текущего процесса: −${fees:.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
