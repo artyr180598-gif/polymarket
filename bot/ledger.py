@@ -129,6 +129,40 @@ class Ledger:
         )
         self.conn.commit()
 
+    def record_fills_atomic(self, fills: List[Dict[str, Any]]) -> None:
+        """Persist a simulated multi-leg fill as one SQLite transaction."""
+        if not fills:
+            return
+        rows = []
+        for fill in fills:
+            shares = float(fill["shares"])
+            price = float(fill["price"])
+            fee = float(fill.get("fee", 0.0))
+            if shares <= 0 or not 0 < price < 1 or fee < 0:
+                raise ValueError("Invalid fill in atomic batch")
+            rows.append((
+                float(fill.get("ts", time.time())),
+                str(fill["mode"]), str(fill["slug"]), str(fill["condition_id"]),
+                str(fill["asset"]), str(fill["timeframe"]), str(fill["outcome"]),
+                str(fill.get("role", "TAKER_CLOB")), str(fill.get("reason", "pair_arb")),
+                round(shares, 4), round(price, 6), round(shares * price, 4),
+                round(fee, 5), round(float(fill["fair_prob"]), 6),
+                str(fill.get("tx_or_order_id", "")),
+            ))
+        try:
+            self.conn.executemany(
+                """
+                INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
+                                   shares, price, notional, fee, fair_prob, tx_or_order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def record_merge(
         self,
         *,
