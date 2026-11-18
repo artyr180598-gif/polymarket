@@ -341,6 +341,8 @@ class Ledger:
                 SUM(CASE WHEN lower(f.outcome) IN ('down', 'no') THEN f.shares ELSE 0 END) AS down_total,
                 SUM(CASE WHEN lower(f.outcome) IN ('up', 'yes') THEN f.notional ELSE 0 END) AS up_cost_total,
                 SUM(CASE WHEN lower(f.outcome) IN ('down', 'no') THEN f.notional ELSE 0 END) AS down_cost_total,
+                SUM(CASE WHEN lower(f.outcome) IN ('up', 'yes') THEN f.fee ELSE 0 END) AS up_fees_total,
+                SUM(CASE WHEN lower(f.outcome) IN ('down', 'no') THEN f.fee ELSE 0 END) AS down_fees_total,
                 COALESCE(m.merged_pairs, 0) AS merged_pairs
             FROM fills f
             LEFT JOIN (
@@ -362,8 +364,12 @@ class Ledger:
             down_remaining = max(0.0, down_total - merged)
             up_cost_total = max(0.0, float(row["up_cost_total"] or 0.0))
             down_cost_total = max(0.0, float(row["down_cost_total"] or 0.0))
+            up_fees_total = max(0.0, float(row["up_fees_total"] or 0.0))
+            down_fees_total = max(0.0, float(row["down_fees_total"] or 0.0))
             up_cost = up_cost_total * (up_remaining / up_total) if up_total else 0.0
             down_cost = down_cost_total * (down_remaining / down_total) if down_total else 0.0
+            up_fees = up_fees_total * (up_remaining / up_total) if up_total else 0.0
+            down_fees = down_fees_total * (down_remaining / down_total) if down_total else 0.0
             if up_remaining < 0.0001 and down_remaining < 0.0001:
                 continue
             result.append({
@@ -375,6 +381,8 @@ class Ledger:
                 "down_shares": down_remaining,
                 "up_cost": up_cost,
                 "down_cost": down_cost,
+                "up_fees": up_fees,
+                "down_fees": down_fees,
                 "merged_pairs": merged,
             })
         return result
