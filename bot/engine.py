@@ -62,7 +62,7 @@ class WindowState:
         return min(self.up_shares, self.down_shares)
 
 
-def _select_live_strike(event: dict[str, Any]) -> tuple[Optional[float], str]:
+def _select_closed_gamma_strike(event: dict[str, Any]) -> tuple[Optional[float], str]:
     """Only accept Gamma's settled PTB; active-window strikes come from RTDS TWAP60."""
     market_closed = any(
         market.get("closed") is True or str(market.get("closed", "")).lower() == "true"
@@ -366,12 +366,12 @@ class TradingEngine:
                         if existing.price_to_beat is None:
                             tracker = self.trackers.get(asset)
                             boundary = (
-                                tracker.lookup_twap_at(int(start), max_diff_sec=1.0)
+                                tracker.lookup_twap_at(int(start), max_diff_sec=0.5)
                                 if tracker is not None else None
                             )
                             if boundary is not None and boundary > 0:
                                 existing.price_to_beat = float(boundary)
-                                existing.price_to_beat_source = "rtds.chainlink_twap60.window_start"
+                                existing.price_to_beat_source = "rtds.chainlink_twap60.near_exact_window_start"
                             elif now_mono - existing.last_ptb_retry_mono >= 5.0:
                                 existing.last_ptb_retry_mono = now_mono
                                 refreshed = await self._gamma(slug)
@@ -1454,7 +1454,7 @@ class TradingEngine:
             "oracle_connected": self._oracle_fresh(),
             "model_ready": all(t._vol_samples >= 60 for t in self.trackers.values()),
             "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
-            "strike_source": "Polymarket crypto-price openPrice (live); Gamma priceToBeat only after close",
+            "strike_source": "RTDS Chainlink TWAP60 within 0.5s of window start; Gamma priceToBeat only after close; crypto-price.openPrice is diagnostic only",
             "clob_feed_connected": self._market_feed_connected,
             "clob_last_event_age_sec": round(time.monotonic() - self._market_feed_last_event_mono, 2) if self._market_feed_last_event_mono else None,
             "execution_model": "PAPER CLOB post-only queue simulation + taker at public best ask; maker rebates not modeled",
