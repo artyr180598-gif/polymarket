@@ -272,7 +272,7 @@ class Ledger:
             "win_markets": int(r_row["win_mkts"]),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
             "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
-            "realized_net_pnl": round(float(r_row["net_pnl"]), 2),
+            "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
             "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
             "today_merged_pnl": round(float(m_row["today_merged_pnl"]), 2),
             "today_fees": round(float(f_row["today_fees"]), 4),
