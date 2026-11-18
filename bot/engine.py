@@ -146,12 +146,16 @@ class TradingEngine:
         self._log_event("INFO", "Торговля возобновлена", notify=True)
 
     def set_preset(self, key: str) -> bool:
+        # Preset values are not yet wired into _run(). Changing the label while
+        # leaving hard-coded signal thresholds active would mislead the operator.
         if key not in PRESETS:
             return False
-        self.cfg.strategy_preset = key
-        self.params = PRESETS[key]
-        self._log_event("INFO", f"Пресет → {PRESETS[key].title_ru}", notify=True)
-        return True
+        self._log_event(
+            "WARNING",
+            "Смена пресета отключена: параметры ещё не подключены к торговой логике",
+            notify=True,
+        )
+        return False
 
     async def emergency_kill(self) -> Dict[str, Any]:
         self.paused = True
