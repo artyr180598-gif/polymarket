@@ -49,6 +49,7 @@ It paginates the public Data API v2 trades feed with both taker-only settings, a
 - Set a strong DASHBOARD_PIN. Protected dashboard APIs fail closed when it is missing.
 - Keep API keys and wallet secrets in Railway variables only; never commit .env or private keys.
 - The current service was observed without a Railway Volume. Persistent history is therefore **not yet guaranteed** until storage is attached and verified.
+- Before migrating the existing SQLite database to a Volume, pause the bot and export a consistent backup with `POST /api/admin/backup` using the `x-bot-pin` header. This endpoint requires a configured dashboard PIN and a paused engine, uses SQLite's online backup API (including committed WAL data), and checks `PRAGMA integrity_check` before returning the file. Verify the downloaded backup before attaching or switching storage; do not mount an empty Volume over the existing database path.
 
 ## Configuration
 
