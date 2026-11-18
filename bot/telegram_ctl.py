@@ -215,14 +215,14 @@ class TelegramController:
             logger.warning("Telegram send failed: %s", e)
             return False
 
-    async def notify(self, text: str) -> None:
+    async def notify(self, text: str, event_key: Optional[str] = None) -> None:
         msg = (text or "").strip()
         if not msg:
             return
         if not self.enabled:
             return
         clean = msg[:3500]
-        event_key = uuid.uuid4().hex
+        event_key = str(event_key or uuid.uuid4().hex)
         notification_id: Optional[int] = None
         if self.ledger is not None:
             try:
