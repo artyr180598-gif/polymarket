@@ -510,25 +510,47 @@ class Ledger:
         return [dict(r) for r in rows]
 
     def market_history(self, mode: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Return resolved markets with merge-adjusted, fee-adjusted net PnL."""
+        """Return resolved and fully-merged markets with fee-adjusted net PnL."""
         rows = self.conn.execute(
             """
-            SELECT r.*, COALESCE(m.merge_pnl, 0) AS merge_pnl,
-                   r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS market_net_pnl
-            FROM resolutions r
-            LEFT JOIN (
-                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl
+            WITH market_keys AS (
+                SELECT mode, slug FROM resolutions WHERE mode = ?
+                UNION
+                SELECT mode, slug FROM merges WHERE mode = ?
+            ),
+            merge_stats AS (
+                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
                 FROM merges GROUP BY mode, slug
-            ) m ON m.mode = r.mode AND m.slug = r.slug
-            LEFT JOIN (
-                SELECT mode, slug, SUM(fee) AS fees
+            ),
+            fill_stats AS (
+                SELECT mode, slug, SUM(fee) AS fees, MAX(ts) AS fill_ts,
+                       MAX(asset) AS asset, MAX(timeframe) AS timeframe
                 FROM fills GROUP BY mode, slug
-            ) f ON f.mode = r.mode AND f.slug = r.slug
-            WHERE r.mode = ?
-            ORDER BY r.ts DESC, r.id DESC
+            )
+            SELECT
+                COALESCE(r.ts, m.merge_ts, f.fill_ts) AS ts,
+                s.slug,
+                COALESCE(r.asset, f.asset, '') AS asset,
+                COALESCE(r.timeframe, f.timeframe, '') AS timeframe,
+                COALESCE(r.winner, 'MERGED') AS winner,
+                COALESCE(r.gross_pnl, 0) AS gross_pnl,
+                COALESCE(m.merge_pnl, 0) AS merge_pnl,
+                COALESCE(f.fees, 0) AS fees,
+                COALESCE(r.gross_pnl, 0) + COALESCE(m.merge_pnl, 0)
+                    - COALESCE(f.fees, 0) AS market_net_pnl,
+                r.price_to_beat_source,
+                r.gamma_price_to_beat,
+                r.anchor_delta,
+                r.anchor_verified
+            FROM market_keys s
+            LEFT JOIN resolutions r ON r.mode = s.mode AND r.slug = s.slug
+            LEFT JOIN merge_stats m ON m.mode = s.mode AND m.slug = s.slug
+            LEFT JOIN fill_stats f ON f.mode = s.mode AND f.slug = s.slug
+            WHERE s.mode = ?
+            ORDER BY ts DESC, s.slug DESC
             LIMIT ?
-            """
-            , (mode, max(1, min(int(limit), 100))),
+            """,
+            (mode, mode, mode, max(1, min(int(limit), 100))),
         ).fetchall()
         return [dict(row) for row in rows]
 
