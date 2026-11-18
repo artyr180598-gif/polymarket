@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from bot.ledger import Ledger
 
 
@@ -487,9 +489,14 @@ def test_telegram_outbox_survives_ledger_reopen_and_tracks_delivery(tmp_path) ->
     assert len(restored) == 1
     assert restored[0]["id"] == notification_id
     assert restored[0]["message"] == "PAPER fill BTC Up: 5 shares"
+    # Same key + same payload is idempotent; a different payload must fail closed.
     assert reopened.enqueue_telegram_notification(
-        "duplicate must not be created", "stable-test-event"
+        "PAPER fill BTC Up: 5 shares", "stable-test-event"
     ) == notification_id
+    with pytest.raises(ValueError, match="event_key collision"):
+        reopened.enqueue_telegram_notification(
+            "different trade must not be silently substituted", "stable-test-event"
+        )
     assert len(reopened.pending_telegram_notifications()) == 1
 
     reopened.mark_telegram_notification_delivered(notification_id)
@@ -521,4 +528,31 @@ def test_single_fill_and_telegram_event_commit_in_same_transaction(tmp_path) -> 
     assert len(pending) == 1
     assert pending[0]["event_key"] == "paper-fill-atomic"
     assert pending[0]["message"] == "PAPER buy BTC Up"
+    ledger.conn.close()
+
+
+
+def test_fill_and_outbox_roll_back_on_event_key_collision(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "outbox-collision.db"))
+    ledger.enqueue_telegram_notification("original event", "same-key")
+    with pytest.raises(ValueError, match="event_key collision"):
+        ledger.record_fill(
+            mode="paper",
+            slug="btc-updown-5m-1795035600",
+            condition_id="0x" + "8" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome="Up",
+            role="TAKER_CLOB",
+            reason="test",
+            shares=5,
+            price=0.5,
+            fee=0.01,
+            fair_prob=0.6,
+            tx_or_order_id="collision-fill",
+            notification_message="different event payload",
+            notification_event_key="same-key",
+        )
+    assert ledger.recent_fills("paper", 5) == []
+    assert ledger.pending_telegram_notifications()[0]["message"] == "original event"
     ledger.conn.close()
