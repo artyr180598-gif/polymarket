@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -116,11 +117,11 @@ class TelegramController:
                 result = await r.json(content_type=None)
                 if r.status != 200 or not result.get("ok", False):
                     logger.warning("sendMessage rejected: status=%s response=%s", r.status, str(result)[:180])
-                    plain = (
-                        clean.replace("<b>", "").replace("</b>", "")
-                        .replace("<i>", "").replace("</i>", "")
-                        .replace("<code>", "").replace("</code>", "")
-                    )
+                    # Telegram's HTML parser rejects unescaped '<', '&', and
+                    # unsupported tags in dynamic market/error text. Retry as
+                    # genuinely plain text, stripping markup rather than only
+                    # the handful of tags used by our templates.
+                    plain = re.sub(r"</?[^>]+>", "", clean)
                     payload["text"] = plain[:4090]
                     payload.pop("parse_mode", None)
                     async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
