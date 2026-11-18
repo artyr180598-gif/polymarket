@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -92,12 +93,42 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
             event_metadata = json.loads(event_metadata)
         except (TypeError, ValueError):
             event_metadata = {}
+    start_ts = int(slug.rsplit("-", 1)[1])
+    start_iso = datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = datetime.fromtimestamp(start_ts + 300, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    crypto_price = None
+    for _ in range(5):
+        async with session.get(
+            "https://polymarket.com/api/crypto/crypto-price",
+            params={
+                "symbol": "BTC",
+                "eventStartTime": start_iso,
+                "endDate": end_iso,
+                "variant": "fiveminute",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as response:
+            body = await response.text()
+            if response.status != 200:
+                raise RuntimeError(f"Polymarket crypto-price returned HTTP {response.status}: {body[:300]}")
+            crypto_price = json.loads(body)
+        if isinstance(crypto_price, dict) and crypto_price.get("openPrice") is not None:
+            break
+        await asyncio.sleep(1.0)
+    open_price = None
+    if isinstance(crypto_price, dict) and crypto_price.get("openPrice") is not None:
+        open_price = float(crypto_price["openPrice"])
+        if open_price <= 0:
+            raise RuntimeError("Polymarket crypto-price returned a non-positive openPrice")
+    if open_price is None:
+        raise RuntimeError(f"Polymarket crypto-price did not publish openPrice for {slug}")
     return {
         "slug": slug,
         "condition_id": market.get("conditionId"),
-        "price_to_beat_available": bool(
+        "gamma_price_to_beat_available": bool(
             isinstance(event_metadata, dict) and event_metadata.get("priceToBeat")
         ),
+        "polymarket_crypto_price_open": open_price,
         "clob_asks": len(book["asks"]),
         "clob_bids": len(book["bids"]),
     }
