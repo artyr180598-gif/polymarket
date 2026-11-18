@@ -206,6 +206,20 @@ class PaperExecutor:
                             o.remaining = 0.0
         return new_fills
 
+    def rollback_fill(self, fill: PaperFill) -> bool:
+        """Undo an unpersisted simulated fill while retaining its cash reservation."""
+        if fill not in self.fills:
+            return False
+        self.fills.remove(fill)
+        self.positions[fill.asset_id] = max(
+            0.0, self.positions.get(fill.asset_id, 0.0) - fill.size
+        )
+        order = self.orders.get(fill.order_id)
+        if order is not None:
+            order.remaining = min(order.size, round(order.remaining + fill.size, 4))
+            order.status = "open"
+        return True
+
     async def cancel_order(self, order_id: str) -> bool:
         o = self.orders.get(order_id)
         if not o or o.status != "open":
