@@ -1349,11 +1349,8 @@ class TradingEngine:
             # Data API can lag settlement. Keep the market pending; never book a
             # guessed winner or manufacture PnL while the authoritative result is absent.
             return
-        if w.up_shares < 0.01 and w.down_shares < 0.01:
-            w.resolved = True
-            return
-
         # Once Gamma publishes the settled priceToBeat, compare it with the
+        # RTDS boundary sample        # Once Gamma publishes the settled priceToBeat, compare it with the
         # RTDS boundary sample used for trading. A material mismatch is a data
         # integrity fault: persist it and halt new entries rather than hide it.
         gamma_price_to_beat = None
@@ -1385,8 +1382,24 @@ class TradingEngine:
                         notify=True,
                     )
 
-        payout = float(w.up_shares if winner == "Up" else w.down_shares)
-        gross_cost = float(w.up_cost + w.down_cost)
+        try:
+            self.ledger.record_anchor_check(
+                mode=self.cfg.trading_mode,
+                slug=w.slug,
+                price_to_beat=w.price_to_beat,
+                price_to_beat_source=w.price_to_beat_source,
+                gamma_price_to_beat=gamma_price_to_beat,
+                anchor_delta=anchor_delta,
+                anchor_verified=anchor_verified,
+            )
+        except Exception:
+            log.exception("Could not persist settlement-anchor verification for %s", w.slug)
+
+        if w.up_shares < 0.01 and w.down_shares < 0.01:
+            w.resolved = True
+            return
+
+ost + w.down_cost)
         market_fees = self.ledger.fees_for_market(self.cfg.trading_mode, w.slug)
         gross = payout - gross_cost
         net = gross - market_fees
