@@ -669,7 +669,7 @@ class TradingEngine:
             self._merge_history = self._merge_history[:40]
             self._log_event(
                 "INFO",
-                f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>",
+                f"♻️ MERGE: закрыл {pairs:.1f} пар\nGross до комиссий: ${locked:+.2f}\n<code>{w.slug}</code>",
                 notify=True,
             )
             return pairs
