@@ -301,7 +301,25 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
     result = asyncio.run(run(args.wallet, Path(args.out_dir)))
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    pnl = result.get("official_user_pnl") or {}
+    points = pnl.get("points") or []
+    concise = {
+        "wallet": result.get("wallet"),
+        "data_quality": result.get("data_quality"),
+        "trade_summary": result.get("trade_summary"),
+        "by_asset": result.get("by_asset"),
+        "top_paired_markets": (result.get("paired_up_down_buy_markets") or [])[:30],
+        "activity": result.get("activity"),
+        "official_user_stats": result.get("official_user_stats"),
+        "official_user_pnl": {
+            "interval": pnl.get("interval"),
+            "fidelity": pnl.get("fidelity"),
+            "points_count": len(points),
+            "latest_point": points[-1] if points else None,
+        },
+        "raw_output_dir": str(Path(args.out_dir)),
+    }
+    print(json.dumps(concise, ensure_ascii=False, indent=2, default=str))
 
 
 if __name__ == "__main__":
