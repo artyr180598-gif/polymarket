@@ -41,6 +41,8 @@ def test_open_positions_and_equity_rebuild_after_merge(tmp_path) -> None:
     assert positions[0]["down_shares"] == 5
     assert positions[0]["up_cost"] == 2.0
     assert positions[0]["down_cost"] == 2.5
+    assert round(positions[0]["up_fees"], 4) == 0.05
+    assert round(positions[0]["down_fees"], 4) == 0.05
 
     state = ledger.portfolio_state("paper", 100.0)
     assert round(state["cash"], 2) == 95.80
