@@ -183,6 +183,7 @@ class TradingEngine:
 
     async def stop(self) -> None:
         self.running = False
+        self._market_feed_connected = False
         if self.executor is not None:
             await self.executor.cancel_all()
         for t in self._tasks:
@@ -545,12 +546,13 @@ class TradingEngine:
                     self._market_books.pop(token, None)
             previous_tokens = current_tokens
             if not token_ids:
+                self._market_feed_connected = False
                 await self._market_tokens_changed.wait()
                 continue
 
             iterator = PolymarketMarketFeed(token_ids).events().__aiter__()
             try:
-                self._market_feed_connected = True
+                self._market_feed_connected = False
                 self._log_event(
                     "INFO",
                     f"CLOB WebSocket подключён · {len(token_ids)} токенов",
@@ -575,6 +577,7 @@ class TradingEngine:
                         except StopAsyncIteration:
                             break
                         self._market_feed_last_event_mono = time.monotonic()
+                        self._market_feed_connected = True
                         await self._process_market_event(event)
             except asyncio.CancelledError:
                 raise
@@ -587,7 +590,6 @@ class TradingEngine:
                 previous_tokens = set()
                 await asyncio.sleep(2.0)
             finally:
-                self._market_feed_connected = False
                 try:
                     await iterator.aclose()
                 except Exception:
