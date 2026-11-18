@@ -59,6 +59,7 @@ class AssetPriceTracker:
         self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=400)
         self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=900)
         self.boundary_twap: Dict[int, float] = {}
+        self.boundary_twap_ts: Dict[int, float] = {}
         default_v = DEFAULT_SIGMA_1S.get(self.asset, 0.00012) ** 2
         self._var_fast: float = default_v
         self._var_slow: float = default_v
@@ -101,9 +102,11 @@ class AssetPriceTracker:
             self.cl_twap_hist.append((ts, twap_val))
         sec = int(round(ts))
         self.boundary_twap[sec] = twap_val
+        self.boundary_twap_ts[sec] = ts
         if len(self.boundary_twap) > 150:
             for k in sorted(self.boundary_twap.keys())[:-120]:
                 del self.boundary_twap[k]
+                self.boundary_twap_ts.pop(k, None)
 
     def on_binance_spot(self, price: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
@@ -114,27 +117,29 @@ class AssetPriceTracker:
             self.basis_ema = price - self.cl_spot
 
     def lookup_twap_at(self, epoch_sec: int, max_diff_sec: float = 45.0) -> Optional[float]:
-        epoch_sec = int(epoch_sec)
-        if epoch_sec in self.boundary_twap:
-            return self.boundary_twap[epoch_sec]
-        best = None
-        best_d = max_diff_sec + 1
-        for sec, val in self.boundary_twap.items():
-            d = abs(sec - epoch_sec)
-            if d < best_d:
-                best_d = d
-                best = val
-        if best is not None and best_d <= max_diff_sec:
-            return best
-        # Choose the nearest timestamp, not simply the newest sample inside
-        # the tolerance. This matters when recovering an exact market boundary.
+        target = float(epoch_sec)
+        # Prefer the raw feed timestamp so rounded-second buckets cannot turn
+        # a sample 0.6s away into a false "exact" boundary observation.
         nearest = min(
             self.cl_twap_hist,
-            key=lambda item: abs(item[0] - epoch_sec),
+            key=lambda item: abs(item[0] - target),
             default=None,
         )
-        if nearest is not None and abs(nearest[0] - epoch_sec) <= max_diff_sec:
+        if nearest is not None and abs(nearest[0] - target) <= max_diff_sec:
             return nearest[1]
+
+        # Fallback for a bounded set of retained boundary samples, but verify
+        # their original timestamp rather than trusting the rounded key.
+        best_value = None
+        best_diff = float("inf")
+        for sec, value in self.boundary_twap.items():
+            sample_ts = self.boundary_twap_ts.get(sec, float(sec))
+            diff = abs(sample_ts - target)
+            if diff < best_diff:
+                best_diff = diff
+                best_value = value
+        if best_value is not None and best_diff <= max_diff_sec:
+            return best_value
         return None
 
     @property
