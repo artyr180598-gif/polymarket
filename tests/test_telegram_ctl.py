@@ -264,3 +264,35 @@ def test_telegram_pnl_breakdown_exposes_fees_in_net_formula():
     assert "MERGE gross" in message
     assert "Все комиссии: <b>−$0.20</b>" in message
     assert "MERGE gross + resolved gross − комиссии = Lifetime net" in message
+
+
+def test_telegram_queues_startup_trade_notifications_until_session_is_ready():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    asyncio.run(controller.notify("🟢 Купил ВВЕРХ (Up) BTC · 5.0 шт"))
+
+    assert len(controller._pending_notifications) == 1
+    assert "Купил ВВЕРХ" in controller._pending_notifications[0]
+
+    class SuccessfulSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json):
+            self.calls.append((url, dict(json)))
+            return FakeResponse(200, {"ok": True, "result": {"message_id": 7}})
+
+    session = SuccessfulSession()
+    controller._session = session
+    asyncio.run(controller._flush_pending_notifications())
+
+    assert controller._pending_notifications == []
+    assert len(session.calls) == 1
+    assert "Купил ВВЕРХ" in session.calls[0][1]["text"]
+    assert session.calls[0][1]["chat_id"] == "123"
