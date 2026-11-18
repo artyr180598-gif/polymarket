@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -46,6 +47,7 @@ class WindowState:
     resolved: bool = False
     merge_in_flight: bool = False
     last_ptb_retry_mono: float = 0.0
+    price_to_beat_source: str = ""
 
     @property
     def remain_sec(self) -> float:
@@ -58,6 +60,36 @@ class WindowState:
     @property
     def mergeable_pairs(self) -> float:
         return min(self.up_shares, self.down_shares)
+
+
+def _select_live_strike(event: dict[str, Any], open_price: Optional[float]) -> tuple[Optional[float], str]:
+    """Use Polymarket's live openPrice; Gamma priceToBeat is a post-close reconciliation field."""
+    if open_price is not None:
+        try:
+            value = float(open_price)
+            if value > 0:
+                return value, "polymarket_crypto_price.openPrice"
+        except (TypeError, ValueError):
+            pass
+
+    closed = event.get("closed") is True or str(event.get("closed", "")).lower() == "true"
+    if not closed:
+        return None, ""
+    for source in (event, *(event.get("markets") or [])[:1]):
+        metadata = source.get("eventMetadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
+        if isinstance(metadata, dict) and metadata.get("priceToBeat") is not None:
+            try:
+                value = float(metadata["priceToBeat"])
+                if value > 0:
+                    return value, "gamma.eventMetadata.priceToBeat"
+            except (TypeError, ValueError):
+                pass
+    return None, ""
 
 
 class TradingEngine:
@@ -201,6 +233,7 @@ class TradingEngine:
                 start_ts=start_ts,
                 end_ts=start_ts + duration,
                 price_to_beat=(meta or {}).get("price_to_beat"),
+                price_to_beat_source=(meta or {}).get("price_to_beat_source", ""),
                 fee_rate=(meta or {}).get("fee_rate"),
             )
             window.up_shares = float(position["up_shares"])
@@ -319,6 +352,7 @@ class TradingEngine:
                             refreshed = await self._gamma(slug)
                             if refreshed and refreshed.get("price_to_beat") is not None:
                                 existing.price_to_beat = float(refreshed["price_to_beat"])
+                                existing.price_to_beat_source = str(refreshed.get("price_to_beat_source", ""))
                             if existing.fee_rate is None and refreshed and refreshed.get("fee_rate") is not None:
                                 existing.fee_rate = float(refreshed["fee_rate"])
                         continue
@@ -331,6 +365,7 @@ class TradingEngine:
                         up_token=meta["up_token"], down_token=meta["down_token"],
                         start_ts=float(start), end_ts=float(end),
                         price_to_beat=meta.get("price_to_beat"),
+                        price_to_beat_source=meta.get("price_to_beat_source", ""),
                         fee_rate=meta.get("fee_rate"),
                         last_ptb_retry_mono=time.monotonic(),
                     )
@@ -356,20 +391,40 @@ class TradingEngine:
                         ids = json.loads(ids)
                     if not ids or len(ids) < 2:
                         return None
+                    # Gamma publishes eventMetadata.priceToBeat only after the window
+                    # closes. For a live market, obtain the exact opening strike from
+                    # Polymarket's own crypto-price endpoint.
+                    parts = slug.rsplit("-", 3)
                     ptb = None
-                    md = ev.get("eventMetadata") or {}
-                    if isinstance(md, str):
+                    ptb_source = ""
+                    if len(parts) == 4:
+                        asset, timeframe, start_raw = parts[0], parts[2], parts[3]
                         try:
-                            md = json.loads(md)
-                        except (TypeError, ValueError):
-                            md = {}
-                    if isinstance(md, dict) and md.get("priceToBeat") is not None:
-                        try:
-                            candidate_ptb = float(md["priceToBeat"])
-                            if candidate_ptb > 0:
-                                ptb = candidate_ptb
-                        except (TypeError, ValueError):
+                            start_ts = int(start_raw)
+                            duration = 300 if timeframe == "5m" else 900 if timeframe == "15m" else 0
+                            variant = "fiveminute" if timeframe in ("5m", "15m") else ""
+                            if duration and variant:
+                                start_iso = datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                end_iso = datetime.fromtimestamp(start_ts + duration, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                async with s.get(
+                                    "https://polymarket.com/api/crypto/crypto-price",
+                                    params={
+                                        "symbol": asset.upper(),
+                                        "eventStartTime": start_iso,
+                                        "endDate": end_iso,
+                                        "variant": variant,
+                                    },
+                                    headers={"User-Agent": "Mozilla/5.0"},
+                                ) as price_response:
+                                    if price_response.status == 200:
+                                        price_payload = await price_response.json()
+                                        ptb, ptb_source = _select_live_strike(
+                                            ev, price_payload.get("openPrice") if isinstance(price_payload, dict) else None
+                                        )
+                        except (TypeError, ValueError, OverflowError):
                             pass
+                    if ptb is None:
+                        ptb, ptb_source = _select_live_strike(ev, None)
                     fee_schedule = m.get("feeSchedule") or ev.get("feeSchedule") or {}
                     if isinstance(fee_schedule, str):
                         try:
@@ -392,6 +447,7 @@ class TradingEngine:
                         "up_token": str(ids[0]),
                         "down_token": str(ids[1]),
                         "price_to_beat": ptb,
+                        "price_to_beat_source": ptb_source,
                         "fee_rate": fee_rate,
                     }
         except Exception:
