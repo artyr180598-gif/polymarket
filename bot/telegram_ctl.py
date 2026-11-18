@@ -49,6 +49,8 @@ class TelegramController:
         self._running = False
         self._offset = 0
         self._session: Optional[aiohttp.ClientSession] = None
+        # Engine events can arrive during startup, before the HTTP session exists.
+        self._pending_notifications: list[str] = []
 
     @property
     def _base(self) -> str:
@@ -89,7 +91,7 @@ class TelegramController:
         bank = self.engine.cfg.bankroll_usd
         preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>{preset_title}</b>\n"
+            f"🟢 <b>PolyBot подключён к Telegram</b>\nСтратегия: <b>{preset_title}</b>\n"
             f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
             f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
             "Strike: RTDS Chainlink TWAP60 captured at exact window start; settled Gamma priceToBeat is the reconciliation source. Frontend openPrice is reference only.\n"
@@ -97,6 +99,7 @@ class TelegramController:
             "Сделки и MERGE виртуальные; точная копия mo-money и прибыльность не подтверждены.",
             keyboard=_kb_main(),
         )
+        await self._flush_pending_notifications()
 
     async def _register_commands(self) -> None:
         """Expose supported controls in Telegram's native slash-command menu."""
@@ -172,8 +175,20 @@ class TelegramController:
         msg = (text or "").strip()
         if not msg:
             return
-        await asyncio.sleep(0.35)
+        if not self.enabled:
+            return
+        if self._session is None:
+            # Do not drop fills/position-open events emitted during engine startup.
+            self._pending_notifications.append(msg[:3500])
+            self._pending_notifications = self._pending_notifications[-100:]
+            return
+        await asyncio.sleep(0.15)
         await self.send(f"🔔 {msg}", keyboard=_kb_main())
+
+    async def _flush_pending_notifications(self) -> None:
+        pending, self._pending_notifications = self._pending_notifications, []
+        for msg in pending:
+            await self.send(f"🔔 {msg}", keyboard=_kb_main())
 
     async def _answer_callback(self, cq_id: str) -> None:
         if self._session:
