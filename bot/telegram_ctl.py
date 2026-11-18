@@ -62,10 +62,28 @@ class TelegramController:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40))
         if hasattr(self.engine, "set_notifier"):
             self.engine.set_notifier(self.notify)
+        # Discard pending updates from before this process started. Without this,
+        # a stale /resume or kill_confirm callback can execute after a restart.
+        try:
+            async with self._session.get(
+                f"{self._base}/getUpdates",
+                params={"offset": -1, "timeout": 0, "allowed_updates": ["message", "callback_query"]},
+            ) as response:
+                if response.status == 200:
+                    payload = await response.json()
+                    pending = payload.get("result") or []
+                    if pending:
+                        self._offset = max(int(item["update_id"]) for item in pending) + 1
+        except Exception as exc:
+            logger.warning("Could not prime Telegram update offset: %s", exc)
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
+        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: CLOB + fee",
+            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>{preset_title}</b>\n"
+            f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
+            f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
+            "Рыночные котировки: Polymarket CLOB; settlement Chainlink feed: не подключён",
             keyboard=_kb_main(),
         )
 
