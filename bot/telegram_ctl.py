@@ -367,10 +367,18 @@ class TelegramController:
         for row in rows:
             net = float(row.get("market_net_pnl") or 0.0)
             icon = "✅" if net > 0.000001 else "❌" if net < -0.000001 else "➖"
+            anchor_state = row.get("anchor_verified")
+            if anchor_state == 1:
+                anchor_label = "TWAP сверён ✓"
+            elif anchor_state == 0:
+                anchor_label = "TWAP mismatch ⚠"
+            else:
+                anchor_label = "TWAP не подтверждён"
             lines.append(
                 f"\n{icon} <b>{row.get('asset', '?')} {row.get('timeframe', '')}</b> "
                 f"· net <b>${net:+.2f}</b>\n"
                 f"Победил: {row.get('winner', '?')} · MERGE: ${float(row.get('merge_pnl') or 0):+.2f}\n"
+                f"{anchor_label}\n"
                 f"<code>{row.get('slug', '')}</code>"
             )
         return "\n".join(lines)
