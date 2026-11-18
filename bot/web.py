@@ -62,7 +62,10 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
     @app.post("/api/action/resume", dependencies=[Depends(verify_pin)])
     async def act_resume() -> dict:
         if hasattr(engine, "resume"):
-            engine.resume()
+            resumed = engine.resume()
+            if resumed is False:
+                reason = getattr(engine, "_risk_halt_reason", "") or "Активен защитный лимит"
+                raise HTTPException(status_code=409, detail=reason)
         return {"ok": True}
 
     @app.post("/api/action/kill", dependencies=[Depends(verify_pin)])
