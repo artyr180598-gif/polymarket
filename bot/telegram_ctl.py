@@ -61,6 +61,7 @@ class TelegramController:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40))
         if hasattr(self.engine, "set_notifier"):
             self.engine.set_notifier(self.notify)
+        await self._register_commands()
         # Discard pending updates from before this process started. Without this,
         # a stale /resume or kill_confirm callback can execute after a restart.
         try:
@@ -87,6 +88,29 @@ class TelegramController:
             "Сделки и MERGE виртуальные; точная копия mo-money и прибыльность не подтверждены.",
             keyboard=_kb_main(),
         )
+
+    async def _register_commands(self) -> None:
+        """Expose supported controls in Telegram's native slash-command menu."""
+        if not self._session:
+            return
+        commands = [
+            {"command": "status", "description": "Состояние бота и источников данных"},
+            {"command": "pnl", "description": "PnL, прибыльные и убыточные рынки"},
+            {"command": "positions", "description": "Открытые виртуальные позиции"},
+            {"command": "fills", "description": "Последние исполнения и MERGE"},
+            {"command": "history", "description": "История закрытых рынков"},
+            {"command": "pause", "description": "Поставить PAPER-торговлю на паузу"},
+            {"command": "resume", "description": "Возобновить PAPER-торговлю"},
+            {"command": "kill", "description": "Аварийная остановка с подтверждением"},
+            {"command": "help", "description": "Описание режима и ограничений"},
+        ]
+        try:
+            async with self._session.post(f"{self._base}/setMyCommands", json={"commands": commands}) as response:
+                payload = await response.json(content_type=None)
+                if response.status != 200 or not payload.get("ok", False):
+                    logger.warning("Telegram setMyCommands rejected: %s", str(payload)[:180])
+        except Exception as exc:
+            logger.warning("Could not register Telegram commands: %s", exc)
 
     async def stop(self) -> None:
         self._running = False
