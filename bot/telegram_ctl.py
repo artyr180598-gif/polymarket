@@ -381,6 +381,8 @@ class TelegramController:
             )
         lines = ["📚 <b>История закрытых рынков</b>", "━━━━━━━━━━━━━━━━"]
         for row in rows:
+            gross = float(row.get("gross_pnl") or 0.0) + float(row.get("merge_pnl") or 0.0)
+            fees = float(row.get("fees") or 0.0)
             net = float(row.get("market_net_pnl") or 0.0)
             icon = "✅" if net > 0.000001 else "❌" if net < -0.000001 else "➖"
             anchor_state = row.get("anchor_verified")
@@ -393,7 +395,8 @@ class TelegramController:
             lines.append(
                 f"\n{icon} <b>{row.get('asset', '?')} {row.get('timeframe', '')}</b> "
                 f"· net <b>${net:+.2f}</b>\n"
-                f"Победил: {row.get('winner', '?')} · MERGE: ${float(row.get('merge_pnl') or 0):+.2f}\n"
+                f"Победил: {row.get('winner', '?')}\n"
+                f"Gross: ${gross:+.2f} · комиссии: −${fees:.2f} · Net: ${net:+.2f}\n"
                 f"{anchor_label}\n"
                 f"<code>{row.get('slug', '')}</code>"
             )
