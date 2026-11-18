@@ -348,6 +348,47 @@ class Ledger:
             (today_start, mode),
         ).fetchone()
 
+        completed_row = self.conn.execute(
+            """
+            WITH merge_stats AS (
+                SELECT mode, slug, SUM(pairs) AS merged_pairs,
+                       SUM(locked_pnl) AS merge_pnl
+                FROM merges GROUP BY mode, slug
+            ),
+            fill_stats AS (
+                SELECT mode, slug,
+                       SUM(fee) AS fees,
+                       SUM(CASE WHEN lower(outcome) IN ('up', 'yes') THEN shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(outcome) IN ('down', 'no') THEN shares ELSE 0 END) AS down_shares
+                FROM fills GROUP BY mode, slug
+            ),
+            completed AS (
+                SELECT r.mode, r.slug,
+                       r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS net_pnl
+                FROM resolutions r
+                LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
+                LEFT JOIN fill_stats f ON f.mode = r.mode AND f.slug = r.slug
+                UNION ALL
+                SELECT m.mode, m.slug,
+                       m.merge_pnl - COALESCE(f.fees, 0) AS net_pnl
+                FROM merge_stats m
+                JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM resolutions r
+                    WHERE r.mode = m.mode AND r.slug = m.slug
+                )
+                  AND ABS(f.up_shares - m.merged_pairs) <= 0.0001
+                  AND ABS(f.down_shares - m.merged_pairs) <= 0.0001
+            )
+            SELECT COUNT(*) AS completed_markets,
+                   COALESCE(SUM(CASE WHEN net_pnl > 0.000001 THEN 1 ELSE 0 END), 0) AS win_markets,
+                   COALESCE(SUM(CASE WHEN net_pnl < -0.000001 THEN 1 ELSE 0 END), 0) AS loss_markets,
+                   COALESCE(SUM(CASE WHEN ABS(net_pnl) <= 0.000001 THEN 1 ELSE 0 END), 0) AS breakeven_markets
+            FROM completed WHERE mode = ?
+            """,
+            (mode,),
+        ).fetchone()
+
         m_row = self.conn.execute(
             """
             SELECT COUNT(*) AS merge_count, COALESCE(SUM(pairs), 0) AS merged_usd,
@@ -375,6 +416,15 @@ class Ledger:
             "loss_markets": int(r_row["loss_mkts"]),
             "breakeven_markets": int(r_row["breakeven_mkts"]),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
+            # Completed units include official resolutions and only fully paired
+            # MERGEs; partial MERGEs with residual inventory are excluded.
+            "completed_markets": int(completed_row["completed_markets"]),
+            "completed_win_markets": int(completed_row["win_markets"]),
+            "completed_loss_markets": int(completed_row["loss_markets"]),
+            "completed_breakeven_markets": int(completed_row["breakeven_markets"]),
+            "completed_win_rate_pct": round(
+                100.0 * completed_row["win_markets"] / completed_row["completed_markets"], 1
+            ) if completed_row["completed_markets"] else 0.0,
             "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
             "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
             "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
@@ -553,19 +603,31 @@ class Ledger:
         """Return resolved and fully-merged markets with fee-adjusted net PnL."""
         rows = self.conn.execute(
             """
-            WITH market_keys AS (
-                SELECT mode, slug FROM resolutions WHERE mode = ?
-                UNION
-                SELECT mode, slug FROM merges WHERE mode = ?
-            ),
-            merge_stats AS (
-                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
+            WITH merge_stats AS (
+                SELECT mode, slug, SUM(pairs) AS merged_pairs,
+                       SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
                 FROM merges GROUP BY mode, slug
             ),
             fill_stats AS (
                 SELECT mode, slug, SUM(fee) AS fees, MAX(ts) AS fill_ts,
-                       MAX(asset) AS asset, MAX(timeframe) AS timeframe
+                       MAX(asset) AS asset, MAX(timeframe) AS timeframe,
+                       SUM(CASE WHEN lower(outcome) IN ('up', 'yes') THEN shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(outcome) IN ('down', 'no') THEN shares ELSE 0 END) AS down_shares
                 FROM fills GROUP BY mode, slug
+            ),
+            market_keys AS (
+                SELECT mode, slug FROM resolutions WHERE mode = ?
+                UNION
+                SELECT m.mode, m.slug
+                FROM merge_stats m
+                JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
+                WHERE m.mode = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolutions r
+                      WHERE r.mode = m.mode AND r.slug = m.slug
+                  )
+                  AND ABS(f.up_shares - m.merged_pairs) <= 0.0001
+                  AND ABS(f.down_shares - m.merged_pairs) <= 0.0001
             )
             SELECT
                 COALESCE(r.ts, m.merge_ts, f.fill_ts) AS ts,
@@ -591,7 +653,7 @@ class Ledger:
             ORDER BY ts DESC, s.slug DESC
             LIMIT ?
             """,
-            (mode, mode, mode, max(1, min(int(limit), 100))),
+            (mode, mode, max(1, min(int(limit), 100))),
         ).fetchall()
         return [dict(row) for row in rows]
 
