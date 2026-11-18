@@ -429,3 +429,17 @@ def test_atomic_pair_entry_debits_engine_and_executor_cash_once(tmp_path) -> Non
     assert len([row for row in engine.ledger.recent_fills("paper", limit=10) if row["slug"] == window.slug]) == 2
     assert len(engine.ledger.pending_telegram_notifications()) == 1
     engine.ledger.conn.close()
+
+
+def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "telegram-required.db"),
+    ))
+    engine._notification_channel_ready = False
+
+    assert engine.resume() is False
+    assert engine.paused is True
+    assert "Telegram delivery is not initialized" in engine._risk_halt_reason
+    engine.ledger.conn.close()
