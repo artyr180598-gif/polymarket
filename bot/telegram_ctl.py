@@ -80,8 +80,9 @@ class TelegramController:
             f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>{preset_title}</b>\n"
             f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
             f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
-            "Котировки: Polymarket CLOB; oracle: RTDS Chainlink spot + TWAP60.\n"
-            "Сделки и MERGE — виртуальные; это ещё не точная копия Maker-стратегии mo-money.",
+            "Strike: Polymarket crypto-price openPrice; oracle: RTDS Chainlink spot + TWAP60.\n"
+            "Maker PAPER: post-only + видимая очередь CLOB; rebates не моделируются.\n"
+            "Сделки и MERGE виртуальные; точная копия mo-money и прибыльность не подтверждены.",
             keyboard=_kb_main(),
         )
 
@@ -153,7 +154,8 @@ class TelegramController:
         running = st.get("running")
         paused = st.get("paused")
         oracle_ready = bool(st.get("streams_ok"))
-        clob_ready = bool(st.get("clob_feed_connected"))
+        clob_age = st.get("clob_last_event_age_sec")
+        clob_ready = bool(st.get("clob_feed_connected")) and clob_age is not None and float(clob_age) <= 5.0
         strike_ready = any(
             w.get("price_to_beat") is not None
             for w in (st.get("windows") or [])
