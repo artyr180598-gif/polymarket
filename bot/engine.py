@@ -1,4 +1,4 @@
-"""TradingEngine — Polymarket paper/live. Prices via Coinbase REST (EU-safe)."""
+"""TradingEngine — Polymarket paper/live. Coinbase/Kraken prices (EU-safe)."""
 
 from __future__ import annotations
 
@@ -105,7 +105,6 @@ class TradingEngine:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
             self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · paper Polymarket", notify=True)
-
         self.running = True
         self._tasks = [
             asyncio.create_task(self._rest_price_loop(), name="prices"),
@@ -292,12 +291,7 @@ class TradingEngine:
                             ptb = float(md["priceToBeat"])
                         except Exception:
                             pass
-                    return {
-                        "condition_id": str(m.get("conditionId") or ""),
-                        "up_token": str(ids[0]),
-                        "down_token": str(ids[1]),
-                        "price_to_beat": ptb,
-                    }
+                    return {"condition_id": str(m.get("conditionId") or ""), "up_token": str(ids[0]), "down_token": str(ids[1]), "price_to_beat": ptb}
         except Exception:
             return None
 
@@ -395,7 +389,7 @@ class TradingEngine:
         except Exception:
             pass
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
-        why = {"maker_entry": "вход по модели", "lockin": "фиксация перед закрытием окна", "syn_tp": "вторая сторона для MERGE"}.get(reason, reason)
+        why = {"maker_entry": "вход по модели", "lockin": "фиксация перед закрытием", "syn_tp": "вторая сторона для MERGE"}.get(reason, reason)
         self._log_event("INFO", f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f})\n{why}\n<code>{w.slug}</code>", notify=True)
 
     async def _try_merge(self, w) -> None:
@@ -442,7 +436,7 @@ class TradingEngine:
                 log.warning("resolve: %s", e)
             await asyncio.sleep(6)
 
-    async def _resolve(self, w) -> None:
+    async def _resolve(self, w: WindowState) -> None:
         winner = None
         try:
             timeout = aiohttp.ClientTimeout(total=10)
@@ -466,28 +460,42 @@ class TradingEngine:
                 winner = "Up" if spot >= w.price_to_beat else "Down"
         if winner is None:
             return
-        payout = (w.up_shares if winner == "Up" else w.down_shares)
-        gross = payout - w.up_cost - w.down_cost
+        payout = float(w.up_shares if winner == "Up" else w.down_shares)
+        gross_cost = float(w.up_cost + w.down_cost)
+        gross = payout - gross_cost
         self.cash += payout
         self.realized_pnl += gross
         self.day_pnl += gross
         self.consecutive_losses = self.consecutive_losses + 1 if gross < 0 else 0
         try:
-            self.ledger.record_resolution(mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id, asset=w.asset, timeframe=w.timeframe, winner=winner, price_to_beat=w.price_to_beat, final_price=w.final_price, up_shares=w.up_shares, down_shares=w.down_shares, gross_pnl=gross, fees=0.0, net_pnl=gross)
-        except Exception:
-            pass
+            self.ledger.record_resolution(
+                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
+                asset=w.asset, timeframe=w.timeframe, winner=winner,
+                price_to_beat=w.price_to_beat, final_price=w.final_price,
+                up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
+                merged_pairs=0.0, gross_cost=gross_cost, total_fees=0.0, total_payout=payout,
+            )
+        except Exception as e:
+            log.warning("record_resolution: %s", e)
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
-        emoji = "✅" if gross >= 0 else "❌"
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
-        self._log_event("INFO", f"{emoji} Окно закрылось · победил {side}\nРезультат сделки: ${gross:+.2f}\n<code>{w.slug}</code>", notify=True)
+        if gross >= 0:
+            msg = f"✅ Окно закрылось · победил {side}\nПрибыль: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+        else:
+            msg = f"❌ Окно закрылось · победил {side}\nУбыток: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+        self._log_event("INFO", msg, notify=True)
 
-    def snapshot(self):
+    def snapshot(self) -> Dict[str, Any]:
         try:
             stats = self.ledger.get_stats(self.cfg.trading_mode)
         except Exception:
             stats = {}
-        equity = self.cash + self.realized_pnl
+        inv = 0.0
+        for w in self.windows.values():
+            if not w.resolved:
+                inv += max(0.0, w.up_cost) + max(0.0, w.down_cost)
+        equity = self.cash + inv
         now = time.time()
         windows = []
         for w in self.windows.values():
@@ -501,6 +509,17 @@ class TradingEngine:
                         fair = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts)).prob_up
                     except Exception:
                         pass
-            windows.append({"slug": w.slug, "asset": w.asset, "remain_sec": round(w.remain_sec, 1), "price_to_beat": w.price_to_beat, "fair_up": round(fair, 4) if fair is not None else None, "net_shares": round(w.net_shares, 2), "up_shares": round(w.up_shares, 2), "down_shares": round(w.down_shares, 2), "mergeable": round(w.mergeable_pairs, 2)})
+            windows.append({
+                "slug": w.slug, "asset": w.asset, "remain_sec": round(w.remain_sec, 1),
+                "price_to_beat": w.price_to_beat, "fair_up": round(fair, 4) if fair is not None else None,
+                "net_shares": round(w.net_shares, 2), "up_shares": round(w.up_shares, 2),
+                "down_shares": round(w.down_shares, 2), "mergeable": round(w.mergeable_pairs, 2),
+            })
         windows.sort(key=lambda x: x["remain_sec"])
-        return {"mode": self.cfg.trading_mode, "running": self.running and not self.paused, "paused": self.paused, "preset": self.cfg.strategy_preset, "equity": round(equity, 2), "cash": round(self.cash, 2), "realized_pnl": round(self.realized_pnl, 2), "day_pnl": round(self.day_pnl, 2), "total_exposure": 0.0, "stats": stats, "windows": windows, "events": self.events[-40:], "fee_regime": fee_regime_label(), "assets": self.cfg.enabled_assets, "streams_ok": self._price_ok}
+        return {
+            "mode": self.cfg.trading_mode, "running": self.running and not self.paused, "paused": self.paused,
+            "preset": self.cfg.strategy_preset, "equity": round(equity, 2), "cash": round(self.cash, 2),
+            "realized_pnl": round(self.realized_pnl, 2), "day_pnl": round(self.day_pnl, 2),
+            "total_exposure": round(inv, 2), "stats": stats, "windows": windows, "events": self.events[-40:],
+            "fee_regime": fee_regime_label(), "assets": self.cfg.enabled_assets, "streams_ok": self._price_ok,
+        }
