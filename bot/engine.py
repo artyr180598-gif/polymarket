@@ -822,7 +822,6 @@ class TradingEngine:
         # Empirical median maker fill sizes from the target wallet's 5m history.
         # These are conservative PAPER seed sizes, not a claim of exact wallet sizing.
         size_caps = {"BTC": 12.0, "ETH": 11.0, "SOL": 8.0}
-        min_size = max(float(self.params.maker_min_size), float(book.get("min_order_size") or 0.0))
         min_edge = float(self.params.min_maker_edge)
         min_price = float(self.params.maker_min_price)
         max_price = float(self.params.maker_max_price)
@@ -837,6 +836,10 @@ class TradingEngine:
             if not book or now_mono - float(book.get("recv_mono", 0.0)) > 5.0:
                 await self.executor.cancel_all([token])
                 continue
+            min_size = max(
+                float(self.params.maker_min_size),
+                float(book.get("min_order_size") or 0.0),
+            )
             best_bid, best_ask = self._book_best(book)
             tick = float(book.get("tick_size") or 0.01)
             if (
