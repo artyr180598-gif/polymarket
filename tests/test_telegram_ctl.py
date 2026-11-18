@@ -337,3 +337,46 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
     assert controller._pending_notifications == []
     assert len(recovered.calls) == 1
     assert "PAPER MAKER fill BTC Up" in recovered.calls[0][1]["text"]
+
+
+
+def test_telegram_background_worker_retries_without_waiting_for_poll_cycle():
+    async def scenario():
+        engine = SimpleNamespace(
+            cfg=SimpleNamespace(
+                telegram_bot_token="test-token",
+                telegram_chat_id="123",
+            )
+        )
+        controller = TelegramController(engine)
+        controller._session = object()
+        controller._notification_retry_interval = 0.01
+        attempts = []
+
+        async def flaky_send(message, keyboard=None):
+            attempts.append(message)
+            return len(attempts) > 1
+
+        controller.send = flaky_send
+        controller._running = True
+        worker = asyncio.create_task(controller._notification_delivery_loop())
+        try:
+            await controller.notify("PAPER fill BTC Up: 5 shares")
+
+            async def wait_until_delivered():
+                while controller._pending_notifications:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(wait_until_delivered(), timeout=0.5)
+        finally:
+            controller._running = False
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+
+        assert len(attempts) >= 2
+        assert controller._pending_notifications == []
+
+    asyncio.run(scenario())
