@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -77,9 +78,12 @@ class PaperExecutor:
         best_bid: float = 0.0,
         best_ask: float = 1.0,
         bid_size_at_or_better: float = 0.0,
+        tick_size: float = 0.01,
     ) -> Optional[str]:
         """Place post-only BUY. Rejects if would cross the spread."""
-        price = round(price, 2)
+        if not math.isfinite(tick_size) or tick_size <= 0:
+            return None
+        price = round(math.floor((price + 1e-12) / tick_size) * tick_size, 6)
         size = round(size, 2)
         if size < 5.0 or price <= 0 or price >= 1:
             return None
@@ -163,14 +167,24 @@ class PaperExecutor:
                 o.status = "canceled"
                 self.cash += o.price * o.remaining  # release reserve
                 continue
-            # Queue decay from aggressive sells hitting the bid
-            if last_trade_price is not None and last_trade_side.upper() in ("SELL", "ASK", ""):
-                if last_trade_price <= o.price + 1e-9:
-                    o.queue_ahead = max(0.0, o.queue_ahead - last_trade_size)
-            # Fill when queue is gone and trade prints at or through our price
-            if o.queue_ahead <= 0 and last_trade_price is not None:
-                if last_trade_price <= o.price + 1e-9:
-                    fill_size = min(o.remaining, last_trade_size if last_trade_size > 0 else o.remaining)
+            # Only sell-aggressor prints can execute a resting BUY order.
+            # Unknown trade side is not enough evidence to simulate a fill.
+            is_sell_aggressor = last_trade_side.upper() in ("SELL", "ASK")
+            if (
+                not is_sell_aggressor
+                or last_trade_price is None
+                or not math.isfinite(last_trade_size)
+                or last_trade_size <= 0
+                or last_trade_price > o.price + 1e-9
+            ):
+                continue
+            # First consume the visible queue that was ahead when we joined.
+            # Only the residual tape volume can execute our simulated order.
+            volume_before_us = max(0.0, last_trade_size - o.queue_ahead)
+            o.queue_ahead = max(0.0, o.queue_ahead - last_trade_size)
+            # Fill only from tape volume remaining after the queue ahead.
+            if volume_before_us > 0:
+                    fill_size = min(o.remaining, volume_before_us)
                     if fill_size >= 0.01:
                         o.remaining = round(o.remaining - fill_size, 4)
                         self.positions[asset_id] = self.positions.get(asset_id, 0.0) + fill_size
