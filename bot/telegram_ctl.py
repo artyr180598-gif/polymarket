@@ -83,7 +83,8 @@ class TelegramController:
             f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>{preset_title}</b>\n"
             f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
             f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
-            "Котировки: Polymarket CLOB; oracle: RTDS Chainlink spot + TWAP60.\n"\n            "Сделки и MERGE — виртуальные; это ещё не точная копия Maker-стратегии mo-money.",
+            "Котировки: Polymarket CLOB; oracle: RTDS Chainlink spot + TWAP60.\n"
+            "Сделки и MERGE — виртуальные; это ещё не точная копия Maker-стратегии mo-money.",
             keyboard=_kb_main(),
         )
 
