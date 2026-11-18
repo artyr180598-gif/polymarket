@@ -556,3 +556,37 @@ def test_fill_and_outbox_roll_back_on_event_key_collision(tmp_path) -> None:
     assert ledger.recent_fills("paper", 5) == []
     assert ledger.pending_telegram_notifications()[0]["message"] == "original event"
     ledger.conn.close()
+
+
+
+def test_atomic_pair_and_outbox_roll_back_on_event_key_collision(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "atomic-outbox-collision.db"))
+    ledger.enqueue_telegram_notification("original event", "same-pair-key")
+    pair_fills = [
+        {
+            "ts": 1_795_035_600.0,
+            "mode": "paper",
+            "slug": "btc-updown-5m-1795035600",
+            "condition_id": "0x" + "7" * 64,
+            "asset": "BTC",
+            "timeframe": "5m",
+            "outcome": outcome,
+            "role": "TAKER_CLOB",
+            "reason": "pair_arb",
+            "shares": 5,
+            "price": 0.49,
+            "fee": 0.01,
+            "fair_prob": 0.5,
+            "tx_or_order_id": f"pair-{outcome.lower()}",
+        }
+        for outcome in ("Up", "Down")
+    ]
+    with pytest.raises(ValueError, match="event_key collision"):
+        ledger.record_fills_atomic(
+            pair_fills,
+            notification_message="different pair payload",
+            notification_event_key="same-pair-key",
+        )
+    assert ledger.recent_fills("paper", 5) == []
+    assert ledger.pending_telegram_notifications()[0]["message"] == "original event"
+    ledger.conn.close()
