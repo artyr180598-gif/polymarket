@@ -122,6 +122,7 @@ class TradingEngine:
         self._market_feed_connected = False
         self._market_feed_last_event_mono = 0.0
         self._risk_halt_active = False
+        self._risk_halt_reason = ""
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -191,9 +192,20 @@ class TradingEngine:
                 pass
         self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=True)
 
-    def resume(self) -> None:
+    def resume(self) -> bool:
+        # Re-check durable risk and data-integrity guards before unpausing.
+        if self._risk_halted():
+            self.paused = True
+            self._risk_halt_active = True
+            self._log_event(
+                "ALERT",
+                f"Возобновление заблокировано защитой: {self._risk_halt_reason}",
+                notify=True,
+            )
+            return False
         self.paused = False
-        self._log_event("INFO", "Торговля возобновлена", notify=True)
+        self._log_event("INFO", "PAPER-торговля возобновлена", notify=True)
+        return True
 
     def set_preset(self, key: str) -> bool:
         # Preset values are not yet wired into _run(). Changing the label while
@@ -767,19 +779,55 @@ class TradingEngine:
             await asyncio.sleep(1.5)
 
     def _risk_halted(self) -> bool:
+        # A confirmed RTDS-vs-Gamma mismatch is a persistent data-integrity halt.
+        # It survives restarts and cannot be cleared by the ordinary resume button.
+        try:
+            mismatch = self.ledger.conn.execute(
+                """
+                SELECT slug, anchor_delta
+                FROM anchor_checks
+                WHERE mode = ? AND anchor_verified = 0
+                ORDER BY ts DESC, id DESC
+                LIMIT 1
+                """,
+                (self.cfg.trading_mode,),
+            ).fetchone()
+        except Exception:
+            self._risk_halt_reason = "Cannot verify settlement-anchor integrity from SQLite"
+            return True
+        if mismatch is not None:
+            delta = mismatch["anchor_delta"]
+            delta_text = f"${float(delta):.4f}" if delta is not None else "unknown"
+            self._risk_halt_reason = (
+                f"Chainlink/Gamma settlement-anchor mismatch: {mismatch['slug']} "
+                f"(delta {delta_text}); manual investigation required"
+            )
+            return True
+
         try:
             ledger_stats = self.ledger.get_stats(self.cfg.trading_mode)
             current_day_pnl = float(ledger_stats.get("today_total_net_pnl", self.day_pnl))
         except Exception:
-            current_day_pnl = self.day_pnl
+            self._risk_halt_reason = "Cannot read PAPER ledger PnL; trading remains halted"
+            return True
         if current_day_pnl <= -self.cfg.max_daily_loss_usd:
+            self._risk_halt_reason = (
+                f"Daily net loss limit reached: ${current_day_pnl:.2f} "
+                f"(limit −${self.cfg.max_daily_loss_usd:.2f})"
+            )
             return True
         try:
             self.consecutive_losses = self.ledger.consecutive_net_losses(self.cfg.trading_mode)
         except Exception:
+            self._risk_halt_reason = "Cannot read consecutive-loss state from SQLite"
             return True
         if self.cfg.max_consecutive_losses > 0 and self.consecutive_losses >= self.cfg.max_consecutive_losses:
+            self._risk_halt_reason = (
+                f"Consecutive net-loss limit reached: {self.consecutive_losses}/"
+                f"{self.cfg.max_consecutive_losses}"
+            )
             return True
+        self._risk_halt_reason = ""
         return False
 
     async def _cancel_window_maker_orders(self, window: WindowState) -> None:
@@ -1370,6 +1418,11 @@ class TradingEngine:
                 anchor_verified = anchor_delta <= 0.01
                 if not anchor_verified:
                     self.paused = True
+                    self._risk_halt_active = True
+                    self._risk_halt_reason = (
+                        f"Chainlink/Gamma settlement-anchor mismatch: {w.slug}, "
+                        f"delta ${anchor_delta:.4f}"
+                    )
                     if self.executor is not None:
                         try:
                             await self.executor.cancel_all()
@@ -1524,6 +1577,8 @@ class TradingEngine:
             "execution_model": "PAPER CLOB post-only queue simulation + taker at public best ask; maker rebates not modeled",
             "maker_rebates_modeled": False,
             "live_trading_enabled": False,
+            "risk_halt_active": self._risk_halt_active,
+            "risk_halt_reason": self._risk_halt_reason,
             "oracle_last_event_ts": self._oracle_last_event_ts,
             "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
             "merge_history": self.ledger.recent_merges(self.cfg.trading_mode, 10),
