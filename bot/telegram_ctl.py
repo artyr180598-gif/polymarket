@@ -52,6 +52,8 @@ class TelegramController:
         self._notification_wakeup = asyncio.Event()
         self._running = False
         self._offset = 0
+        self._delivery_ready = False
+        self._startup_acknowledged = False
         self._session: Optional[aiohttp.ClientSession] = None
         # Keep message text and durable outbox IDs aligned by queue position.
         self.ledger = getattr(engine, "ledger", None)
@@ -85,6 +87,20 @@ class TelegramController:
                 known.add(notification_id)
         except Exception:
             logger.exception("Could not load next Telegram outbox batch")
+
+    def _set_delivery_ready(self, ready: bool) -> None:
+        """Fail closed when durable trade notifications cannot be delivered."""
+        self._delivery_ready = bool(ready)
+        if hasattr(self.engine, "_notification_channel_ready"):
+            self.engine._notification_channel_ready = bool(ready)
+        if not ready and hasattr(self.engine, "paused"):
+            self.engine.paused = True
+            executor = getattr(self.engine, "executor", None)
+            if executor is not None:
+                try:
+                    asyncio.get_running_loop().create_task(executor.cancel_all())
+                except RuntimeError:
+                    logger.exception("Could not schedule maker cancellation after Telegram delivery failure")
 
     @property
     def _base(self) -> str:
@@ -137,8 +153,14 @@ class TelegramController:
             keyboard=_kb_main(),
         )
         if not startup_delivered:
+            self._set_delivery_ready(False)
             raise RuntimeError("Telegram startup message was not acknowledged; refusing unnotified PAPER trading")
+        self._startup_acknowledged = True
         await self._flush_pending_notifications()
+        if self._pending_notifications:
+            self._set_delivery_ready(False)
+            raise RuntimeError("Pending Telegram trade notifications remain undelivered; PAPER trading is paused")
+        self._set_delivery_ready(True)
 
     async def _register_commands(self) -> None:
         """Expose supported controls in Telegram's native slash-command menu."""
@@ -263,6 +285,7 @@ class TelegramController:
                         self._pending_notification_ids[0] = notification_id
                     except Exception:
                         logger.exception("Telegram outbox insert retry failed; not sending unpersisted event")
+                        self._set_delivery_ready(False)
                         break
                 delivered = await self.send(f"🔔 {msg}", keyboard=_kb_main())
                 if not delivered:
@@ -273,6 +296,8 @@ class TelegramController:
                             )
                         except Exception:
                             logger.exception("Could not record Telegram delivery failure")
+                    # Stop new PAPER entries until this trade event is delivered.
+                    self._set_delivery_ready(False)
                     # Leave the head item queued. The dedicated delivery worker
                     # retries independently of Telegram's long-poll command loop.
                     break
@@ -282,12 +307,15 @@ class TelegramController:
                     except Exception:
                         # Do not drop the item if the durable acknowledgement failed.
                         logger.exception("Could not acknowledge Telegram outbox delivery")
+                        self._set_delivery_ready(False)
                         break
                 self._pending_notifications.pop(0)
                 self._pending_notification_ids.pop(0)
                 self._pending_notification_keys.pop(0)
                 if not self._pending_notifications:
                     self._load_persisted_notifications()
+            if self._startup_acknowledged and not self._pending_notifications:
+                self._set_delivery_ready(True)
 
     async def _notification_delivery_loop(self) -> None:
         """Retry queued trade events independently from the long-polling bot loop."""
