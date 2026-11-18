@@ -127,6 +127,7 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
     return {
         "slug": slug,
         "condition_id": market.get("conditionId"),
+        "clob_token_ids": [str(token_id) for token_id in token_ids],
         "gamma_price_to_beat_available": bool(
             isinstance(event_metadata, dict) and event_metadata.get("priceToBeat")
         ),
@@ -181,13 +182,7 @@ async def main() -> None:
         # RTDS uses its own SDK websocket client; HTTP checks share this session.
         rtds = await check_rtds()
         gamma_clob = await check_gamma_and_clob(session)
-        clob_ws = await check_clob_websocket(str(
-            json.loads((await get_json(
-                session,
-                "https://gamma-api.polymarket.com/events",
-                {"slug": gamma_clob["slug"]},
-            ))[0]["markets"][0]["clobTokenIds"])[0]
-        ))
+        clob_ws = await check_clob_websocket(gamma_clob["clob_token_ids"][0])
         data_api = await check_data_api(session)
     print(json.dumps({
         "status": "PASS",
