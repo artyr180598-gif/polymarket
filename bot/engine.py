@@ -384,7 +384,9 @@ class TradingEngine:
         # market discovery. A restart can occur after a market has expired;
         # those positions still need token IDs for resolution and UI tracking.
         for restored in list(self.windows.values()):
-            if restored.resolved:
+            if restored.resolved or restored.end_ts > now + 5:
+                # Current/future windows are handled below, where the exact
+                # Chainlink boundary sample is checked before any Gamma retry.
                 continue
             needs_metadata = (
                 not restored.up_token
