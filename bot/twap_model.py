@@ -57,8 +57,9 @@ class AssetPriceTracker:
         self.basis_ema: Optional[float] = None
         self.basis_alpha: float = 0.035
         self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=400)
-        self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=900)
+        self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=1800)
         self.boundary_twap: Dict[int, float] = {}
+        self.boundary_twap_ts: Dict[int, float] = {}
         default_v = DEFAULT_SIGMA_1S.get(self.asset, 0.00012) ** 2
         self._var_fast: float = default_v
         self._var_slow: float = default_v
@@ -68,6 +69,9 @@ class AssetPriceTracker:
 
     def on_chainlink_spot(self, price: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        # A delayed/out-of-order RTDS packet must never roll the live price back.
+        if ts < self.cl_spot_ts:
+            return
         now_m = time.monotonic()
         if self._last_vol_px is not None and ts > self._last_vol_ts:
             dt = ts - self._last_vol_ts
@@ -94,6 +98,9 @@ class AssetPriceTracker:
 
     def on_chainlink_twap60(self, twap_val: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        # Keep the latest source timestamp monotonic; do not regress the anchor.
+        if ts < self.cl_twap60_ts:
+            return
         self.cl_twap60 = twap_val
         self.cl_twap60_ts = ts
         self.cl_twap_recv_mono = time.monotonic()
@@ -101,35 +108,32 @@ class AssetPriceTracker:
             self.cl_twap_hist.append((ts, twap_val))
         sec = int(round(ts))
         self.boundary_twap[sec] = twap_val
-        if len(self.boundary_twap) > 150:
-            for k in sorted(self.boundary_twap.keys())[:-120]:
+        self.boundary_twap_ts[sec] = ts
+        if len(self.boundary_twap) > 1200:
+            for k in sorted(self.boundary_twap.keys())[:-1200]:
                 del self.boundary_twap[k]
+                self.boundary_twap_ts.pop(k, None)
 
     def on_binance_spot(self, price: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        if ts < self.bn_spot_ts:
+            return
         self.bn_spot = price
         self.bn_spot_ts = ts
         self.bn_recv_mono = time.monotonic()
         if self.cl_spot is not None and self.basis_ema is None and abs(ts - self.cl_spot_ts) <= 5.0:
             self.basis_ema = price - self.cl_spot
 
-    def lookup_twap_at(self, epoch_sec: int, max_diff_sec: float = 45.0) -> Optional[float]:
-        epoch_sec = int(epoch_sec)
-        if epoch_sec in self.boundary_twap:
-            return self.boundary_twap[epoch_sec]
-        best = None
-        best_d = max_diff_sec + 1
-        for sec, val in self.boundary_twap.items():
-            d = abs(sec - epoch_sec)
-            if d < best_d:
-                best_d = d
-                best = val
-        if best is not None and best_d <= max_diff_sec:
-            return best
-        # hist search
-        for ts, val in reversed(self.cl_twap_hist):
-            if abs(ts - epoch_sec) <= max_diff_sec:
-                return val
+    def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
+        # Use source timestamps, not rounded dictionary keys, to select the
+        # closest sample to the exact market boundary.
+        nearest = min(
+            self.cl_twap_hist,
+            key=lambda item: abs(item[0] - epoch_sec),
+            default=None,
+        )
+        if nearest is not None and abs(nearest[0] - epoch_sec) <= max_diff_sec:
+            return nearest[1]
         return None
 
     @property

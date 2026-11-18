@@ -43,6 +43,9 @@ def main() -> None:
             "yes" if cfg.telegram_bot_token else "NO",
             cfg.telegram_chat_id or "NO",
         )
+        # Attach the notifier before engine.start(): startup can discover and fill
+        # PAPER orders before Telegram's polling session is fully initialized.
+        engine.set_notifier(tg.notify)
         try:
             await engine.start()
         except Exception:
@@ -50,8 +53,14 @@ def main() -> None:
             raise
         try:
             await tg.start()
+            engine._notification_channel_ready = bool(tg.enabled and tg._delivery_ready)
+            if not engine._notification_channel_ready:
+                engine.pause()
+                log.error("Telegram is not configured; PAPER trading is paused until trade notifications are available")
         except Exception:
-            log.exception("telegram.start failed")
+            engine._notification_channel_ready = False
+            log.exception("telegram.start failed; pausing PAPER trading")
+            engine.pause()
         try:
             yield
         finally:

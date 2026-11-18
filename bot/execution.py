@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ class PaperFill:
     fee: float
     role: str  # MAKER | TAKER
     ts: float
+    queue_ahead_before: Optional[float] = None
 
 
 class PaperExecutor:
@@ -77,9 +79,22 @@ class PaperExecutor:
         best_bid: float = 0.0,
         best_ask: float = 1.0,
         bid_size_at_or_better: float = 0.0,
+        tick_size: float = 0.01,
     ) -> Optional[str]:
         """Place post-only BUY. Rejects if would cross the spread."""
-        price = round(price, 2)
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (price, size, best_bid, best_ask, bid_size_at_or_better, tick_size)
+            )
+            or tick_size <= 0
+            or best_bid < 0
+            or not 0 < best_ask < 1
+            or best_bid >= best_ask
+            or bid_size_at_or_better < 0
+        ):
+            return None
+        price = round(math.floor((price + 1e-12) / tick_size) * tick_size, 6)
         size = round(size, 2)
         if size < 5.0 or price <= 0 or price >= 1:
             return None
@@ -119,8 +134,10 @@ class PaperExecutor:
         timeframe: str = "5m",
     ) -> Optional[PaperFill]:
         """FAK-style taker buy at best_ask."""
+        if not math.isfinite(size) or not math.isfinite(best_ask):
+            return None
         size = round(size, 2)
-        if size < 5.0 or best_ask <= 0 or best_ask >= 1:
+        if size < 5.0 or not 0 < best_ask < 1:
             return None
         fee = calc_taker_fee_usdc(size, best_ask, asset, timeframe)
         cost = best_ask * size + fee
@@ -152,6 +169,14 @@ class PaperExecutor:
         """Progress queue and generate maker fills when tape eats through us."""
         now = time.time()
         new_fills: List[PaperFill] = []
+        if (
+            not math.isfinite(best_bid)
+            or not math.isfinite(best_ask)
+            or best_bid < 0
+            or not 0 < best_ask < 1
+            or best_bid >= best_ask
+        ):
+            return new_fills
         for oid, o in list(self.orders.items()):
             if o.status != "open" or o.asset_id != asset_id:
                 continue
@@ -163,34 +188,73 @@ class PaperExecutor:
                 o.status = "canceled"
                 self.cash += o.price * o.remaining  # release reserve
                 continue
-            # Queue decay from aggressive sells hitting the bid
-            if last_trade_price is not None and last_trade_side.upper() in ("SELL", "ASK", ""):
-                if last_trade_price <= o.price + 1e-9:
-                    o.queue_ahead = max(0.0, o.queue_ahead - last_trade_size)
-            # Fill when queue is gone and trade prints at or through our price
-            if o.queue_ahead <= 0 and last_trade_price is not None:
-                if last_trade_price <= o.price + 1e-9:
-                    fill_size = min(o.remaining, last_trade_size if last_trade_size > 0 else o.remaining)
-                    if fill_size >= 0.01:
-                        o.remaining = round(o.remaining - fill_size, 4)
-                        self.positions[asset_id] = self.positions.get(asset_id, 0.0) + fill_size
-                        # Maker fee = 0; reserved cash already deducted at limit price
-                        # Refund difference if any (we reserved at limit)
-                        fill = PaperFill(
-                            order_id=oid,
-                            asset_id=asset_id,
-                            price=o.price,
-                            size=fill_size,
-                            fee=0.0,
-                            role="MAKER",
-                            ts=now,
-                        )
-                        self.fills.append(fill)
-                        new_fills.append(fill)
-                        if o.remaining < 0.01:
-                            o.status = "filled"
-                            o.remaining = 0.0
+            # Only sell-aggressor prints can execute a resting BUY order.
+            # Unknown trade side is not enough evidence to simulate a fill.
+            is_sell_aggressor = last_trade_side.upper() in ("SELL", "ASK")
+            if (
+                not is_sell_aggressor
+                or last_trade_price is None
+                or not math.isfinite(last_trade_price)
+                or not 0 < last_trade_price < 1
+                or not math.isfinite(last_trade_size)
+                or last_trade_size <= 0
+                or last_trade_price > o.price + 1e-9
+            ):
+                continue
+            # First consume the visible queue that was ahead when we joined.
+            # Only the residual tape volume can execute our simulated order.
+            queue_ahead_before = o.queue_ahead
+            volume_before_us = max(0.0, last_trade_size - queue_ahead_before)
+            o.queue_ahead = max(0.0, queue_ahead_before - last_trade_size)
+            # Fill only from tape volume remaining after the queue ahead.
+            if volume_before_us <= 0:
+                continue
+            fill_size = min(o.remaining, volume_before_us)
+            if fill_size < 0.01:
+                continue
+            o.remaining = round(o.remaining - fill_size, 4)
+            self.positions[asset_id] = self.positions.get(asset_id, 0.0) + fill_size
+            # Maker fee = 0; cash for the full resting order was reserved on entry.
+            fill = PaperFill(
+                order_id=oid,
+                asset_id=asset_id,
+                price=o.price,
+                size=fill_size,
+                fee=0.0,
+                role="MAKER",
+                ts=now,
+                queue_ahead_before=queue_ahead_before,
+            )
+            self.fills.append(fill)
+            new_fills.append(fill)
+            if o.remaining < 0.01:
+                o.status = "filled"
+                o.remaining = 0.0
         return new_fills
+
+    def confirm_fill(self, fill: PaperFill) -> None:
+        """Forget a fill after the engine has durably committed it to SQLite."""
+        if fill in self.fills:
+            self.fills.remove(fill)
+        order = self.orders.get(fill.order_id)
+        if order is not None and order.status == "filled":
+            self.orders.pop(fill.order_id, None)
+
+    def rollback_fill(self, fill: PaperFill) -> bool:
+        """Undo an unpersisted simulated fill while retaining its cash reservation."""
+        if fill not in self.fills:
+            return False
+        self.fills.remove(fill)
+        self.positions[fill.asset_id] = max(
+            0.0, self.positions.get(fill.asset_id, 0.0) - fill.size
+        )
+        order = self.orders.get(fill.order_id)
+        if order is not None:
+            order.remaining = min(order.size, round(order.remaining + fill.size, 4))
+            if fill.queue_ahead_before is not None:
+                order.queue_ahead = fill.queue_ahead_before
+            order.status = "open"
+        return True
 
     async def cancel_order(self, order_id: str) -> bool:
         o = self.orders.get(order_id)

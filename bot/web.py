@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import os
+import sqlite3
+import tempfile
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from .engine import TradingEngine
@@ -30,7 +34,7 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
     def verify_pin(x_bot_pin: Optional[str] = Header(default=None)) -> None:
         required = engine.cfg.dashboard_pin
         if not required:
-            return
+            raise HTTPException(status_code=503, detail="Dashboard PIN is not configured")
         provided = (x_bot_pin or "").strip()
         if not hmac.compare_digest(provided, required):
             raise HTTPException(status_code=401, detail="Неверный PIN-код панели")
@@ -48,6 +52,44 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
             "pin_required": bool(engine.cfg.dashboard_pin),
         }
 
+    @app.post("/api/admin/backup", dependencies=[Depends(verify_pin)])
+    async def create_database_backup() -> FileResponse:
+        # A consistent SQLite online backup includes committed WAL contents.
+        # Require an explicit PIN even if other dashboard routes are configured
+        # for an unauthenticated local-only setup, and never export while active.
+        if not engine.cfg.dashboard_pin:
+            raise HTTPException(status_code=503, detail="Dashboard PIN is required for database export")
+        if not getattr(engine, "paused", True):
+            raise HTTPException(status_code=409, detail="Pause the bot before creating a database backup")
+        source = getattr(getattr(engine, "ledger", None), "conn", None)
+        if source is None:
+            raise HTTPException(status_code=503, detail="Ledger database is unavailable")
+        fd, backup_path = tempfile.mkstemp(prefix="polybot-ledger-", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            destination = sqlite3.connect(backup_path)
+            try:
+                source.backup(destination)
+                check = destination.execute("PRAGMA integrity_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise RuntimeError("SQLite backup integrity check failed")
+            finally:
+                destination.close()
+            return FileResponse(
+                backup_path,
+                media_type="application/vnd.sqlite3",
+                filename="polybot-ledger-backup.sqlite3",
+                background=BackgroundTask(os.unlink, backup_path),
+            )
+        except Exception as exc:
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                pass
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(status_code=500, detail="Database backup failed integrity verification") from exc
+
     @app.get("/api/state", dependencies=[Depends(verify_pin)])
     async def get_state() -> JSONResponse:
         snap = engine.snapshot() if hasattr(engine, "snapshot") else {}
@@ -62,7 +104,10 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
     @app.post("/api/action/resume", dependencies=[Depends(verify_pin)])
     async def act_resume() -> dict:
         if hasattr(engine, "resume"):
-            engine.resume()
+            resumed = engine.resume()
+            if resumed is False:
+                reason = getattr(engine, "_risk_halt_reason", "") or "Активен защитный лимит"
+                raise HTTPException(status_code=409, detail=reason)
         return {"ok": True}
 
     @app.post("/api/action/kill", dependencies=[Depends(verify_pin)])

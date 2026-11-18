@@ -1,0 +1,445 @@
+from __future__ import annotations
+
+import asyncio
+import time
+
+from bot.config import BotConfig
+from bot.engine import TradingEngine, WindowState, _select_closed_gamma_strike
+
+
+def test_expired_window_reports_negative_remaining_time(monkeypatch) -> None:
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_000.0)
+    window = WindowState(
+        slug="btc-updown-5m-999700",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=700.0,
+        end_ts=990.0,
+    )
+    assert window.remain_sec == -10.0
+
+
+
+def test_discovery_uses_only_near_exact_rtds_sample_for_existing_window(monkeypatch) -> None:
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"]))
+    slug = "btc-updown-5m-900"
+    engine.windows[slug] = WindowState(
+        slug=slug,
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        fee_rate=0.0,
+        start_ts=900.0,
+        end_ts=1200.0,
+        price_to_beat=None,
+        last_ptb_retry_mono=time.monotonic() - 6.0,
+    )
+    engine.trackers["BTC"].on_chainlink_twap60(100_000.25, 900_000)
+    calls: list[str] = []
+
+    async def fake_gamma(requested_slug: str):
+        calls.append(requested_slug)
+        return None
+
+    engine._gamma = fake_gamma  # type: ignore[method-assign]
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_000.0)
+
+    asyncio.run(engine._discover())
+
+    assert engine.windows[slug].price_to_beat == 100_000.25
+    assert engine.windows[slug].price_to_beat_source == "rtds.chainlink_twap60.near_exact_window_start"
+    assert slug not in calls
+
+
+
+def test_active_market_does_not_treat_frontend_open_price_as_settlement_strike() -> None:
+    # The frontend crypto-price openPrice can differ from the Chainlink TWAP60
+    # settlement anchor. Active windows must wait for the exact RTDS boundary sample.
+    value, source = _select_closed_gamma_strike({"closed": False, "eventMetadata": {}})
+    assert value is None
+    assert source == ""
+
+
+def test_active_gamma_event_metadata_is_not_used_as_live_strike() -> None:
+    value, source = _select_closed_gamma_strike(
+        {"closed": False, "eventMetadata": {"priceToBeat": "62000"}},
+    )
+    assert value is None
+    assert source == ""
+
+
+def test_closed_gamma_price_to_beat_is_reconciliation_fallback() -> None:
+    value, source = _select_closed_gamma_strike(
+        {"closed": True, "eventMetadata": {"priceToBeat": "62000"}},
+    )
+    assert value == 62_000.0
+    assert source == "gamma.eventMetadata.priceToBeat"
+
+
+def test_boundary_lookup_rejects_samples_more_than_half_a_second_away(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    ))
+    tracker = engine.trackers["BTC"]
+    tracker.on_chainlink_twap60(100_000.0, 1_000_000)
+    assert tracker.lookup_twap_at(1_000.0, max_diff_sec=0.5) == 100_000.0
+    assert tracker.lookup_twap_at(1_000.6, max_diff_sec=0.5) is None
+    assert tracker.lookup_twap_at(1_001.0, max_diff_sec=0.5) is None
+    engine.ledger.conn.close()
+
+
+def test_twap_boundary_lookup_uses_original_fractional_timestamp() -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    tracker = AssetPriceTracker("BTC")
+    tracker.on_chainlink_twap60(100_000.0, 1_000_000)
+    tracker.on_chainlink_twap60(100_001.0, 1_000_600)
+    assert tracker.lookup_twap_at(1_000.0, max_diff_sec=0.0) == 100_000.0
+    assert tracker.lookup_twap_at(1_000.6, max_diff_sec=0.0) == 100_001.0
+    assert tracker.lookup_twap_at(1_000.0, max_diff_sec=0.1) == 100_000.0
+
+
+def test_discovery_uses_chainlink_twap60_sample_at_window_boundary(monkeypatch) -> None:
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"]))
+    tracker = engine.trackers["BTC"]
+    tracker.on_chainlink_twap60(62_236.25808880998, 900_000)
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_000.0)
+
+    async def fake_gamma(slug: str):
+        return {
+            "condition_id": "0x" + "1" * 64,
+            "up_token": "up-token",
+            "down_token": "down-token",
+            "price_to_beat": None,
+            "price_to_beat_source": "",
+            "fee_rate": 0.25,
+        }
+
+    engine._gamma = fake_gamma  # type: ignore[method-assign]
+    asyncio.run(engine._discover())
+
+    window = engine.windows["btc-updown-5m-900"]
+    assert window.price_to_beat == 62_236.25808880998
+    assert window.price_to_beat_source == "rtds.chainlink_twap60.near_exact_window_start"
+
+
+
+def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-900",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
+
+    orders = engine.executor.get_open_orders("up-token")
+    assert len(orders) == 1
+    assert orders[0].price == 0.41
+    assert orders[0].size == 12.0
+    assert engine.executor.cash == 100.0 - 0.41 * 12.0
+
+
+def test_maker_quotes_are_not_created_without_live_clob_feed(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-900",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
+
+    assert engine.executor.get_open_orders("up-token") == []
+
+
+
+def test_gamma_active_event_ignores_metadata_price_to_beat(monkeypatch) -> None:
+    event = {
+        "closed": False,
+        "eventMetadata": {"priceToBeat": "100001.25"},
+        "markets": [{
+            "closed": False,
+            "conditionId": "0x" + "3" * 64,
+            "clobTokenIds": ["up-token", "down-token"],
+            "feeSchedule": {"rate": 0.25},
+        }],
+    }
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return [event]
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def get(self, url):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "bot.engine.aiohttp.ClientSession",
+        lambda **kwargs: FakeSession(),
+    )
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"]))
+
+    result = asyncio.run(engine._gamma("btc-updown-5m-900"))
+
+    assert result is not None
+    assert result["condition_id"] == "0x" + "3" * 64
+    assert result["price_to_beat"] is None
+    assert result["price_to_beat_source"] == ""
+    assert result["fee_rate"] == 0.25
+    engine.ledger.conn.close()
+
+
+
+def test_oracle_tracker_rejects_out_of_order_spot_and_twap_updates() -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    tracker = AssetPriceTracker("BTC")
+    tracker.on_chainlink_spot(100_000.0, 1_000_000)
+    tracker.on_chainlink_spot(99_000.0, 999_000)
+    assert tracker.cl_spot == 100_000.0
+    assert tracker.cl_spot_ts == 1_000.0
+
+    tracker.on_chainlink_twap60(100_001.0, 1_000_000)
+    tracker.on_chainlink_twap60(99_001.0, 999_000)
+    assert tracker.cl_twap60 == 100_001.0
+    assert tracker.cl_twap60_ts == 1_000.0
+
+
+def test_binance_basis_tracker_rejects_out_of_order_spot_updates() -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    tracker = AssetPriceTracker("BTC")
+    tracker.on_binance_spot(100_010.0, 1_000_000)
+    tracker.on_binance_spot(99_010.0, 999_000)
+    assert tracker.bn_spot == 100_010.0
+    assert tracker.bn_spot_ts == 1_000.0
+
+
+
+def test_anchor_mismatch_halts_resume_even_after_engine_restart(tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "anchor-mismatch.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.ledger.record_anchor_check(
+        mode="paper",
+        slug="btc-updown-5m-anchor-mismatch",
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=100_000.10,
+        anchor_delta=0.10,
+        anchor_verified=False,
+    )
+    engine.ledger.conn.close()
+
+    restarted = TradingEngine(cfg)
+    assert restarted._risk_halted() is True
+    assert restarted.resume() is False
+    assert restarted.paused is True
+    assert restarted._risk_halt_active is True
+    assert "manual investigation required" in restarted._risk_halt_reason
+    restarted.ledger.conn.close()
+
+
+def test_resume_refuses_to_bypass_daily_loss_limit(tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "daily-loss-halt.db"),
+        max_daily_loss_usd=10.0,
+    )
+    engine = TradingEngine(cfg)
+    engine.ledger.record_merge(
+        mode="paper",
+        slug="btc-updown-5m-daily-loss",
+        condition_id="0x" + "4" * 64,
+        pairs=1.0,
+        cost_basis=12.0,
+        locked_pnl=-11.0,
+        tx_hash="paper-risk-test",
+    )
+
+    assert engine.resume() is False
+    assert engine.paused is True
+    assert "Daily net loss limit reached" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
+
+def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "restore-metadata.db"),
+    ))
+    old_start = int(time.time()) - 600
+    slug = f"btc-updown-5m-{old_start}"
+    restored = WindowState(
+        slug=slug,
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "5" * 64,
+        up_token="",
+        down_token="",
+        start_ts=float(old_start),
+        end_ts=float(old_start + 300),
+        last_ptb_retry_mono=time.monotonic() - 10.0,
+    )
+    restored.up_shares = 5.0
+    restored.up_cost = 2.0
+    engine.windows[slug] = restored
+
+    async def fake_gamma(requested_slug: str):
+        return {
+            "condition_id": "0x" + "5" * 64,
+            "up_token": "restored-up-token",
+            "down_token": "restored-down-token",
+            "price_to_beat": 100_000.0,
+            "price_to_beat_source": "gamma.eventMetadata.priceToBeat",
+            "fee_rate": 0.25,
+        }
+
+    engine._gamma = fake_gamma  # type: ignore[method-assign]
+    asyncio.run(engine._discover())
+
+    assert restored.up_token == "restored-up-token"
+    assert restored.down_token == "restored-down-token"
+    assert restored.price_to_beat == 100_000.0
+    assert engine._market_tokens_changed.is_set()
+    engine.ledger.conn.close()
+
+
+def test_atomic_pair_entry_debits_engine_and_executor_cash_once(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-cash.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    window = WindowState(
+        slug="btc-updown-5m-pair-cash",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "5" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=time.time(),
+        end_ts=time.time() + 300,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+
+    opened = asyncio.run(engine._open_pair(
+        window,
+        price_up=0.40,
+        price_down=0.50,
+        size=10.0,
+        fee_up=0.10,
+        fee_down=0.10,
+        fair_up=0.60,
+        fair_down=0.40,
+    ))
+
+    assert opened is True
+    expected_cash = 100.0 - (10.0 * (0.40 + 0.50) + 0.20)
+    assert engine.cash == expected_cash
+    assert engine.executor.cash == expected_cash
+    assert window.up_shares == 10.0
+    assert window.down_shares == 10.0
+    assert len([row for row in engine.ledger.recent_fills("paper", limit=10) if row["slug"] == window.slug]) == 2
+    assert len(engine.ledger.pending_telegram_notifications()) == 1
+    engine.ledger.conn.close()
+
+
+def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "telegram-required.db"),
+    ))
+    engine._notification_channel_ready = False
+
+    assert engine.resume() is False
+    assert engine.paused is True
+    assert "Telegram delivery is not initialized" in engine._risk_halt_reason
+    engine.ledger.conn.close()
