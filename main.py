@@ -1,18 +1,20 @@
-"""PolyBot TWAP Hybrid — main entrypoint (Engine + Mobile Dashboard + Telegram)."""
+"""PolyBot TWAP Hybrid — Engine + Dashboard + Telegram."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 from contextlib import asynccontextmanager
 
 import uvicorn
+from fastapi import FastAPI
 
 from bot.config import BotConfig
 from bot.engine import TradingEngine
 from bot.telegram_ctl import TelegramController
 from bot.web import create_app
+
+log = logging.getLogger("polybot")
 
 
 def setup_logging() -> None:
@@ -22,40 +24,52 @@ def setup_logging() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
     )
-    # Keep third-party HTTP/WS chatter quiet
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-def build_application():
+def main() -> None:
     setup_logging()
     cfg = BotConfig.from_env()
     engine = TradingEngine(cfg)
     tg = TelegramController(engine)
 
     @asynccontextmanager
-    async def lifespan(_app):
-        await engine.start()
-        await tg.start()
+    async def lifespan(app: FastAPI):
+        log.info(
+            "Boot mode=%s bankroll=%s tg_token=%s tg_chat=%s",
+            cfg.trading_mode,
+            cfg.bankroll_usd,
+            "yes" if cfg.telegram_bot_token else "NO",
+            cfg.telegram_chat_id or "NO",
+        )
+        try:
+            await engine.start()
+        except Exception:
+            log.exception("engine.start failed")
+            raise
+        try:
+            await tg.start()
+        except Exception:
+            log.exception("telegram.start failed")
         try:
             yield
         finally:
-            await tg.stop()
-            await engine.stop()
+            try:
+                await tg.stop()
+            except Exception:
+                pass
+            try:
+                await engine.stop()
+            except Exception:
+                pass
 
-    app = create_app(engine)
-    app.router.lifespan_context = lifespan
-    return app, cfg
+    app = create_app(engine, lifespan=lifespan)
 
-
-def main() -> None:
-    app, cfg = build_application()
-    uvicorn.run(
-        app,
-        host=cfg.dashboard_host,
-        port=cfg.dashboard_port,
-        log_level="info",
-    )
+    port = int(cfg.dashboard_port)
+    host = cfg.dashboard_host
+    log.info("Listening on %s:%s", host, port)
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
