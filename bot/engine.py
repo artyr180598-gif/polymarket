@@ -535,7 +535,8 @@ class TradingEngine:
                 await self._market_tokens_changed.wait()
                 continue
 
-            iterator = PolymarketMarketFeed(token_ids).events().__aiter__()
+            stream = PolymarketMarketFeed(token_ids).events()
+            iterator = stream.__aiter__()
             try:
                 self._market_feed_connected = False
                 self._log_event(
@@ -580,9 +581,9 @@ class TradingEngine:
                 await asyncio.sleep(2.0)
             finally:
                 try:
-                    await iterator.aclose()
-                except Exception:
-                    pass
+                    await asyncio.wait_for(stream.aclose(), timeout=4.0)
+                except (asyncio.TimeoutError, RuntimeError):
+                    log.warning("Timed out while closing Polymarket CLOB stream")
 
     def _book_best(self, book: Dict[str, Any]) -> tuple[float, float]:
         bids = book.get("bids") or {}
