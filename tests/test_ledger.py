@@ -238,3 +238,73 @@ def test_existing_ledger_schema_migrates_anchor_audit_columns(tmp_path) -> None:
         "anchor_verified",
     }.issubset(columns)
     ledger.conn.close()
+
+
+def test_maker_clob_roles_are_counted_as_maker_and_history_net_is_merge_adjusted(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "maker-history.db"))
+    slug = "btc-updown-5m-1795035600"
+    ledger.record_fill(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        outcome="Up",
+        role="MAKER_CLOB",
+        reason="maker_test",
+        shares=10,
+        price=0.40,
+        fee=0.10,
+        fair_prob=0.5,
+    )
+    ledger.record_fill(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        outcome="Down",
+        role="TAKER_CLOB",
+        reason="taker_test",
+        shares=10,
+        price=0.50,
+        fee=0.10,
+        fair_prob=0.5,
+    )
+    ledger.record_merge(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        pairs=5,
+        cost_basis=4.5,
+        locked_pnl=0.5,
+        tx_hash="paper-merge",
+    )
+    ledger.record_resolution(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100000.0,
+        final_price=100001.0,
+        up_shares_total=5,
+        down_shares_total=5,
+        merged_pairs=5,
+        gross_cost=4.5,
+        total_fees=0.2,
+        total_payout=5.0,
+    )
+
+    stats = ledger.get_stats("paper")
+    assert stats["maker_fills"] == 1
+    assert stats["total_fills"] == 2
+    assert stats["win_markets"] == 1
+    assert stats["loss_markets"] == 0
+    assert stats["breakeven_markets"] == 0
+
+    history = ledger.market_history("paper", 10)
+    assert len(history) == 1
+    assert history[0]["merge_pnl"] == 0.5
+    assert round(history[0]["market_net_pnl"], 2) == 0.8
