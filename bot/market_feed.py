@@ -32,6 +32,7 @@ class PolymarketMarketFeed:
                             "bids": [(float(x.price), float(x.size)) for x in payload.bids],
                             "asks": [(float(x.price), float(x.size)) for x in payload.asks],
                             "tick_size": float(payload.tick_size or 0.01),
+                            "min_order_size": float(payload.min_order_size or 0.0),
                             "timestamp": payload.timestamp.timestamp() if payload.timestamp else None,
                         }
                     elif event_type == "price_change":
