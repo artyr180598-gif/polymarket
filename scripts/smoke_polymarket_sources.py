@@ -200,6 +200,85 @@ async def check_open_price_reference_vs_gamma_ptb(
     }
 
 
+async def check_boundary_twap_vs_gamma(
+    session: aiohttp.ClientSession,
+) -> dict[str, float]:
+    # One-time integration proof: capture RTDS Chainlink TWAP60 around a future
+    # BTC 5m boundary, then compare that sample with Gamma's settled priceToBeat.
+    iterator = PolymarketOracleFeed(["BTC"]).events().__aiter__()
+    samples: list[tuple[float, float]] = []
+    start_ts = 0
+    try:
+        # Wait for a live event first so the RTDS subscription is established.
+        await asyncio.wait_for(iterator.__anext__(), timeout=30.0)
+        start_ts = ((int(time.time()) // 300) + 1) * 300
+        deadline = start_ts + 3
+        while time.time() <= deadline:
+            try:
+                asset, kind, price, timestamp_ms = await asyncio.wait_for(
+                    iterator.__anext__(), timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                continue
+            ts = timestamp_ms / 1000.0
+            if asset == "BTC" and kind == "chainlink_twap60" and start_ts - 2 <= ts <= start_ts + 2:
+                samples.append((ts, price))
+    finally:
+        await iterator.aclose()
+
+    if not samples:
+        raise RuntimeError("No BTC Chainlink TWAP60 samples observed within ±2s of the next 5m boundary")
+    nearest_ts, nearest_twap = min(samples, key=lambda item: abs(item[0] - start_ts))
+    offset = abs(nearest_ts - start_ts)
+    if offset > 0.5:
+        raise RuntimeError(
+            f"Nearest RTDS TWAP60 sample is {offset:.3f}s from boundary; "
+            "strict PAPER strike gate must skip this window"
+        )
+
+    slug = f"btc-updown-5m-{start_ts}"
+    await asyncio.sleep(max(0.0, start_ts + 300 + 90 - time.time()))
+    gamma_strike = None
+    for _ in range(90):
+        rows = await get_json(
+            session,
+            "https://gamma-api.polymarket.com/events",
+            {"slug": slug},
+        )
+        if isinstance(rows, list) and rows:
+            event = rows[0]
+            for source in [event, *(event.get("markets") or [])[:1]]:
+                metadata = source.get("eventMetadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if isinstance(metadata, dict) and metadata.get("priceToBeat") is not None:
+                    gamma_strike = float(metadata["priceToBeat"])
+                    break
+        if gamma_strike is not None and gamma_strike > 0:
+            break
+        await asyncio.sleep(2.0)
+    if gamma_strike is None or gamma_strike <= 0:
+        raise RuntimeError(f"Gamma did not publish settled priceToBeat for {slug}")
+    delta = abs(nearest_twap - gamma_strike)
+    if delta > 0.01:
+        raise RuntimeError(
+            f"RTDS boundary TWAP60 does not match Gamma for {slug}: "
+            f"sample_ts={nearest_ts}, offset={offset:.3f}s, "
+            f"RTDS={nearest_twap}, Gamma={gamma_strike}, delta={delta}"
+        )
+    return {
+        "slug": slug,
+        "rtds_sample_timestamp": nearest_ts,
+        "offset_from_boundary_seconds": offset,
+        "rtds_chainlink_twap60": nearest_twap,
+        "gamma_settled_price_to_beat": gamma_strike,
+        "absolute_delta": delta,
+    }
+
+
 async def check_clob_websocket(token_id: str) -> dict[str, bool]:
     iterator = PolymarketMarketFeed([token_id]).events().__aiter__()
     got_book = False
@@ -251,6 +330,7 @@ async def main() -> None:
         )
         clob_ws = await check_clob_websocket(gamma_clob["clob_token_ids"][0])
         data_api = await check_data_api(session)
+        boundary_strike = await check_boundary_twap_vs_gamma(session)
     print(json.dumps({
         "status": "PASS",
         "rtds_chainlink": rtds,
@@ -258,6 +338,7 @@ async def main() -> None:
         "open_price_reference_vs_gamma_ptb": open_price_reference,
         "clob_websocket": clob_ws,
         "data_api_v2": data_api,
+        "boundary_strike_reconciliation": boundary_strike,
     }, indent=2))
 
 
