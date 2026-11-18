@@ -127,7 +127,7 @@ class TelegramController:
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
         preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
-        await self.send(
+        startup_delivered = await self.send(
             f"🟢 <b>PolyBot подключён к Telegram</b>\nСтратегия: <b>{preset_title}</b>\n"
             f"Режим: <b>{self.engine.cfg.trading_mode.upper()}</b> · только PAPER симуляция\n"
             f"Виртуальный банк: <b>${bank:,.0f}</b>\n"
@@ -136,6 +136,8 @@ class TelegramController:
             "Сделки и MERGE виртуальные; точная копия mo-money и прибыльность не подтверждены.",
             keyboard=_kb_main(),
         )
+        if not startup_delivered:
+            raise RuntimeError("Telegram startup message was not acknowledged; refusing unnotified PAPER trading")
         await self._flush_pending_notifications()
 
     async def _register_commands(self) -> None:
