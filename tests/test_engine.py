@@ -426,6 +426,6 @@ def test_atomic_pair_entry_debits_engine_and_executor_cash_once(tmp_path) -> Non
     assert engine.executor.cash == expected_cash
     assert window.up_shares == 10.0
     assert window.down_shares == 10.0
-    assert len(engine.ledger.fills("paper", window.slug)) == 2
+    assert len([row for row in engine.ledger.recent_fills("paper", limit=10) if row["slug"] == window.slug]) == 2
     assert len(engine.ledger.pending_telegram_notifications()) == 1
     engine.ledger.conn.close()
