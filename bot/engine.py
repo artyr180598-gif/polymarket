@@ -1385,6 +1385,11 @@ class TradingEngine:
             inv = 0.0
             equity = 0.0
             cash = 0.0
+        reserved_orders = self.executor.get_open_orders() if self.executor is not None else []
+        reserved_orders_usd = sum(order.price * order.remaining for order in reserved_orders)
+        available_cash = max(0.0, cash - reserved_orders_usd)
+        if self.executor is not None:
+            self.executor.cash = available_cash
         now = time.time()
         windows = []
         for w in self.windows.values():
@@ -1403,6 +1408,7 @@ class TradingEngine:
             windows.append({
                 "slug": w.slug, "asset": w.asset, "remain_sec": round(w.remain_sec, 1),
                 "price_to_beat": w.price_to_beat,
+                "price_to_beat_source": w.price_to_beat_source,
                 "fair_up": round(fair, 4) if fair is not None else None,
                 "net_shares": round(w.net_shares, 2),
                 "up_shares": round(w.up_shares, 2),
@@ -1417,6 +1423,9 @@ class TradingEngine:
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
             "cash": round(cash, 2),
+            "available_cash": round(available_cash, 2),
+            "reserved_maker_orders_usd": round(reserved_orders_usd, 2),
+            "maker_orders_open": len(reserved_orders),
             "realized_pnl": round(self.realized_pnl, 2),
             "day_pnl": round(self.day_pnl, 2),
             "fees_paid": round(self.fees_paid, 4),
@@ -1430,6 +1439,12 @@ class TradingEngine:
             "oracle_connected": self._oracle_fresh(),
             "model_ready": all(t._vol_samples >= 60 for t in self.trackers.values()),
             "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
+            "strike_source": "Polymarket crypto-price openPrice (live); Gamma priceToBeat only after close",
+            "clob_feed_connected": self._market_feed_connected,
+            "clob_last_event_age_sec": round(time.monotonic() - self._market_feed_last_event_mono, 2) if self._market_feed_last_event_mono else None,
+            "execution_model": "PAPER CLOB post-only queue simulation + taker at public best ask; maker rebates not modeled",
+            "maker_rebates_modeled": False,
+            "live_trading_enabled": False,
             "oracle_last_event_ts": self._oracle_last_event_ts,
             "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
             "merge_history": self.ledger.recent_merges(self.cfg.trading_mode, 10),
