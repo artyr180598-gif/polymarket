@@ -359,9 +359,9 @@ class TradingEngine:
                     slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
                     existing = self.windows.get(slug)
                     if existing is not None:
-                        # Gamma can publish priceToBeat shortly after the market
-                        # is created. Retry missing strikes instead of freezing
-                        # the window forever with None and silently skipping it.
+                        # Wait for a near-exact RTDS TWAP60 sample at this window
+                        # boundary. Gamma priceToBeat is only a post-close fallback;
+                        # never replace a missing live boundary sample with frontend openPrice.
                         now_mono = time.monotonic()
                         if existing.price_to_beat is None:
                             tracker = self.trackers.get(asset)
