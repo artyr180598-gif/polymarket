@@ -280,6 +280,91 @@ class Ledger:
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
         }
 
+    def open_positions(self, mode: str) -> List[Dict[str, Any]]:
+        """Rebuild residual PAPER inventory from persisted fills, merges and resolutions."""
+        rows = self.conn.execute(
+            """
+            SELECT
+                f.slug, f.condition_id, f.asset, f.timeframe,
+                SUM(CASE WHEN lower(f.outcome) IN ('up', 'yes') THEN f.shares ELSE 0 END) AS up_total,
+                SUM(CASE WHEN lower(f.outcome) IN ('down', 'no') THEN f.shares ELSE 0 END) AS down_total,
+                SUM(CASE WHEN lower(f.outcome) IN ('up', 'yes') THEN f.notional ELSE 0 END) AS up_cost_total,
+                SUM(CASE WHEN lower(f.outcome) IN ('down', 'no') THEN f.notional ELSE 0 END) AS down_cost_total,
+                COALESCE(m.merged_pairs, 0) AS merged_pairs
+            FROM fills f
+            LEFT JOIN (
+                SELECT mode, slug, SUM(pairs) AS merged_pairs
+                FROM merges GROUP BY mode, slug
+            ) m ON m.mode = f.mode AND m.slug = f.slug
+            LEFT JOIN resolutions r ON r.mode = f.mode AND r.slug = f.slug
+            WHERE f.mode = ? AND r.slug IS NULL
+            GROUP BY f.mode, f.slug, f.condition_id, f.asset, f.timeframe, m.merged_pairs
+            """,
+            (mode,),
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            up_total = max(0.0, float(row["up_total"] or 0.0))
+            down_total = max(0.0, float(row["down_total"] or 0.0))
+            merged = min(float(row["merged_pairs"] or 0.0), up_total, down_total)
+            up_remaining = max(0.0, up_total - merged)
+            down_remaining = max(0.0, down_total - merged)
+            up_cost_total = max(0.0, float(row["up_cost_total"] or 0.0))
+            down_cost_total = max(0.0, float(row["down_cost_total"] or 0.0))
+            up_cost = up_cost_total * (up_remaining / up_total) if up_total else 0.0
+            down_cost = down_cost_total * (down_remaining / down_total) if down_total else 0.0
+            if up_remaining < 0.0001 and down_remaining < 0.0001:
+                continue
+            result.append({
+                "slug": row["slug"],
+                "condition_id": row["condition_id"],
+                "asset": row["asset"],
+                "timeframe": row["timeframe"],
+                "up_shares": up_remaining,
+                "down_shares": down_remaining,
+                "up_cost": up_cost,
+                "down_cost": down_cost,
+                "merged_pairs": merged,
+            })
+        return result
+
+    def portfolio_state(self, mode: str, initial_bankroll: float) -> Dict[str, float]:
+        """Reconstruct PAPER cash/equity from the durable event ledger."""
+        fills = self.conn.execute(
+            "SELECT COALESCE(SUM(notional), 0) AS notional, COALESCE(SUM(fee), 0) AS fees "
+            "FROM fills WHERE mode = ?",
+            (mode,),
+        ).fetchone()
+        merges = self.conn.execute(
+            "SELECT COALESCE(SUM(pairs), 0) AS payout, COALESCE(SUM(locked_pnl), 0) AS pnl "
+            "FROM merges WHERE mode = ?",
+            (mode,),
+        ).fetchone()
+        resolutions = self.conn.execute(
+            "SELECT COALESCE(SUM(total_payout), 0) AS payout, COALESCE(SUM(gross_pnl), 0) AS pnl "
+            "FROM resolutions WHERE mode = ?",
+            (mode,),
+        ).fetchone()
+        open_inventory = sum(
+            float(position["up_cost"]) + float(position["down_cost"])
+            for position in self.open_positions(mode)
+        )
+        total_notional = float(fills["notional"] or 0.0)
+        total_fees = float(fills["fees"] or 0.0)
+        merge_payout = float(merges["payout"] or 0.0)
+        resolution_payout = float(resolutions["payout"] or 0.0)
+        cash = float(initial_bankroll) - total_notional - total_fees + merge_payout + resolution_payout
+        realized_gross = float(merges["pnl"] or 0.0) + float(resolutions["pnl"] or 0.0)
+        stats = self.get_stats(mode)
+        return {
+            "cash": cash,
+            "inventory_cost": open_inventory,
+            "equity": cash + open_inventory,
+            "realized_gross_pnl": realized_gross,
+            "fees_paid": total_fees,
+            "day_net_pnl": float(stats.get("today_total_net_pnl", 0.0)),
+        }
+
     def recent_fills(self, mode: str, limit: int = 30) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM fills WHERE mode = ? ORDER BY id DESC LIMIT ?",
