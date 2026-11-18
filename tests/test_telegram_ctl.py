@@ -81,6 +81,7 @@ def test_telegram_market_history_renders_net_pnl():
             "winner": "Up",
             "merge_pnl": 0.5,
             "market_net_pnl": 0.8,
+            "anchor_verified": 1,
             "slug": "btc-updown-5m-test",
         }]),
     )
@@ -88,4 +89,5 @@ def test_telegram_market_history_renders_net_pnl():
     message = controller._fmt_history()
     assert "История закрытых рынков" in message
     assert "$+0.80" in message
+    assert "TWAP сверён" in message
     assert "btc-updown-5m-test" in message
