@@ -17,23 +17,10 @@ logger = logging.getLogger("polybot.telegram")
 def _kb_main() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [
-                {"text": "📊 Статус", "callback_data": "status"},
-                {"text": "💰 PnL", "callback_data": "pnl"},
-            ],
-            [
-                {"text": "📈 Позиции", "callback_data": "positions"},
-                {"text": "📋 Сделки", "callback_data": "fills"},
-            ],
-            [
-                {"text": "▶️ Старт", "callback_data": "resume"},
-                {"text": "⏸ Пауза", "callback_data": "pause"},
-                {"text": "🛑 СТОП", "callback_data": "kill"},
-            ],
-            [
-                {"text": "⚙️ Пресет", "callback_data": "presets"},
-                {"text": "ℹ️ Помощь", "callback_data": "help"},
-            ],
+            [{"text": "📊 Статус", "callback_data": "status"}, {"text": "💰 PnL", "callback_data": "pnl"}],
+            [{"text": "📈 Позиции", "callback_data": "positions"}, {"text": "📋 Сделки", "callback_data": "fills"}],
+            [{"text": "▶️ Старт", "callback_data": "resume"}, {"text": "⏸ Пауза", "callback_data": "pause"}, {"text": "🛑 СТОП", "callback_data": "kill"}],
+            [{"text": "⚙️ Пресет", "callback_data": "presets"}, {"text": "ℹ️ Помощь", "callback_data": "help"}],
         ]
     }
 
@@ -41,23 +28,16 @@ def _kb_main() -> Dict[str, Any]:
 def _kb_presets() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "⭐ mo-money (рекомендуется)", "callback_data": "preset:mo_money"}],
-            [{"text": "🛡️ Lock-In (консервативный)", "callback_data": "preset:lockin"}],
-            [{"text": "⚡ Гибрид (агрессивный)", "callback_data": "preset:hybrid"}],
+            [{"text": "⭐ mo-money", "callback_data": "preset:mo_money"}],
+            [{"text": "🛡️ Lock-In", "callback_data": "preset:lockin"}],
+            [{"text": "⚡ Гибрид", "callback_data": "preset:hybrid"}],
             [{"text": "« Назад", "callback_data": "status"}],
         ]
     }
 
 
 def _kb_confirm_kill() -> Dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Да, остановить всё", "callback_data": "kill_confirm"},
-                {"text": "❌ Отмена", "callback_data": "status"},
-            ]
-        ]
-    }
+    return {"inline_keyboard": [[{"text": "✅ Да, стоп", "callback_data": "kill_confirm"}, {"text": "❌ Отмена", "callback_data": "status"}]]}
 
 
 class TelegramController:
@@ -85,18 +65,8 @@ class TelegramController:
             self.engine.set_notifier(self.notify)
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
-        mode = self.engine.cfg.trading_mode.upper()
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"Режим: <b>{mode}</b> (демо)\n"
-            f"Банк: <b>${bank:,.0f}</b>\n"
-            f"Пресет: <code>{self.engine.cfg.strategy_preset}</code>\n"
-            f"Активы: {', '.join(self.engine.cfg.enabled_assets)}\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"Торговля на <b>демо-счёте</b> внутри бота.\n"
-            f"Рынки — живые с Polymarket.\n"
-            f"Нажми кнопку ниже 👇",
+            f"🟢 <b>PolyBot онлайн</b>\nРежим: PAPER (демо)\nБанк: <b>${bank:,.0f}</b>\nЦены: Coinbase/Kraken → модель окон Polymarket\nНажми кнопку 👇",
             keyboard=_kb_main(),
         )
 
@@ -115,12 +85,7 @@ class TelegramController:
     async def send(self, text: str, keyboard: Optional[Dict] = None) -> None:
         if not self.enabled or not self._session:
             return
-        payload: Dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "text": text[:4090],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
+        payload: Dict[str, Any] = {"chat_id": self.chat_id, "text": text[:4090], "parse_mode": "HTML", "disable_web_page_preview": True}
         if keyboard:
             payload["reply_markup"] = keyboard
         try:
@@ -138,10 +103,7 @@ class TelegramController:
     async def _answer_callback(self, cq_id: str) -> None:
         if self._session:
             try:
-                await self._session.post(
-                    f"{self._base}/answerCallbackQuery",
-                    json={"callback_query_id": cq_id},
-                )
+                await self._session.post(f"{self._base}/answerCallbackQuery", json={"callback_query_id": cq_id})
             except Exception:
                 pass
 
@@ -167,24 +129,21 @@ class TelegramController:
             f"💵 Equity: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"{day_e} Сегодня: <b>{day_s}</b>",
-            f"📦 Экспозиция: ${st.get('total_exposure', 0) or 0:,.0f}",
             "",
             f"Сделки: {stats.get('total_fills', 0)} · Maker {stats.get('maker_fill_pct', 0)}%",
             f"MERGE: {stats.get('merge_count', 0)} (${stats.get('merged_usd', 0):.0f})",
-            f"Винрейт: {stats.get('win_rate_pct', 0)}%",
+            f"Винрейт окон: {stats.get('win_rate_pct', 0)}%",
+            f"Realized: ${stats.get('realized_net_pnl', 0):+.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
             lines.append(f"\n⏱ Окон: <b>{len(windows)}</b>")
-            for w in windows[:5]:
+            for w in windows[:6]:
                 tau = w.get("remain_sec", 0) or 0
                 fair = w.get("fair_up")
                 fair_s = f"{fair * 100:.0f}¢" if fair is not None else "—"
                 net = w.get("net_shares", 0) or 0
-                lines.append(
-                    f"· <code>{(w.get('slug') or '')[:26]}</code>\n"
-                    f"  τ {tau:.0f}s · fair {fair_s} · pos {net:+.1f}"
-                )
+                lines.append(f"· <code>{(w.get('slug') or '')[:28]}</code>\n  τ {tau:.0f}s · fair {fair_s} · pos {net:+.1f}")
         else:
             lines.append("\n⏱ Активных окон нет")
         return "\n".join(lines)
@@ -193,68 +152,75 @@ class TelegramController:
         st = self.engine.snapshot()
         stats = st.get("stats") or {}
         equity = st.get("equity", 0) or 0
+        cash = st.get("cash", 0) or 0
         bank = self.engine.cfg.bankroll_usd
         pnl = equity - bank
-        pnl_s = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        pct = (pnl / bank * 100) if bank else 0
+        day = st.get("day_pnl", 0) or stats.get("today_net_pnl", 0) or 0
+        realized = stats.get("realized_net_pnl", 0) or 0
+        emoji = "📈" if pnl >= 0 else "📉"
         return (
-            f"💰 <b>Демо-счёт · PnL</b>\n"
+            f"💰 <b>Прибыль и убытки (демо)</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"Стартовый банк: <b>${bank:,.0f}</b>\n"
+            f"Старт: <b>${bank:,.0f}</b>\n"
             f"Equity: <b>${equity:,.2f}</b>\n"
-            f"Итого PnL: <b>{pnl_s}</b> ({pct:+.1f}%)\n\n"
-            f"· Realized: <b>${stats.get('realized_net_pnl', 0):+.2f}</b>\n"
-            f"· Сегодня: <b>${stats.get('today_net_pnl', 0):+.2f}</b>\n"
-            f"· Fills: {stats.get('total_fills', 0)} (maker {stats.get('maker_fill_pct', 0)}%)\n"
-            f"· MERGE: {stats.get('merge_count', 0)}\n"
-            f"· Винрейт: {stats.get('win_rate_pct', 0)}%\n\n"
-            f"<i>Демо внутри бота. Реальные деньги не списываются.</i>"
+            f"Cash: ${cash:,.2f}\n"
+            f"{emoji} Итого: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
+            f"Сегодня: <b>${day:+.2f}</b>\n\n"
+            f"· Realized (закрыто): <b>${realized:+.2f}</b>\n"
+            f"· Сделок: {stats.get('total_fills', 0)}\n"
+            f"· MERGE: {stats.get('merge_count', 0)} (locked ${stats.get('merged_locked_pnl', 0):+.2f})\n"
+            f"· Окон закрыто: {stats.get('resolved_markets', 0)}\n"
+            f"· Винрейт: {stats.get('win_rate_pct', 0)}%\n"
+            f"· Комиссии: ${stats.get('total_fees', 0):.4f}\n\n"
+            f"<i>Минус = убыток на демо-счёте.</i>"
         )
 
     def _fmt_positions(self) -> str:
         st = self.engine.snapshot()
-        windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
+        windows = [w for w in (st.get("windows") or []) if (w.get("up_shares", 0) or 0) > 0 or (w.get("down_shares", 0) or 0) > 0]
         if not windows:
-            return "📈 <b>Позиции</b>\n━━━━━━━━━━━━━━━━\nОткрытых позиций нет."
-        lines = ["📈 <b>Открытые позиции (демо)</b>", "━━━━━━━━━━━━━━━━"]
+            windows = [w for w in (st.get("windows") or [])]
+            if not windows:
+                return "📈 <b>Позиции</b>\n━━━━━━━━━━━━━━━━\nОткрытых позиций нет."
+        lines = ["📈 <b>Открытые позиции</b> (демо)", "━━━━━━━━━━━━━━━━"]
         for w in windows[:10]:
             fair = w.get("fair_up")
             fair_s = f"{fair * 100:.1f}¢" if fair is not None else "—"
             lines.append(
                 f"\n<code>{w.get('slug') or '?'}</code>\n"
                 f"⏱ {w.get('remain_sec', 0) or 0:.0f}s · fair {fair_s}\n"
-                f"↑ {w.get('up_shares', 0) or 0:.1f}  ↓ {w.get('down_shares', 0) or 0:.1f}  "
-                f"net {w.get('net_shares', 0) or 0:+.1f}"
+                f"↑ {w.get('up_shares', 0) or 0:.1f}  ↓ {w.get('down_shares', 0) or 0:.1f}  net {w.get('net_shares', 0) or 0:+.1f}"
             )
         return "\n".join(lines)
 
     def _fmt_fills(self) -> str:
         try:
-            fills = self.engine.ledger.get_recent_fills(self.engine.cfg.trading_mode, limit=12)
+            fills = self.engine.ledger.recent_fills(self.engine.cfg.trading_mode, limit=12)
         except Exception:
             fills = []
         if not fills:
             return "📋 <b>Сделки</b>\n━━━━━━━━━━━━━━━━\nСделок пока нет."
-        lines = ["📋 <b>Последние сделки (демо)</b>", "━━━━━━━━━━━━━━━━"]
+        lines = ["📋 <b>Последние сделки</b> (демо)", "━━━━━━━━━━━━━━━━"]
         for f in fills[:12]:
             role = (f.get("role") or "?").upper()
             emoji = "🟢" if role == "MAKER" else "⚡"
-            lines.append(
-                f"{emoji} <b>{role}</b> {f.get('outcome', '?')} "
-                f"{f.get('shares', 0):.1f} @ {f.get('price', 0):.2f}\n"
-                f"   <code>{(f.get('slug') or '')[:22]}</code>"
-            )
+            outcome = f.get("outcome") or "?"
+            side = "ВВЕРХ" if str(outcome).lower() in ("up", "yes") else ("ВНИЗ" if str(outcome).lower() in ("down", "no") else outcome)
+            shares = f.get("shares") or 0
+            price = f.get("price") or 0
+            slug = (f.get("slug") or "")[:22]
+            lines.append(f"{emoji} {side}: {shares:.1f} шт по {float(price)*100:.0f}¢\n   {role} · <code>{slug}</code>")
         return "\n".join(lines)
 
     def _fmt_help(self) -> str:
         return (
-            "ℹ️ <b>PolyBot — помощь</b>\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "<b>Демо-торговля</b> внутри бота на живых данных Polymarket.\n\n"
-            "📊 Статус · 💰 PnL · 📈 Позиции · 📋 Сделки\n"
-            "▶️ Старт · ⏸ Пауза · 🛑 СТОП · ⚙️ Пресет\n\n"
-            "Уведомления: филл, MERGE, резолв окна.\n\n"
-            "/start /status /pnl /positions /pause /resume /kill"
+            "ℹ️ <b>Помощь</b>\n━━━━━━━━━━━━━━━━\n"
+            "Демо на живых окнах Polymarket.\n"
+            "Цены для модели: Coinbase/Kraken.\n"
+            "Резолв окон: Data API Polymarket.\n\n"
+            "📊 Статус · 💰 PnL (прибыль/убыток)\n"
+            "📈 Позиции · 📋 Сделки\n"
+            "Уведомления: покупка, MERGE, прибыль и <b>убыток</b>."
         )
 
     def _fmt_presets(self) -> str:
@@ -281,38 +247,27 @@ class TelegramController:
             return self._fmt_presets(), _kb_presets()
         if a in ("resume", "/resume"):
             self.engine.resume()
-            return "✅ <b>Торговля запущена</b> (демо)", _kb_main()
+            return "✅ Торговля запущена (демо)", _kb_main()
         if a in ("pause", "/pause"):
             self.engine.pause()
-            return "⏸ <b>Пауза</b>", _kb_main()
+            return "⏸ Пауза", _kb_main()
         if a in ("kill", "/kill"):
-            return "🛑 Снять все ордера и смерджить?", _kb_confirm_kill()
+            return "🛑 Снять всё?", _kb_confirm_kill()
         if a == "kill_confirm":
             res = await self.engine.emergency_kill()
-            return (
-                f"🛑 СТОП: ордеров {res.get('canceled', 0)}, "
-                f"merge ${res.get('merged_usd', 0):.2f}",
-                _kb_main(),
-            )
+            return f"🛑 СТОП: merge ${res.get('merged_usd', 0):.2f}", _kb_main()
         if a.startswith("preset:"):
             key = a.split(":", 1)[1].strip()
-            if key in PRESETS:
-                if hasattr(self.engine, "set_preset"):
-                    r = self.engine.set_preset(key)
-                    if asyncio.iscoroutine(r):
-                        await r
-                return f"✅ Пресет: <b>{PRESETS[key].title_ru}</b>", _kb_main()
+            if key in PRESETS and hasattr(self.engine, "set_preset"):
+                self.engine.set_preset(key)
+                return f"✅ Пресет: {PRESETS[key].title_ru}", _kb_main()
         return self._fmt_status(), _kb_main()
 
     async def _poll_loop(self) -> None:
         assert self._session
         while self._running:
             try:
-                params = {
-                    "offset": self._offset,
-                    "timeout": 25,
-                    "allowed_updates": ["message", "callback_query"],
-                }
+                params = {"offset": self._offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}
                 async with self._session.get(f"{self._base}/getUpdates", params=params) as r:
                     if r.status != 200:
                         await asyncio.sleep(3)
@@ -322,7 +277,7 @@ class TelegramController:
                         self._offset = max(self._offset, upd["update_id"] + 1)
                         if "message" in upd:
                             msg = upd["message"]
-                            if str((msg.get("chat") or {}).get("id", "")) != self.chat_id:
+                            if str((msg.get("chat") or {}).get("id", "")).strip() != self.chat_id:
                                 continue
                             text = (msg.get("text") or "").strip()
                             if text:
@@ -330,7 +285,7 @@ class TelegramController:
                                 await self.send(reply, keyboard=kb)
                         elif "callback_query" in upd:
                             cq = upd["callback_query"]
-                            chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
+                            chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id", "")).strip()
                             await self._answer_callback(cq.get("id", ""))
                             if chat_id != self.chat_id:
                                 continue
