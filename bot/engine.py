@@ -309,11 +309,6 @@ class TradingEngine:
                         price_to_beat=meta.get("price_to_beat"),
                         fee_rate=meta.get("fee_rate"),
                     )
-                    if w.price_to_beat is None:
-                        tr = self.trackers[asset]
-                        ptb = tr.lookup_twap_at(int(start), max_diff_sec=2.0)
-                        if ptb is not None:
-                            w.price_to_beat = float(ptb)
                     self.windows[slug] = w
 
     async def _gamma(self, slug: str):
@@ -431,6 +426,10 @@ class TradingEngine:
             current_day_pnl = self.day_pnl
         if current_day_pnl <= -self.cfg.max_daily_loss_usd:
             return True
+        try:
+            self.consecutive_losses = self.ledger.consecutive_net_losses(self.cfg.trading_mode)
+        except Exception:
+            return True
         if self.cfg.max_consecutive_losses > 0 and self.consecutive_losses >= self.cfg.max_consecutive_losses:
             return True
         return False
@@ -449,10 +448,6 @@ class TradingEngine:
             or tr._vol_samples < 60
         ):
             return
-        if w.price_to_beat is None:
-            ptb = tr.lookup_twap_at(int(w.start_ts), max_diff_sec=2.0)
-            if ptb is not None:
-                w.price_to_beat = float(ptb)
         if w.price_to_beat is None:
             return
         try:
@@ -588,6 +583,21 @@ class TradingEngine:
             cost = price * size + fee
         if cost > self.cash + 1e-9:
             return
+        fill = {
+            "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
+            "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
+            "fee": fee, "notional": cost,
+        }
+        try:
+            self.ledger.record_fill(
+                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
+                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
+                reason=reason, shares=size, price=price, fee=fee, fair_prob=float(fair_prob if fair_prob is not None else price),
+                tx_or_order_id=f"paper-clob-{time.time_ns()}",
+            )
+        except Exception as e:
+            log.exception("PAPER fill was not persisted; refusing in-memory fill: %s", e)
+            return
         self.cash -= cost
         self.fees_paid += fee
         if outcome == "Up":
@@ -597,22 +607,8 @@ class TradingEngine:
             w.down_shares += size
             w.down_cost += price * size
         w.last_trade_mono = time.monotonic()
-        fill = {
-            "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
-            "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
-            "fee": fee, "notional": cost,
-        }
         self._fill_history.insert(0, fill)
         self._fill_history = self._fill_history[:80]
-        try:
-            self.ledger.record_fill(
-                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
-                reason=reason, shares=size, price=price, fee=fee, fair_prob=float(fair_prob if fair_prob is not None else price),
-                tx_or_order_id=f"paper-clob-{int(time.time())}",
-            )
-        except Exception as e:
-            log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
         why = {
             "taker_entry": "CLOB ask дешевле fair (Taker PAPER simulation)",
@@ -650,6 +646,14 @@ class TradingEngine:
             dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares else 0.0
             cost = up_part + dn_part
             locked = pairs - cost
+            try:
+                self.ledger.record_merge(
+                    mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
+                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"paper-merge-{time.time_ns()}",
+                )
+            except Exception as e:
+                log.exception("PAPER merge was not persisted; refusing in-memory merge: %s", e)
+                return 0.0
             w.up_shares = max(0.0, w.up_shares - pairs)
             w.down_shares = max(0.0, w.down_shares - pairs)
             w.up_cost = max(0.0, w.up_cost - up_part)
@@ -659,13 +663,6 @@ class TradingEngine:
             self.day_pnl += locked
             self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked})
             self._merge_history = self._merge_history[:40]
-            try:
-                self.ledger.record_merge(
-                    mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}",
-                )
-            except Exception as e:
-                log.warning("record_merge: %s", e)
             self._log_event(
                 "INFO",
                 f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>",
@@ -739,32 +736,35 @@ class TradingEngine:
 
         payout = float(w.up_shares if winner == "Up" else w.down_shares)
         gross_cost = float(w.up_cost + w.down_cost)
+        market_fees = self.ledger.fees_for_market(self.cfg.trading_mode, w.slug)
         gross = payout - gross_cost
-        self.cash += payout
-        self.realized_pnl += gross
-        self.day_pnl += gross
-        self.consecutive_losses = self.consecutive_losses + 1 if gross < 0 else 0
+        net = gross - market_fees
         try:
             self.ledger.record_resolution(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
                 price_to_beat=w.price_to_beat, final_price=w.final_price,
                 up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
-                merged_pairs=0.0, gross_cost=gross_cost, total_fees=0.0, total_payout=payout,
+                merged_pairs=0.0, gross_cost=gross_cost, total_fees=market_fees, total_payout=payout,
             )
         except Exception as exc:
-            log.warning("record_resolution: %s", exc)
+            log.exception("PAPER resolution was not persisted; market remains pending: %s", exc)
+            return
+        self.cash += payout
+        self.realized_pnl += gross
+        self.day_pnl += net
+        self.consecutive_losses = self.ledger.consecutive_net_losses(self.cfg.trading_mode)
         self._resolve_history.insert(
-            0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "pnl": gross}
+            0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "net": net, "pnl": net}
         )
         self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
         if gross >= 0:
-            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\nПрибыль: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\nПрибыль: <b>${net:+.2f}</b>\n<code>{w.slug}</code>"
         else:
-            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\nУбыток: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\nУбыток: <b>${net:+.2f}</b>\n<code>{w.slug}</code>"
         self._log_event("INFO", msg, notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
