@@ -115,9 +115,9 @@ class TelegramController:
             payload["reply_markup"] = keyboard
         try:
             async with self._session.post(f"{self._base}/sendMessage", json=payload) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    logger.warning("sendMessage %s: %s", r.status, body[:180])
+                result = await r.json(content_type=None)
+                if r.status != 200 or not result.get("ok", False):
+                    logger.warning("sendMessage rejected: status=%s response=%s", r.status, str(result)[:180])
                     plain = (
                         clean.replace("<b>", "").replace("</b>", "")
                         .replace("<i>", "").replace("</i>", "")
@@ -126,8 +126,12 @@ class TelegramController:
                     payload["text"] = plain[:4090]
                     payload.pop("parse_mode", None)
                     async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
-                        if r2.status != 200:
-                            logger.warning("sendMessage plain %s", r2.status)
+                        result2 = await r2.json(content_type=None)
+                        if r2.status != 200 or not result2.get("ok", False):
+                            logger.warning(
+                                "sendMessage plain rejected: status=%s response=%s",
+                                r2.status, str(result2)[:180],
+                            )
         except Exception as e:
             logger.warning("Telegram send failed: %s", e)
 
@@ -179,7 +183,7 @@ class TelegramController:
             f"💵 Equity: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
-            f"Комиссии текущего процесса: −${fees:.2f}",
+            f"Комиссии всего: −${fees:.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
