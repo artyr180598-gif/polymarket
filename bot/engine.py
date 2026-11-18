@@ -198,14 +198,9 @@ class TradingEngine:
                     # Coinbase/Kraken REST spot is NOT Chainlink oracle data.
                     # Do not relabel it as Chainlink spot/TWAP: the strategy requires
                     # the actual market settlement feed before it can calculate fair value.
-                    tr.on_binance_spot(px, ts_ms)
-                    for w in self.windows.values():
-                        if w.asset != asset:
-                            continue
-                        if w.price_to_beat is None and -5 <= (now - w.start_ts) <= 30:
-                            w.price_to_beat = px
-                        if w.final_price is None and -5 <= (now - w.end_ts) <= 30:
-                            w.final_price = px
+                    # Coinbase/Kraken fallback is only a reference quote.
+                    # It is NOT Binance and NOT Polymarket's Chainlink settlement feed.
+                    # Never use it for fair value, price-to-beat, or final settlement.
                 for w in list(self.windows.values()):
                     if w.resolved or w.price_to_beat is not None:
                         continue
@@ -215,12 +210,19 @@ class TradingEngine:
                     ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
                     if ptb:
                         w.price_to_beat = float(ptb)
-                if ok_any:
-                    self._price_ok = True
-                    self._streams_ok = True
-                    if not notified:
-                        self._log_event("INFO", "Spot + CLOB book OK", notify=True)
-                        notified = True
+                # Reference spot availability is not equivalent to a healthy
+                # Chainlink settlement feed. Keep trading health false until the
+                # official oracle stream is connected and timestamp-validated.
+                self._price_ok = False
+                self._streams_ok = False
+                if ok_any and not notified:
+                    self._log_event(
+                        "WARNING",
+                        "Reference spot reachable; Polymarket Chainlink settlement feed is not connected. "
+                        "Strategy will remain idle rather than fabricate oracle inputs.",
+                        notify=True,
+                    )
+                    notified = True
             except Exception as e:
                 log.warning("prices: %s", e)
             await asyncio.sleep(2.0)
@@ -613,17 +615,10 @@ class TradingEngine:
         except Exception:
             pass
         spot = getattr(self.trackers[w.asset], "cl_spot", None)
-        if winner is None and w.final_price is not None and w.price_to_beat is not None:
-            winner = "Up" if w.final_price >= w.price_to_beat else "Down"
-        if winner is None and w.price_to_beat is not None and spot is not None:
-            winner = "Up" if spot >= w.price_to_beat else "Down"
-        if winner is None and w.remain_sec <= -20:
-            if w.price_to_beat and spot:
-                winner = "Up" if spot >= w.price_to_beat else "Down"
-            elif w.up_shares >= w.down_shares:
-                winner = "Down"
-            else:
-                winner = "Up"
+        # Never guess a winner from inventory or an unrelated exchange quote.
+        # Only the official Polymarket resolution feed may settle this position.
+        if winner is None:
+            return
         if winner is None:
             return
         if w.up_shares < 0.01 and w.down_shares < 0.01:
