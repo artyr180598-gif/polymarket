@@ -191,13 +191,13 @@ class TelegramController:
             f"Polymarket openPrice: <b>{'OK' if strike_ready else 'ожидание'}</b>",
             f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
             f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
-            f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв \${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
-            f"Доступно: <b>\${float(st.get('available_cash', cash) or 0):.2f}</b>",
+            f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв ${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
+            f"Доступно: <b>${float(st.get('available_cash', cash) or 0):.2f}</b>",
             f"",
-            f"💵 Equity: <b>\${equity:,.2f}</b>",
-            f"💸 Cash: \${cash:,.2f}",
+            f"💵 Equity: <b>${equity:,.2f}</b>",
+            f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
-            f"Комиссии всего: −\${fees:.2f}",
+            f"Комиссии всего: −${fees:.2f}",
             "Maker-rebates в PAPER PnL пока не моделируются.",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
@@ -311,7 +311,7 @@ class TelegramController:
             reason = f.get("reason") or ""
             role = str(f.get("role") or "TAKER").upper()
             fee = float(f.get("fee") or 0)
-            fee_s = f" fee \${fee:.2f}" if fee else ""
+            fee_s = f" fee ${fee:.2f}" if fee else ""
             lines.append(f"🟢 {role} {side} {asset} {shares:.1f}×{price*100:.0f}¢ ({reason}){fee_s}")
         if merges:
             lines.append("")
