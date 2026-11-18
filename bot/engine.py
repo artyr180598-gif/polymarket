@@ -43,6 +43,7 @@ class WindowState:
     last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
+    last_ptb_retry_mono: float = 0.0
 
     @property
     def remain_sec(self) -> float:
@@ -300,7 +301,22 @@ class TradingEngine:
                     if end <= now + 5:
                         continue
                     slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
-                    if slug in self.windows:
+                    existing = self.windows.get(slug)
+                    if existing is not None:
+                        # Gamma can publish priceToBeat shortly after the market
+                        # is created. Retry missing strikes instead of freezing
+                        # the window forever with None and silently skipping it.
+                        now_mono = time.monotonic()
+                        if (
+                            existing.price_to_beat is None
+                            and now_mono - existing.last_ptb_retry_mono >= 5.0
+                        ):
+                            existing.last_ptb_retry_mono = now_mono
+                            refreshed = await self._gamma(slug)
+                            if refreshed and refreshed.get("price_to_beat") is not None:
+                                existing.price_to_beat = float(refreshed["price_to_beat"])
+                            if existing.fee_rate is None and refreshed and refreshed.get("fee_rate") is not None:
+                                existing.fee_rate = float(refreshed["fee_rate"])
                         continue
                     meta = await self._gamma(slug)
                     if not meta:
@@ -312,6 +328,7 @@ class TradingEngine:
                         start_ts=float(start), end_ts=float(end),
                         price_to_beat=meta.get("price_to_beat"),
                         fee_rate=meta.get("fee_rate"),
+                        last_ptb_retry_mono=time.monotonic(),
                     )
                     self.windows[slug] = w
 
