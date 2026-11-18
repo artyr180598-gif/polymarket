@@ -1254,6 +1254,12 @@ class TradingEngine:
         except Exception as exc:
             log.exception("PAPER pair not persisted; refusing both legs: %s", exc)
             return False
+        # Keep the executor's spendable cash synchronized with the engine
+        # after an atomic paired taker entry. Resting maker reservations already
+        # reduce executor.cash, so this debit must happen only after the ledger
+        # transaction succeeds.
+        if self.executor is not None:
+            self.executor.cash -= combined_cost
         w.up_shares += size
         w.down_shares += size
         w.up_cost += size * price_up
