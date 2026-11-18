@@ -60,7 +60,7 @@ class TelegramController:
         self._pending_notification_keys: list[Optional[str]] = []
         if self.ledger is not None:
             try:
-                for item in self.ledger.pending_telegram_notifications():
+                for item in self.ledger.pending_telegram_notifications(limit=5000):
                     self._pending_notifications.append(str(item["message"]))
                     self._pending_notification_ids.append(int(item["id"]))
                     self._pending_notification_keys.append(str(item["event_key"]))
