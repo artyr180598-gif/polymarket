@@ -57,7 +57,7 @@ class AssetPriceTracker:
         self.basis_ema: Optional[float] = None
         self.basis_alpha: float = 0.035
         self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=400)
-        self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=900)
+        self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=1800)
         self.boundary_twap: Dict[int, float] = {}
         self.boundary_twap_ts: Dict[int, float] = {}
         default_v = DEFAULT_SIGMA_1S.get(self.asset, 0.00012) ** 2
@@ -103,8 +103,8 @@ class AssetPriceTracker:
         sec = int(round(ts))
         self.boundary_twap[sec] = twap_val
         self.boundary_twap_ts[sec] = ts
-        if len(self.boundary_twap) > 150:
-            for k in sorted(self.boundary_twap.keys())[:-120]:
+        if len(self.boundary_twap) > 1200:
+            for k in sorted(self.boundary_twap.keys())[:-1200]:
                 del self.boundary_twap[k]
                 self.boundary_twap_ts.pop(k, None)
 
@@ -117,29 +117,16 @@ class AssetPriceTracker:
             self.basis_ema = price - self.cl_spot
 
     def lookup_twap_at(self, epoch_sec: int, max_diff_sec: float = 45.0) -> Optional[float]:
-        target = float(epoch_sec)
-        # Prefer the raw feed timestamp so rounded-second buckets cannot turn
-        # a sample 0.6s away into a false "exact" boundary observation.
+        epoch_sec = int(epoch_sec)
+        # Use source timestamps, not rounded dictionary keys, to select the
+        # closest sample to the exact market boundary.
         nearest = min(
             self.cl_twap_hist,
-            key=lambda item: abs(item[0] - target),
+            key=lambda item: abs(item[0] - epoch_sec),
             default=None,
         )
-        if nearest is not None and abs(nearest[0] - target) <= max_diff_sec:
+        if nearest is not None and abs(nearest[0] - epoch_sec) <= max_diff_sec:
             return nearest[1]
-
-        # Fallback for a bounded set of retained boundary samples, but verify
-        # their original timestamp rather than trusting the rounded key.
-        best_value = None
-        best_diff = float("inf")
-        for sec, value in self.boundary_twap.items():
-            sample_ts = self.boundary_twap_ts.get(sec, float(sec))
-            diff = abs(sample_ts - target)
-            if diff < best_diff:
-                best_diff = diff
-                best_value = value
-        if best_value is not None and best_diff <= max_diff_sec:
-            return best_value
         return None
 
     @property
