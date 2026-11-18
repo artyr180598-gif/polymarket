@@ -347,8 +347,13 @@ class TelegramController:
         if a.startswith("preset:"):
             key = a.split(":", 1)[1].strip()
             if key in PRESETS and hasattr(self.engine, "set_preset"):
-                self.engine.set_preset(key)
-                return f"✅ Пресет: {key}", _kb_main()
+                if self.engine.set_preset(key):
+                    return f"✅ Пресет: {key}", _kb_main()
+                return (
+                    "⚠️ Смена пресета отключена: параметры стратегий ещё не подключены "
+                    "к торговой логике. Текущие сигналы используют фиксированные PAPER-правила.",
+                    _kb_main(),
+                )
         return self._fmt_status(), _kb_main()
 
     async def _poll_loop(self) -> None:
