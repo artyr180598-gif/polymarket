@@ -156,10 +156,18 @@ def test_atomic_pair_fill_persists_both_legs_together(tmp_path) -> None:
         "fee": 0.02,
         "fair_prob": 0.5,
     }
-    ledger.record_fills_atomic([
-        {**common, "outcome": "Up", "price": 0.48},
-        {**common, "outcome": "Down", "price": 0.49},
-    ])
+    ledger.record_fills_atomic(
+        [
+            {**common, "outcome": "Up", "price": 0.48},
+            {**common, "outcome": "Down", "price": 0.49},
+        ],
+        notification_message="PAPER pair Up/Down BTC",
+        notification_event_key="pair-atomic-test",
+    )
+    pending = ledger.pending_telegram_notifications()
+    assert len(pending) == 1
+    assert pending[0]["event_key"] == "pair-atomic-test"
+    assert pending[0]["message"] == "PAPER pair Up/Down BTC"
     fills = ledger.recent_fills("paper", 10)
     assert len(fills) == 2
     assert {row["outcome"] for row in fills} == {"Up", "Down"}
@@ -487,3 +495,30 @@ def test_telegram_outbox_survives_ledger_reopen_and_tracks_delivery(tmp_path) ->
     reopened.mark_telegram_notification_delivered(notification_id)
     assert reopened.pending_telegram_notifications() == []
     reopened.conn.close()
+
+
+def test_single_fill_and_telegram_event_commit_in_same_transaction(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "fill-outbox-atomic.db"))
+    ledger.record_fill(
+        mode="paper",
+        slug="btc-updown-5m-1795035600",
+        condition_id="0x" + "9" * 64,
+        asset="BTC",
+        timeframe="5m",
+        outcome="Up",
+        role="TAKER_CLOB",
+        reason="test",
+        shares=5,
+        price=0.5,
+        fee=0.01,
+        fair_prob=0.6,
+        tx_or_order_id="paper-fill-atomic",
+        notification_message="PAPER buy BTC Up",
+        notification_event_key="paper-fill-atomic",
+    )
+    assert len(ledger.recent_fills("paper", 5)) == 1
+    pending = ledger.pending_telegram_notifications()
+    assert len(pending) == 1
+    assert pending[0]["event_key"] == "paper-fill-atomic"
+    assert pending[0]["message"] == "PAPER buy BTC Up"
+    ledger.conn.close()
