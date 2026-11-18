@@ -653,7 +653,7 @@ class Ledger:
             ORDER BY ts DESC, s.slug DESC
             LIMIT ?
             """,
-            (mode, mode, max(1, min(int(limit), 100))),
+            (mode, mode, mode, max(1, min(int(limit), 100))),
         ).fetchall()
         return [dict(row) for row in rows]
 
