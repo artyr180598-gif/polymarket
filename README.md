@@ -7,7 +7,7 @@
 ## What the current prototype does
 
 - Reads outcome order books from the Polymarket CLOB.
-- Reads Chainlink spot and 60-second TWAP from Polymarket's public RTDS stream through the official Python SDK.
+- Reads Chainlink spot and 60-second TWAP from Polymarket's public RTDS stream through the official Python SDK. The no-credentials RTDS specs used in PAPER are marked deprecated by the SDK but remain supported; before any future LIVE work, migrate to the authenticated price specs and verify the event source is Chainlink.
 - Reads market metadata from Gamma and settled outcomes from the Polymarket Data API.
 - Simulates taker buys at the actual best ask, constrained by quantity resting at that exact price level.
 - Applies the market fee rate when Gamma publishes a per-market fee schedule; otherwise uses the configured fallback schedule.
