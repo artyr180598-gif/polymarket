@@ -209,3 +209,54 @@ def test_maker_quotes_are_not_created_without_live_clob_feed(tmp_path) -> None:
     asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
 
     assert engine.executor.get_open_orders("up-token") == []
+
+
+
+def test_gamma_active_event_ignores_metadata_price_to_beat(monkeypatch) -> None:
+    event = {
+        "closed": False,
+        "eventMetadata": {"priceToBeat": "100001.25"},
+        "markets": [{
+            "closed": False,
+            "conditionId": "0x" + "3" * 64,
+            "clobTokenIds": ["up-token", "down-token"],
+            "feeSchedule": {"rate": 0.25},
+        }],
+    }
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return [event]
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def get(self, url):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "bot.engine.aiohttp.ClientSession",
+        lambda **kwargs: FakeSession(),
+    )
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"]))
+
+    result = asyncio.run(engine._gamma("btc-updown-5m-900"))
+
+    assert result is not None
+    assert result["condition_id"] == "0x" + "3" * 64
+    assert result["price_to_beat"] is None
+    assert result["price_to_beat_source"] == ""
+    assert result["fee_rate"] == 0.25
+    engine.ledger.conn.close()
