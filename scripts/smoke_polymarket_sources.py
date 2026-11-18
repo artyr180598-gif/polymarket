@@ -20,15 +20,31 @@ from bot.oracle_feed import PolymarketOracleFeed
 WALLET = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
 
 
-async def get_json(session: aiohttp.ClientSession, url: str, params: dict[str, Any] | None = None) -> Any:
-    async with session.get(url, params=params) as response:
-        body = await response.text()
-        if response.status != 200:
-            raise RuntimeError(f"{url} returned HTTP {response.status}: {body[:300]}")
-        try:
-            return json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"{url} returned invalid JSON") from exc
+async def get_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    # Public Polymarket endpoints may rate-limit shared CI runners. Retry only
+    # transient responses; keep a bounded deadline and honor Retry-After.
+    for attempt in range(6):
+        async with session.get(url, params=params, headers=headers) as response:
+            body = await response.text()
+            if response.status == 200:
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"{url} returned invalid JSON") from exc
+            if response.status not in (429, 500, 502, 503, 504) or attempt == 5:
+                raise RuntimeError(f"{url} returned HTTP {response.status}: {body[:300]}")
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                delay = min(30.0, max(0.5, float(retry_after)))
+            except (TypeError, ValueError):
+                delay = min(16.0, 1.0 * (2 ** attempt))
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"{url} exhausted transient retries")
 
 
 async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]:
@@ -78,20 +94,17 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
     for symbol in ("BTC", "ETH", "SOL"):
         crypto_price = None
         for _ in range(5):
-            async with session.get(
+            crypto_price = await get_json(
+                session,
                 "https://polymarket.com/api/crypto/crypto-price",
-                params={
+                {
                     "symbol": symbol,
                     "eventStartTime": start_iso,
                     "endDate": end_iso,
                     "variant": "fiveminute",
                 },
                 headers={"User-Agent": "Mozilla/5.0"},
-            ) as response:
-                body = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"Polymarket crypto-price {symbol} returned HTTP {response.status}: {body[:300]}")
-                crypto_price = json.loads(body)
+            )
             if isinstance(crypto_price, dict) and crypto_price.get("openPrice") is not None:
                 break
             await asyncio.sleep(1.0)
