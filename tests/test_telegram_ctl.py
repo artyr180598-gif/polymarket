@@ -116,3 +116,40 @@ def test_telegram_registers_native_command_menu():
     assert url.endswith("/setMyCommands")
     commands = {item["command"] for item in payload["commands"]}
     assert {"status", "pnl", "positions", "fills", "history", "pause", "resume", "kill", "help"} <= commands
+
+
+
+def test_telegram_remote_controls_require_configured_private_chat():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+    assert controller._authorized_chat(
+        {"id": 123, "type": "private"},
+        {"id": 123},
+    )
+    assert not controller._authorized_chat(
+        {"id": 123, "type": "group"},
+        {"id": 456},
+    )
+    assert not controller._authorized_chat(
+        {"id": 123, "type": "private"},
+        {"id": 456},
+    )
+
+
+def test_telegram_resume_does_not_claim_to_start_stopped_engine():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        running=False,
+        resume=lambda: (_ for _ in ()).throw(AssertionError("must not resume stopped engine")),
+    )
+    controller = TelegramController(engine)
+    reply, _keyboard = asyncio.run(controller._handle("resume"))
+    assert "Движок остановлен" in reply
