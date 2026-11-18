@@ -265,8 +265,14 @@ class Ledger:
             "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
             "today_merged_pnl": round(float(m_row["today_merged_pnl"]), 2),
             "today_fees": round(float(f_row["today_fees"]), 4),
+            # net_pnl already deducts market fees at resolution. For the
+            # combined daily/lifetime figure, start from gross resolutions,
+            # add realized merge PnL, then subtract all fill fees exactly once.
             "today_total_net_pnl": round(
-                float(r_row["today_net_pnl"])
+                float(self.conn.execute(
+                    "SELECT COALESCE(SUM(gross_pnl), 0) FROM resolutions WHERE mode = ? AND ts >= ?",
+                    (mode, today_start),
+                ).fetchone()[0])
                 + float(m_row["today_merged_pnl"])
                 - float(f_row["today_fees"]), 2
             ),
