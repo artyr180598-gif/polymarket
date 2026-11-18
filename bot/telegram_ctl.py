@@ -21,7 +21,7 @@ def _kb_main() -> Dict[str, Any]:
             [{"text": "📊 Статус", "callback_data": "status"}, {"text": "💰 PnL", "callback_data": "pnl"}],
             [{"text": "📈 Позиции", "callback_data": "positions"}, {"text": "📋 Сделки", "callback_data": "fills"}],
             [{"text": "📚 История", "callback_data": "history"}],
-            [{"text": "▶️ Старт", "callback_data": "resume"}, {"text": "⏸ Пауза", "callback_data": "pause"}, {"text": "🛑 СТОП", "callback_data": "kill"}],
+            [{"text": "▶️ Продолжить", "callback_data": "resume"}, {"text": "⏸ Пауза", "callback_data": "pause"}, {"text": "🛑 СТОП", "callback_data": "kill"}],
             [{"text": "⚙️ Пресет", "callback_data": "presets"}, {"text": "ℹ️ Помощь", "callback_data": "help"}],
         ]
     }
@@ -53,6 +53,15 @@ class TelegramController:
     @property
     def _base(self) -> str:
         return f"https://api.telegram.org/bot{self.token}"
+
+    def _authorized_chat(self, chat: Dict[str, Any], sender: Dict[str, Any]) -> bool:
+        # Remote controls are allowed only in the configured one-to-one chat.
+        # Group members must never gain control merely by sharing a group chat.
+        return (
+            str(chat.get("type", "")) == "private"
+            and str(chat.get("id", "")).strip() == self.chat_id
+            and str(sender.get("id", "")).strip() == self.chat_id
+        )
 
     async def start(self) -> None:
         if not self.enabled:
@@ -257,6 +266,11 @@ class TelegramController:
         losses = int(stats.get("loss_markets", 0) or 0)
         breakeven = int(stats.get("breakeven_markets", 0) or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
+        completed = int(stats.get("completed_markets", resolved) or 0)
+        wins = int(stats.get("completed_win_markets", wins) or 0)
+        losses = int(stats.get("completed_loss_markets", losses) or 0)
+        breakeven = int(stats.get("completed_breakeven_markets", breakeven) or 0)
+        completed_win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
         n_fills = int(stats.get("total_fills", 0) or 0)
         maker_fills = int(stats.get("maker_fills", 0) or 0)
         maker_fill_pct = float(stats.get("maker_fill_pct", 0) or 0)
@@ -279,12 +293,14 @@ class TelegramController:
             f"· Открытые позиции оцениваются по себестоимости, не по mark-to-market.\n"
             f"· Это PAPER симуляция, не фактический PnL аккаунта Polymarket.\n\n"
             f"📊 Журнал\n"
-            f"· Всего исполнений: <b>{n_fills}</b>\n"
+            f"· Исполнений (отдельных ног): <b>{n_fills}</b>\n"
             f"· Maker: <b>{maker_fills}</b> ({maker_fill_pct:.1f}%)\n"
             f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Закрытых рынков: <b>{resolved}</b>\n"
-            f"· Прибыльных: <b>{wins}</b> · убыточных: <b>{losses}</b> · около нуля: <b>{breakeven}</b>\n\n"
-            f"ℹ️ Win/loss учитывает только рынки с официальным резолвом; полностью закрытые MERGE входят в общий PnL."
+            f"· Официально resolved: <b>{resolved}</b>\n"
+            f"· Завершённых рынков (резолв или полный MERGE): <b>{completed}</b>\n"
+            f"· Плюсовых: <b>{wins}</b> · минусовых: <b>{losses}</b> · около нуля: <b>{breakeven}</b>\n"
+            f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n\n"
+            f"ℹ️ Частичный MERGE с оставшейся позицией не считается завершённой сделкой; его результат будет учтён после полного закрытия или официального резолва."
         )
 
     def _fmt_positions(self) -> str:
@@ -420,16 +436,34 @@ class TelegramController:
         if a in ("presets", "/preset"):
             return self._fmt_presets(), _kb_presets()
         if a in ("resume", "/resume"):
+            if not getattr(self.engine, "running", False):
+                return (
+                    "⚠️ Движок остановлен. Кнопка «Продолжить» снимает паузу, "
+                    "но не запускает остановленный процесс. Проверьте состояние сервиса Railway.",
+                    _kb_main(),
+                )
             self.engine.resume()
-            return "✅ Торговля запущена", _kb_main()
+            return "▶️ PAPER-торговля возобновлена", _kb_main()
         if a in ("pause", "/pause"):
             self.engine.pause()
             return "⏸ Пауза", _kb_main()
         if a in ("kill", "/kill"):
-            return "🛑 Снять всё?", _kb_confirm_kill()
+            return (
+                "🛑 <b>Аварийная остановка PAPER</b>\n"
+                "Новые входы будут поставлены на паузу, maker-заявки отменены, "
+                "совпадающие Up/Down пары объединены. Непарный остаток не продаётся "
+                "автоматически и останется до официального резолва. Подтвердить?",
+                _kb_confirm_kill(),
+            )
         if a == "kill_confirm":
             res = await self.engine.emergency_kill()
-            return f"🛑 СТОП: merge ${res.get('merged_usd', 0):.2f}", _kb_main()
+            return (
+                f"🛑 <b>PAPER аварийная остановка выполнена</b>\n"
+                f"Отменено maker-заявок: {int(res.get('canceled', 0))}\n"
+                f"Объединено пар: ${float(res.get('merged_usd', 0)):.2f}\n"
+                "Новые входы на паузе; непарные позиции остаются до резолва.",
+                _kb_main(),
+            )
         if a.startswith("preset:"):
             key = a.split(":", 1)[1].strip()
             if key in PRESETS and hasattr(self.engine, "set_preset"):
@@ -456,7 +490,7 @@ class TelegramController:
                         self._offset = max(self._offset, upd["update_id"] + 1)
                         if "message" in upd:
                             msg = upd["message"]
-                            if str((msg.get("chat") or {}).get("id", "")).strip() != self.chat_id:
+                            if not self._authorized_chat(msg.get("chat") or {}, msg.get("from") or {}):
                                 continue
                             text = (msg.get("text") or "").strip()
                             if text:
@@ -464,9 +498,9 @@ class TelegramController:
                                 await self.send(reply, keyboard=kb)
                         elif "callback_query" in upd:
                             cq = upd["callback_query"]
-                            chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id", "")).strip()
+                            chat = (cq.get("message") or {}).get("chat") or {}
                             await self._answer_callback(cq.get("id", ""))
-                            if chat_id != self.chat_id:
+                            if not self._authorized_chat(chat, cq.get("from") or {}):
                                 continue
                             reply, kb = await self._handle(cq.get("data") or "status")
                             await self.send(reply, keyboard=kb)
