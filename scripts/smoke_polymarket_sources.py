@@ -178,35 +178,40 @@ async def check_open_price_reference_vs_gamma_ptb(
 
 async def check_boundary_twap_vs_gamma(
     session: aiohttp.ClientSession,
-) -> dict[str, float]:
-    # One-time integration proof: capture RTDS Chainlink TWAP60 around a future
-    # BTC 5m boundary, then compare that sample with Gamma's settled priceToBeat.
-    iterator = PolymarketOracleFeed(["BTC"]).events().__aiter__()
+) -> dict[str, float | str]:
+    # Capture RTDS continuously across the next BTC 5m boundary, then compare
+    # that exact sample with Gamma's settled priceToBeat after the window closes.
+    start_ts = ((int(time.time()) // 300) + 1) * 300
+    deadline = start_ts + 3
     samples: list[tuple[float, float]] = []
-    start_ts = 0
-    try:
-        # Wait for a live event first so the RTDS subscription is established.
-        await asyncio.wait_for(iterator.__anext__(), timeout=30.0)
-        start_ts = ((int(time.time()) // 300) + 1) * 300
-        deadline = start_ts + 3
-        while time.time() <= deadline:
-            try:
-                asset, kind, price, timestamp_ms = await asyncio.wait_for(
-                    iterator.__anext__(), timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                continue
-            ts = timestamp_ms / 1000.0
-            if asset == "BTC" and kind == "chainlink_twap60" and start_ts - 2 <= ts <= start_ts + 2:
-                samples.append((ts, price))
-    finally:
+    stream = PolymarketOracleFeed(["BTC"]).events()
+
+    async def consume_until_boundary() -> None:
         try:
-            await asyncio.wait_for(iterator.aclose(), timeout=5.0)
-        except (asyncio.TimeoutError, RuntimeError):
-            pass
+            async for asset, kind, price, timestamp_ms in stream:
+                ts = timestamp_ms / 1000.0
+                if (
+                    asset == "BTC"
+                    and kind == "chainlink_twap60"
+                    and start_ts - 2 <= ts <= start_ts + 2
+                ):
+                    samples.append((ts, price))
+                if time.time() > deadline:
+                    return
+        finally:
+            try:
+                await asyncio.wait_for(stream.aclose(), timeout=5.0)
+            except (asyncio.TimeoutError, RuntimeError):
+                pass
+
+    timeout_seconds = max(30.0, deadline - time.time() + 5.0)
+    try:
+        await asyncio.wait_for(consume_until_boundary(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        pass
 
     if not samples:
-        raise RuntimeError("No BTC Chainlink TWAP60 samples observed within ±2s of the next 5m boundary")
+        raise RuntimeError("No BTC Chainlink TWAP60 sample observed within ±2s of the next 5m boundary")
     nearest_ts, nearest_twap = min(samples, key=lambda item: abs(item[0] - start_ts))
     offset = abs(nearest_ts - start_ts)
     if offset > 0.5:
