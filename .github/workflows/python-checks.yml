@@ -21,4 +21,4 @@ jobs:
       - name: Compile all Python files
         run: python -m compileall -q .
       - name: Run unit tests
-        run: pytest -q
+        run: python -m pytest -q
