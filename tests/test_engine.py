@@ -383,3 +383,49 @@ def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_pa
     assert restored.price_to_beat == 100_000.0
     assert engine._market_tokens_changed.is_set()
     engine.ledger.conn.close()
+
+
+def test_atomic_pair_entry_debits_engine_and_executor_cash_once(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-cash.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    window = WindowState(
+        slug="btc-updown-5m-pair-cash",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "5" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=time.time(),
+        end_ts=time.time() + 300,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+
+    opened = asyncio.run(engine._open_pair(
+        window,
+        price_up=0.40,
+        price_down=0.50,
+        size=10.0,
+        fee_up=0.10,
+        fee_down=0.10,
+        fair_up=0.60,
+        fair_down=0.40,
+    ))
+
+    assert opened is True
+    expected_cash = 100.0 - (10.0 * (0.40 + 0.50) + 0.20)
+    assert engine.cash == expected_cash
+    assert engine.executor.cash == expected_cash
+    assert window.up_shares == 10.0
+    assert window.down_shares == 10.0
+    assert len(engine.ledger.fills("paper", window.slug)) == 2
+    assert len(engine.ledger.pending_telegram_notifications()) == 1
+    engine.ledger.conn.close()
