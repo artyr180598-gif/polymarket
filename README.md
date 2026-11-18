@@ -30,7 +30,7 @@ No stage should be described as complete until its tests and data coverage are d
 
 ### Collect the target wallet's raw history
 
-Run the read-only collector from a machine with internet access:
+Run the read-only collector from a machine with internet access (the v2 Data API feed is public and cursor-paginated):
 
 ```bash
 python scripts/analyze_target_wallet.py --wallet 0x32ed2e546b187ca15e2841edc82b22c713cf8ec3 --out-dir artifacts/mo_money
