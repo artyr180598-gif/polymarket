@@ -123,6 +123,10 @@ class TradingEngine:
         self._market_feed_last_event_mono = 0.0
         self._risk_halt_active = False
         self._risk_halt_reason = ""
+        # Set by the application after Telegram's delivery session initializes.
+        # None preserves library/test embedding behavior; False blocks resuming
+        # an auto-started engine when the required trade-notification channel failed.
+        self._notification_channel_ready: Optional[bool] = None
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -207,6 +211,11 @@ class TradingEngine:
         self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=True)
 
     def resume(self) -> bool:
+        if self._notification_channel_ready is False:
+            self.paused = True
+            self._risk_halt_reason = "Telegram delivery is not initialized; PAPER trading remains paused"
+            self._log_event("ALERT", self._risk_halt_reason, notify=False)
+            return False
         # Re-check durable risk and data-integrity guards before unpausing.
         if self._risk_halted():
             self.paused = True
