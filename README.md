@@ -2,31 +2,32 @@
 
 > **Not production-ready. PAPER mode only. LIVE execution is deliberately blocked.**
 >
-> The current strategy is a taker-based research simulation using real Polymarket market data. It is **not** a faithful copy of the mo-money market-maker. Do not interpret simulated fills, MERGE records or PnL as real account activity or expected returns.
+> The current strategy is a research-grade PAPER simulation using real Polymarket market data. It includes simplified Post-Only maker quotes and selective taker entries, but it is **not** a faithful copy of the mo-money wallet and is not proven profitable. Do not interpret simulated fills, MERGE records or PnL as real account activity or expected returns.
 
 ## What the current prototype does
 
-- Reads outcome order books from the Polymarket CLOB.
-- Reads Chainlink spot and 60-second TWAP from Polymarket's public RTDS stream through the official Python SDK. The no-credentials RTDS specs used in PAPER are marked deprecated by the SDK but remain supported; before any future LIVE work, migrate to the authenticated price specs and verify the event source is Chainlink.
-- Reads market metadata from Gamma and settled outcomes from the Polymarket Data API.
-- Simulates taker buys at the actual best ask, constrained by quantity resting at that exact price level.
-- Applies the market fee rate when Gamma publishes a per-market fee schedule; otherwise uses the configured fallback schedule.
-- Records fills, virtual MERGEs, resolutions and fees in a SQLite ledger.
+- Reads outcome order books, price changes and last trades from the public Polymarket CLOB WebSocket.
+- Reads Chainlink spot and 60-second TWAP from Polymarket RTDS through the official Python SDK. The no-credentials RTDS specs used in PAPER are marked deprecated by the SDK but remain supported; before any future LIVE work, migrate to authenticated price specs and verify the event source is Chainlink.
+- Uses the nearest RTDS Chainlink TWAP60 sample to the exact market-window start as the active settlement anchor, accepted only within 0.5 seconds. If the bot misses that boundary sample, it skips the market rather than substituting a different price.
+- Uses Gamma `eventMetadata.priceToBeat` only after a market closes for reconciliation/restoration. Polymarket frontend `crypto-price.openPrice` is a separate reference and is **not** used as the live settlement strike.
+- Simulates Post-Only maker buys using visible L2 queue-ahead estimates and sell-aggressor trade volume; also simulates taker buys at the actual best ask, constrained by quantity resting at that exact price level.
+- Applies the market fee rate when Gamma publishes a per-market fee schedule; otherwise uses the configured fallback schedule. Maker rebates are not simulated.
+- Records virtual fills, MERGEs, resolutions and fees in a SQLite ledger.
 - Restores PAPER inventory and account equity from that ledger after restart, provided the database is on persistent storage.
 
 ## Strategy status
 
-The target wallet mo-money is a market maker. Its edge depends on resting Post-Only orders, queue priority, partial fills, cancellations, spread capture and maker rebates. The current prototype does not yet reproduce those mechanics. It must not describe its current taker entries as Maker fills.
+The target wallet mo-money is maker-heavy: public history shows about 90.7% maker fills, with substantial MERGE/REDEEM activity and material maker rebates. This repository now has a basic queue-aware Post-Only PAPER simulator, but it is still an approximation. Visible L2 cannot reveal hidden queue, cancellations ahead, latency races or exact matching priority; maker rebates are not modelled. The fair-value model is heuristic and uncalibrated.
 
-The next implementation stages are:
+Remaining validation stages:
 
-1. Capture and paginate the target wallet's raw Data API trades/activity; classify maker/taker, fills, paired outcomes, order sizes, timing and merge lifecycle.
-2. Build a queue-aware Post-Only PAPER simulator using recorded CLOB book and trade events.
-3. Backtest against recorded data, accounting for fees, rebates, spread, latency, queue position and partial fills.
-4. Compare simulated fills and PnL with independent Polymarket account/ledger data.
-5. Only after independent verification, implement and separately review real order submission, fill reconciliation, cancellations, on-chain merge/redeem and restart recovery.
+1. Historical CLOB order-book/trade replay and queue-model calibration.
+2. Model maker rebates, cancellations, partial fills, spread capture, fees and latency conservatively.
+3. Compare simulated fills and PnL with independently observed Polymarket wallet/ledger data.
+4. Run a long forward PAPER period and inspect the complete Telegram/SQLite event history.
+5. Only after independent verification, separately review any real order submission, fill reconciliation, cancellation, on-chain merge/redeem and restart-recovery implementation.
 
-No stage should be described as complete until its tests and data coverage are documented.
+No profitability or exact-wallet-clone claim should be made until these stages are independently validated.
 
 ### Collect the target wallet's raw history
 
