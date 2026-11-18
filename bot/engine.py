@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import time
-from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -63,16 +62,8 @@ class WindowState:
         return min(self.up_shares, self.down_shares)
 
 
-def _select_live_strike(event: dict[str, Any], open_price: Optional[float]) -> tuple[Optional[float], str]:
-    """Use Polymarket's live openPrice; Gamma priceToBeat is a post-close reconciliation field."""
-    if open_price is not None:
-        try:
-            value = float(open_price)
-            if value > 0:
-                return value, "polymarket_crypto_price.openPrice"
-        except (TypeError, ValueError):
-            pass
-
+def _select_live_strike(event: dict[str, Any]) -> tuple[Optional[float], str]:
+    """Only accept Gamma's settled PTB; active-window strikes come from RTDS TWAP60."""
     market_closed = any(
         market.get("closed") is True or str(market.get("closed", "")).lower() == "true"
         for market in (event.get("markets") or [])[:1]
@@ -372,28 +363,44 @@ class TradingEngine:
                         # is created. Retry missing strikes instead of freezing
                         # the window forever with None and silently skipping it.
                         now_mono = time.monotonic()
-                        if (
-                            existing.price_to_beat is None
-                            and now_mono - existing.last_ptb_retry_mono >= 5.0
-                        ):
-                            existing.last_ptb_retry_mono = now_mono
-                            refreshed = await self._gamma(slug)
-                            if refreshed and refreshed.get("price_to_beat") is not None:
-                                existing.price_to_beat = float(refreshed["price_to_beat"])
-                                existing.price_to_beat_source = str(refreshed.get("price_to_beat_source", ""))
-                            if existing.fee_rate is None and refreshed and refreshed.get("fee_rate") is not None:
-                                existing.fee_rate = float(refreshed["fee_rate"])
+                        if existing.price_to_beat is None:
+                            tracker = self.trackers.get(asset)
+                            boundary = (
+                                tracker.lookup_twap_at(int(start), max_diff_sec=1.0)
+                                if tracker is not None else None
+                            )
+                            if boundary is not None and boundary > 0:
+                                existing.price_to_beat = float(boundary)
+                                existing.price_to_beat_source = "rtds.chainlink_twap60.window_start"
+                            elif now_mono - existing.last_ptb_retry_mono >= 5.0:
+                                existing.last_ptb_retry_mono = now_mono
+                                refreshed = await self._gamma(slug)
+                                if refreshed and refreshed.get("price_to_beat") is not None:
+                                    existing.price_to_beat = float(refreshed["price_to_beat"])
+                                    existing.price_to_beat_source = str(refreshed.get("price_to_beat_source", "" ))
+                                if existing.fee_rate is None and refreshed and refreshed.get("fee_rate") is not None:
+                                    existing.fee_rate = float(refreshed["fee_rate"])
                         continue
                     meta = await self._gamma(slug)
                     if not meta:
                         continue
+                    tracker = self.trackers.get(asset)
+                    boundary = (
+                        tracker.lookup_twap_at(int(start), max_diff_sec=1.0)
+                        if tracker is not None else None
+                    )
+                    strike = meta.get("price_to_beat")
+                    strike_source = meta.get("price_to_beat_source", "")
+                    if strike is None and boundary is not None and boundary > 0:
+                        strike = float(boundary)
+                        strike_source = "rtds.chainlink_twap60.window_start"
                     w = WindowState(
                         slug=slug, asset=asset, timeframe=tf,
                         condition_id=meta["condition_id"],
                         up_token=meta["up_token"], down_token=meta["down_token"],
                         start_ts=float(start), end_ts=float(end),
-                        price_to_beat=meta.get("price_to_beat"),
-                        price_to_beat_source=meta.get("price_to_beat_source", ""),
+                        price_to_beat=strike,
+                        price_to_beat_source=strike_source,
                         fee_rate=meta.get("fee_rate"),
                         last_ptb_retry_mono=time.monotonic(),
                     )
@@ -420,40 +427,11 @@ class TradingEngine:
                         ids = json.loads(ids)
                     if not ids or len(ids) < 2:
                         return None
-                    # Gamma publishes eventMetadata.priceToBeat only after the window
-                    # closes. For a live market, obtain the exact opening strike from
-                    # Polymarket's own crypto-price endpoint.
-                    parts = slug.rsplit("-", 3)
-                    ptb = None
-                    ptb_source = ""
-                    if len(parts) == 4:
-                        asset, timeframe, start_raw = parts[0], parts[2], parts[3]
-                        try:
-                            start_ts = int(start_raw)
-                            duration = 300 if timeframe == "5m" else 900 if timeframe == "15m" else 0
-                            variant = "fiveminute" if timeframe in ("5m", "15m") else ""
-                            if duration and variant:
-                                start_iso = datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                                end_iso = datetime.fromtimestamp(start_ts + duration, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                                async with s.get(
-                                    "https://polymarket.com/api/crypto/crypto-price",
-                                    params={
-                                        "symbol": asset.upper(),
-                                        "eventStartTime": start_iso,
-                                        "endDate": end_iso,
-                                        "variant": variant,
-                                    },
-                                    headers={"User-Agent": "Mozilla/5.0"},
-                                ) as price_response:
-                                    if price_response.status == 200:
-                                        price_payload = await price_response.json()
-                                        ptb, ptb_source = _select_live_strike(
-                                            ev, price_payload.get("openPrice") if isinstance(price_payload, dict) else None
-                                        )
-                        except (TypeError, ValueError, OverflowError):
-                            pass
-                    if ptb is None:
-                        ptb, ptb_source = _select_live_strike(ev, None)
+                    # For active 5m/15m markets, the settlement anchor is the
+                    # Chainlink TWAP60 sample at the exact window boundary. The
+                    # frontend crypto-price openPrice is a separate reference and
+                    # can differ; never substitute it for the settlement strike.
+                    ptb, ptb_source = _select_live_strike(ev)
                     fee_schedule = m.get("feeSchedule") or ev.get("feeSchedule") or {}
                     if isinstance(fee_schedule, str):
                         try:
