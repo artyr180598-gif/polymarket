@@ -21,8 +21,8 @@ class StrategyParams:
     enable_maker: bool = False
     min_maker_edge: float = 0.025
     maker_min_size: float = 5.0
-    maker_min_price: float = 0.30
-    maker_max_price: float = 0.89
+    maker_min_price: float = 0.03
+    maker_max_price: float = 0.95
     maker_start_sec: float = 6.0
     take_profit_edge: float = 0.015
     stop_loss_drop: float = 0.12
