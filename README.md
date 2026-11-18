@@ -66,7 +66,16 @@ DB_PATH=/data/polybot.db
 
 ## Telegram
 
-The Telegram bot reports PAPER status, ledger fills, virtual MERGE events, official market resolutions and ledger-based PnL. It must distinguish virtual events from real exchange executions. /positions is restored from the ledger when persistent storage is available.
+The Telegram bot provides inline buttons and native slash commands:
+
+- `/status` — bot state, Chainlink RTDS/TWAP60, CLOB feed, model readiness and open windows.
+- `/pnl` — lifetime and daily net PnL, fees, Maker share, profitable / losing / breakeven resolved markets.
+- `/positions` — current open virtual inventory.
+- `/fills` — recent PAPER fills and MERGE events from SQLite.
+- `/history` — recent officially resolved markets with merge-adjusted, fee-adjusted net PnL.
+- `/pause`, `/resume`, `/kill` — remote PAPER controls; emergency stop requires confirmation.
+
+All displayed fills, MERGEs and PnL are simulated PAPER ledger records, not real Polymarket account executions. Win/loss counts are explicitly limited to markets with an official resolution; fully merged markets remain included in lifetime PnL but are not misclassified as resolved wins or losses. Persistent history still requires a verified Railway Volume mounted at `/data`.
 
 ## Main modules
 
