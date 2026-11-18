@@ -18,8 +18,9 @@ class StrategyParams:
     description_ru: str
 
     # Engine 1: @mo-money Post-Only Maker + Synthetic BUY-Opposite TP/SL + MERGE
-    enable_maker: bool = True
+    enable_maker: bool = False
     min_maker_edge: float = 0.025
+    maker_min_size: float = 5.0
     maker_min_price: float = 0.30
     maker_max_price: float = 0.89
     maker_start_sec: float = 6.0
@@ -28,7 +29,7 @@ class StrategyParams:
     stop_loss_min_remain_sec: float = 30.0
 
     # Engine 2: Bonereaper TWAP Lock-In
-    enable_lockin: bool = True
+    enable_lockin: bool = False
     lockin_min_prob: float = 0.99
     lockin_max_bid: float = 0.98
     lockin_min_net_edge: float = 0.012
@@ -37,7 +38,7 @@ class StrategyParams:
     lockin_start_remain_sec: float = 120.0
 
     # Engine 3: Selective Taker (sniper)
-    enable_taker: bool = True
+    enable_taker: bool = False
     min_taker_net_edge_btc: float = 0.038
     min_taker_net_edge_alt: float = 0.024
     taker_min_price: float = 0.45
@@ -49,15 +50,16 @@ class StrategyParams:
 PRESETS: Dict[str, StrategyParams] = {
     "mo_money": StrategyParams(
         key="mo_money",
-        title_ru="mo-money research prototype (PAPER, Taker)",
+        title_ru="mo-money-inspired PAPER prototype (Maker + selective Taker)",
         description_ru=(
-            "Исследовательский PAPER-прототип, а не точная копия кошелька mo-money. "
-            "Текущая реализация моделирует taker-входы по реальному CLOB best ask и комиссию. "
-            "Post-Only Maker, очередь заявок, отмены, частичные исполнения, rebates и "
-            "полная синхронизация позиций ещё не реализованы и не должны считаться готовыми."
+            "PAPER-исследовательский прототип по публичной истории кошелька, не точная копия. "
+            "Maker-заявки моделируются по живому CLOB WebSocket и видимой очереди L2; "
+            "частичные исполнения учитываются. Отмены и риск-лимиты работают. "
+            "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются; "
+            "fair-value модель не откалибрована. Прибыльность не доказана."
         ),
         enable_maker=True,
-        enable_lockin=True,
+        enable_lockin=False,
         enable_taker=True,
         min_maker_edge=0.024,
         min_taker_net_edge_btc=0.040,
@@ -65,41 +67,25 @@ PRESETS: Dict[str, StrategyParams] = {
     ),
     "lockin": StrategyParams(
         key="lockin",
-        title_ru="Консервативный (TWAP Lock-In)",
+        title_ru="Отключён · TWAP Lock-In ещё не реализован",
         description_ru=(
-            "Минимальная дисперсия (Модуль Б Bonereaper + строгий Maker): ждёт финала окна, "
-            "когда 60-секундный Chainlink TWAP уже математически почти зафиксирован (P ≥ 99.1%), "
-            "и забирает 94–98¢ с 0% мейкер-комиссией. Сделок меньше, винрейт максимальный."
+            "Этот режим не включён: отдельная логика TWAP Lock-In и её риск-проверки "
+            "не прошли независимую валидацию. Переключение пресетов в Telegram отключено."
         ),
-        enable_maker=True,
-        min_maker_edge=0.038,
-        maker_min_price=0.52,
-        maker_max_price=0.88,
-        enable_lockin=True,
-        lockin_min_prob=0.991,
-        lockin_max_bid=0.98,
-        lockin_min_net_edge=0.011,
-        lockin_size_mult=2.0,
+        enable_maker=False,
+        enable_lockin=False,
         enable_taker=False,
     ),
     "hybrid": StrategyParams(
         key="hybrid",
-        title_ru="Гибрид (DSP + mo-money + 0.01 Fee)",
+        title_ru="Отключён · Hybrid ещё не реализован",
         description_ru=(
-            "Активный режим под новые комиссии с 20.11.2026: плотное мейкер-котирование с авто-MERGE, "
-            "более частые Taker-удары при отставании стакана от Chainlink/Binance (особенно на ETH/SOL, "
-            "где комиссия падает до 0.01) и модуль TWAP Lock-In."
+            "Гибридный режим не включён: его отдельные правила комиссий, TP/SL и риск-лимиты "
+            "не прошли проверку на реальных исторических данных."
         ),
-        enable_maker=True,
-        min_maker_edge=0.019,
-        maker_min_price=0.28,
-        take_profit_edge=0.045,
-        stop_loss_drop=0.17,
-        enable_lockin=True,
-        lockin_min_prob=0.988,
-        enable_taker=True,
-        min_taker_net_edge_btc=0.034,
-        min_taker_net_edge_alt=0.020,
+        enable_maker=False,
+        enable_lockin=False,
+        enable_taker=False,
     ),
 }
 
