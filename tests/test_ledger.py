@@ -336,10 +336,20 @@ def test_market_history_includes_fully_merged_markets_without_resolution(tmp_pat
         cost_basis=8.0,
         locked_pnl=2.0,
     )
+    ledger.record_anchor_check(
+        mode="paper",
+        slug="btc-updown-5m-1795035600",
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=100_000.0,
+        anchor_delta=0.0,
+        anchor_verified=True,
+    )
 
     rows = ledger.market_history("paper", 10)
     assert len(rows) == 1
     assert rows[0]["winner"] == "MERGED"
     assert rows[0]["merge_pnl"] == 2.0
     assert rows[0]["market_net_pnl"] == 1.98
+    assert rows[0]["anchor_verified"] == 1
     ledger.conn.close()
