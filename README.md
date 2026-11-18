@@ -10,6 +10,7 @@
 - Reads Chainlink spot and 60-second TWAP from Polymarket RTDS through the official Python SDK. The no-credentials RTDS specs used in PAPER are marked deprecated by the SDK but remain supported; before any future LIVE work, migrate to authenticated price specs and verify the event source is Chainlink.
 - Uses the nearest RTDS Chainlink TWAP60 sample to the exact market-window start as the active settlement anchor, accepted only within 0.5 seconds. If the bot misses that boundary sample, it skips the market rather than substituting a different price.
 - Uses Gamma `eventMetadata.priceToBeat` only after a market closes for reconciliation/restoration. Polymarket frontend `crypto-price.openPrice` is a separate reference and is **not** used as the live settlement strike.
+- At settlement, persists the RTDS strike source and the Gamma comparison in SQLite. A difference above $0.01 raises a Telegram alert and pauses new entries.
 - Simulates Post-Only maker buys using visible L2 queue-ahead estimates and sell-aggressor trade volume; also simulates taker buys at the actual best ask, constrained by quantity resting at that exact price level.
 - Applies the market fee rate when Gamma publishes a per-market fee schedule; otherwise uses the configured fallback schedule. Maker rebates are not simulated.
 - Records virtual fills, MERGEs, resolutions and fees in a SQLite ledger.
