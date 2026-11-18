@@ -222,5 +222,5 @@ def test_telegram_help_explains_history_and_risk_controls():
     controller = TelegramController(engine)
     message = controller._fmt_help()
     assert "gross, комиссии и net" in message
-    assert "отдельным ногам исполнения" not in message
+    assert "а не по отдельным ногам исполнения" in message
     assert "расхождению Chainlink/Gamma" in message
