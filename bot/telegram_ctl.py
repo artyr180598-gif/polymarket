@@ -229,6 +229,8 @@ class TelegramController:
         resolved = int(stats.get("resolved_markets", 0) or 0)
         losses = max(0, resolved - wins)
         n_fills = int(stats.get("total_fills", 0) or 0)
+        maker_fills = int(stats.get("maker_fills", 0) or 0)
+        maker_fill_pct = float(stats.get("maker_fill_pct", 0) or 0)
         n_merge = int(stats.get("merge_count", 0) or 0)
         emoji = "📈" if lifetime_pnl >= 0 else "📉"
         return (
@@ -248,7 +250,8 @@ class TelegramController:
             f"· Открытые позиции оцениваются по себестоимости, не по mark-to-market.\n"
             f"· Это PAPER симуляция, не фактический PnL аккаунта Polymarket.\n\n"
             f"📊 Журнал\n"
-            f"· Ставок: <b>{n_fills}</b>\n"
+            f"· Всего исполнений: <b>{n_fills}</b>\n"
+            f"· Maker: <b>{maker_fills}</b> ({maker_fill_pct:.1f}%)\n"
             f"· MERGE: <b>{n_merge}</b>\n"
             f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses})\n\n"
             f"ℹ️ ✅/❌ только если позиция дождалась конца окна.\n"
@@ -306,9 +309,10 @@ class TelegramController:
             price = float(f.get("price") or 0)
             asset = f.get("asset") or ""
             reason = f.get("reason") or ""
+            role = str(f.get("role") or "TAKER").upper()
             fee = float(f.get("fee") or 0)
-            fee_s = f" fee ${fee:.2f}" if fee else ""
-            lines.append(f"🟢 {side} {asset} {shares:.1f}×{price*100:.0f}¢ ({reason}){fee_s}")
+            fee_s = f" fee \${fee:.2f}" if fee else ""
+            lines.append(f"🟢 {role} {side} {asset} {shares:.1f}×{price*100:.0f}¢ ({reason}){fee_s}")
         if merges:
             lines.append("")
             lines.append("<b>MERGE:</b>")
@@ -319,20 +323,22 @@ class TelegramController:
     def _fmt_help(self) -> str:
         return (
             "ℹ️ <b>Текущий PAPER-прототип</b>\n━━━━━━━━━━━━━━━━\n"
-            "• Котировки исходов: реальный Polymarket CLOB\n"
-            "• Settlement-сигнал: Polymarket RTDS Chainlink spot + TWAP60\n"
-            "• Победитель: только официальный Polymarket Data API resolution\n"
-            "• Покупки и MERGE пока виртуальные, не транзакции\n\n"
-            "Важно: это ещё не точная копия mo-money. Его Post-Only Maker, очередь, отмены, частичные исполнения и rebates ещё нужно реализовать и проверить."
+            "• Strike: Polymarket crypto-price openPrice; Gamma priceToBeat — сверка после закрытия\n"
+            "• Oracle: Polymarket RTDS Chainlink spot + TWAP60\n"
+            "• Maker: PAPER post-only по живому CLOB WebSocket, очередь оценивается по видимой L2 глубине\n"
+            "• Taker: PAPER по реальному CLOB best ask; победитель — официальный Data API resolution\n"
+            "• Все заявки и MERGE виртуальные; реальные ордера не отправляются\n\n"
+            "Ограничения: скрытая очередь, отмены впереди нас и точный matching priority не видны; maker-rebates не моделируются. Это не точная копия mo-money и прибыльность пока не доказана."
         )
 
     def _fmt_presets(self) -> str:
-        lines = ["⚙️ <b>Пресет</b>", "━━━━━━━━━━━━━━━━"]
-        cur = self.engine.cfg.strategy_preset
-        for key, p in PRESETS.items():
-            mark = " ✅" if key == cur else ""
-            lines.append(f"\n<b>{getattr(p, 'title_ru', key)}</b>{mark}")
-        return "\n".join(lines)
+        current = PRESETS.get(self.engine.cfg.strategy_preset)
+        title = getattr(current, "title_ru", self.engine.cfg.strategy_preset)
+        return (
+            "⚙️ <b>Стратегия</b>\n━━━━━━━━━━━━━━━━\n"
+            f"Активна: <b>{title}</b>\n"
+            "Смена пресетов временно отключена: остальные режимы не прошли проверку."
+        )
 
     async def _handle(self, action: str):
         a = (action or "").strip().lower()
@@ -365,8 +371,8 @@ class TelegramController:
                 if self.engine.set_preset(key):
                     return f"✅ Пресет: {key}", _kb_main()
                 return (
-                    "⚠️ Смена пресета отключена: параметры стратегий ещё не подключены "
-                    "к торговой логике. Текущие сигналы используют фиксированные PAPER-правила.",
+                    "⚠️ Смена пресета отключена: активен только проверяемый PAPER-прототип. "
+                    "Другие режимы не прошли валидацию.",
                     _kb_main(),
                 )
         return self._fmt_status(), _kb_main()
