@@ -28,9 +28,6 @@ def _kb_main() -> Dict[str, Any]:
 def _kb_presets() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "⭐ mo-money", "callback_data": "preset:mo_money"}],
-            [{"text": "🛡️ Lock-In", "callback_data": "preset:lockin"}],
-            [{"text": "⚡ Гибрид", "callback_data": "preset:hybrid"}],
             [{"text": "« Назад", "callback_data": "status"}],
         ]
     }
@@ -155,14 +152,27 @@ class TelegramController:
         mode = (st.get("mode") or "paper").upper()
         running = st.get("running")
         paused = st.get("paused")
-        market_data_ready = bool(st.get("streams_ok"))
+        oracle_ready = bool(st.get("streams_ok"))
+        clob_ready = bool(st.get("clob_feed_connected"))
+        strike_ready = any(
+            w.get("price_to_beat") is not None
+            for w in (st.get("windows") or [])
+            if not w.get("resolved")
+        )
+        market_data_ready = oracle_ready and clob_ready and strike_ready
         model_ready = bool(st.get("model_ready"))
-        state_emoji = "🟢" if running and market_data_ready and model_ready else ("🟠" if running else ("⏸" if paused else "⏹"))
+        state_emoji = (
+            "⏸" if paused else
+            "🟢" if running and market_data_ready and model_ready else
+            "🟠" if running else "⏹"
+        )
         state_txt = (
-            "PAPER готов к сигналам" if running and market_data_ready and model_ready
-            else "накапливает данные" if running and market_data_ready
-            else "ожидает Chainlink" if running
-            else "пауза" if paused
+            "пауза" if paused
+            else "PAPER готов к сигналам" if running and market_data_ready and model_ready
+            else "накапливает волатильность" if running and market_data_ready
+            else "ожидает Polymarket openPrice" if running and oracle_ready and clob_ready and not strike_ready
+            else "ожидает CLOB WebSocket" if running and oracle_ready and not clob_ready
+            else "ожидает Chainlink RTDS" if running
             else "остановлен"
         )
         equity = st.get("equity", 0) or 0
@@ -177,13 +187,18 @@ class TelegramController:
             f"Стратегия: <b>{preset_title}</b>",
             f"Режим: <b>{mode}</b>",
             "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
-            f"Oracle RTDS: <b>{'OK' if market_data_ready else 'нет свежих данных'}</b>",
+            f"Chainlink RTDS: <b>{'OK' if oracle_ready else 'нет свежих данных'}</b>",
+            f"Polymarket openPrice: <b>{'OK' if strike_ready else 'ожидание'}</b>",
+            f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
             f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
+            f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв \${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
+            f"Доступно: <b>\${float(st.get('available_cash', cash) or 0):.2f}</b>",
             f"",
-            f"💵 Equity: <b>${equity:,.2f}</b>",
-            f"💸 Cash: ${cash:,.2f}",
+            f"💵 Equity: <b>\${equity:,.2f}</b>",
+            f"💸 Cash: \${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
-            f"Комиссии всего: −${fees:.2f}",
+            f"Комиссии всего: −\${fees:.2f}",
+            "Maker-rebates в PAPER PnL пока не моделируются.",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
