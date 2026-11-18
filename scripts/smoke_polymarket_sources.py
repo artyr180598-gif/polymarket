@@ -24,17 +24,24 @@ async def check_rtds() -> dict[str, dict[str, float]]:
     received: dict[tuple[str, str], dict[str, float]] = {}
 
     async def consume() -> None:
-        async for asset, kind, price, timestamp_ms in PolymarketOracleFeed(["BTC", "ETH", "SOL"]).events():
-            if (asset, kind) not in expected:
-                continue
-            if price <= 0 or timestamp_ms <= 0:
-                continue
-            age = time.time() - timestamp_ms / 1000.0
-            if not -2.0 <= age <= 5.0:
-                continue
-            received[(asset, kind)] = {"price": price, "age_seconds": age}
-            if expected.issubset(received):
-                return
+        stream = PolymarketOracleFeed(["BTC", "ETH", "SOL"]).events()
+        try:
+            async for asset, kind, price, timestamp_ms in stream:
+                if (asset, kind) not in expected:
+                    continue
+                if price <= 0 or timestamp_ms <= 0:
+                    continue
+                age = time.time() - timestamp_ms / 1000.0
+                if not -2.0 <= age <= 5.0:
+                    continue
+                received[(asset, kind)] = {"price": price, "age_seconds": age}
+                if expected.issubset(received):
+                    return
+        finally:
+            try:
+                await asyncio.wait_for(stream.aclose(), timeout=4.0)
+            except (asyncio.TimeoutError, RuntimeError):
+                pass
 
     await asyncio.wait_for(consume(), timeout=35.0)
     if not expected.issubset(received):
