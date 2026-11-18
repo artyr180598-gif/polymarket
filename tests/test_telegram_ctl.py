@@ -59,3 +59,33 @@ def test_telegram_invalid_html_retries_as_plain_text():
     assert "parse_mode" not in second
     assert second["text"] == "Market tag price < 0.5 & move"
     assert second["reply_markup"] == keyboard
+
+
+def test_telegram_main_keyboard_exposes_history():
+    from bot.telegram_ctl import _kb_main
+
+    callbacks = [
+        button["callback_data"]
+        for row in _kb_main()["inline_keyboard"]
+        for button in row
+    ]
+    assert "history" in callbacks
+
+
+def test_telegram_market_history_renders_net_pnl():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(trading_mode="paper"),
+        ledger=SimpleNamespace(market_history=lambda mode, limit: [{
+            "asset": "BTC",
+            "timeframe": "5m",
+            "winner": "Up",
+            "merge_pnl": 0.5,
+            "market_net_pnl": 0.8,
+            "slug": "btc-updown-5m-test",
+        }]),
+    )
+    controller = TelegramController(engine)
+    message = controller._fmt_history()
+    assert "История закрытых рынков" in message
+    assert "$+0.80" in message
+    assert "btc-updown-5m-test" in message
