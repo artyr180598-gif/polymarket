@@ -305,6 +305,44 @@ class TelegramController:
 
     def _fmt_positions(self) -> str:
         st = self.engine.snapshot()
+        window_by_slug = {
+            str(w.get("slug") or ""): w for w in (st.get("windows") or [])
+        }
+        positions = []
+        try:
+            # The SQLite ledger is authoritative, including inventory restored after restart.
+            positions = self.engine.ledger.open_positions(self.engine.cfg.trading_mode)
+        except Exception as exc:
+            logger.warning("ledger positions unavailable for Telegram: %s", exc)
+
+        if positions:
+            lines = ["📈 <b>Открытые PAPER-позиции</b>", "━━━━━━━━━━━━━━━━"]
+            for p in positions[:10]:
+                slug = str(p.get("slug") or "?")
+                w = window_by_slug.get(slug, {})
+                up = float(p.get("up_shares") or 0.0)
+                down = float(p.get("down_shares") or 0.0)
+                up_cost = float(p.get("up_cost") or 0.0)
+                down_cost = float(p.get("down_cost") or 0.0)
+                fees = float(p.get("up_fees") or 0.0) + float(p.get("down_fees") or 0.0)
+                up_avg = up_cost / up if up > 0 else 0.0
+                down_avg = down_cost / down if down > 0 else 0.0
+                fair = w.get("fair_up")
+                fair_s = f"{fair * 100:.1f}¢" if fair is not None else "—"
+                up_s = f"↑ {up:.2f} @ {up_avg * 100:.1f}¢" if up > 0 else "↑ —"
+                down_s = f"↓ {down:.2f} @ {down_avg * 100:.1f}¢" if down > 0 else "↓ —"
+                lines.append(
+                    f"\n<code>{slug}</code>\n"
+                    f"{p.get('asset', '?')} {p.get('timeframe', '')} · "
+                    f"⏱ {w.get('remain_sec', 0) or 0:.0f}s · fair Up {fair_s}\n"
+                    f"{up_s} · {down_s}\n"
+                    f"Себестоимость: <b>${up_cost + down_cost:.2f}</b> · 
+                    f"комиссии входа: −${fees:.2f}"
+                )
+            lines.append("\nСебестоимость не является текущей рыночной оценкой позиции.")
+            return "\n".join(lines)
+
+        # Fallback for in-memory state if the ledger read failed or no fill was persisted.
         windows = [
             w for w in (st.get("windows") or [])
             if (w.get("up_shares", 0) or 0) > 0 or (w.get("down_shares", 0) or 0) > 0
