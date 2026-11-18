@@ -287,26 +287,33 @@ class TradingEngine:
         while self.running:
             try:
                 feed = PolymarketOracleFeed(self.cfg.enabled_assets)
-                async for asset, kind, price, ts_ms in feed.events():
-                    tracker = self.trackers.get(asset)
-                    if tracker is None:
-                        continue
-                    # Reject timestamps that are clearly stale or implausibly in the future.
-                    source_ts = ts_ms / 1000.0
-                    age = time.time() - source_ts
-                    if age > 5.0 or age < -2.0:
-                        continue
-                    if kind == "chainlink_spot":
-                        tracker.on_chainlink_spot(price, ts_ms)
-                    elif kind == "chainlink_twap60":
-                        tracker.on_chainlink_twap60(price, ts_ms)
-                    self._oracle_last_event_ts = time.time()
-                    fresh = self._oracle_fresh()
-                    self._oracle_connected = fresh
-                    self._price_ok = fresh
-                    self._streams_ok = fresh
-                    if fresh:
-                        delay = 1.0
+                events = feed.events()
+                try:
+                    async for asset, kind, price, ts_ms in events:
+                        tracker = self.trackers.get(asset)
+                        if tracker is None:
+                            continue
+                        # Reject timestamps that are clearly stale or implausibly in the future.
+                        source_ts = ts_ms / 1000.0
+                        age = time.time() - source_ts
+                        if age > 5.0 or age < -2.0:
+                            continue
+                        if kind == "chainlink_spot":
+                            tracker.on_chainlink_spot(price, ts_ms)
+                        elif kind == "chainlink_twap60":
+                            tracker.on_chainlink_twap60(price, ts_ms)
+                        self._oracle_last_event_ts = time.time()
+                        fresh = self._oracle_fresh()
+                        self._oracle_connected = fresh
+                        self._price_ok = fresh
+                        self._streams_ok = fresh
+                        if fresh:
+                            delay = 1.0
+                finally:
+                    try:
+                        await asyncio.wait_for(events.aclose(), timeout=4.0)
+                    except (asyncio.TimeoutError, RuntimeError):
+                        log.warning("Timed out while closing Polymarket RTDS stream")
                 if self.running:
                     raise RuntimeError("Polymarket RTDS stream ended unexpectedly")
             except asyncio.CancelledError:
