@@ -31,6 +31,7 @@ jobs:
 
   live-source-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: checks
     steps:
       - uses: actions/checkout@v4
