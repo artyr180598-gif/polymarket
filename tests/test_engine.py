@@ -59,13 +59,13 @@ def test_discovery_uses_only_near_exact_rtds_sample_for_existing_window(monkeypa
 def test_active_market_does_not_treat_frontend_open_price_as_settlement_strike() -> None:
     # The frontend crypto-price openPrice can differ from the Chainlink TWAP60
     # settlement anchor. Active windows must wait for the exact RTDS boundary sample.
-    value, source = _select_live_strike({"closed": False, "eventMetadata": {}})
+    value, source = _select_closed_gamma_strike({"closed": False, "eventMetadata": {}})
     assert value is None
     assert source == ""
 
 
 def test_active_gamma_event_metadata_is_not_used_as_live_strike() -> None:
-    value, source = _select_live_strike(
+    value, source = _select_closed_gamma_strike(
         {"closed": False, "eventMetadata": {"priceToBeat": "62000"}},
     )
     assert value is None
@@ -73,7 +73,7 @@ def test_active_gamma_event_metadata_is_not_used_as_live_strike() -> None:
 
 
 def test_closed_gamma_price_to_beat_is_reconciliation_fallback() -> None:
-    value, source = _select_live_strike(
+    value, source = _select_closed_gamma_strike(
         {"closed": True, "eventMetadata": {"priceToBeat": "62000"}},
     )
     assert value == 62_000.0
