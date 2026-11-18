@@ -50,7 +50,7 @@ class StrategyParams:
 PRESETS: Dict[str, StrategyParams] = {
     "mo_money": StrategyParams(
         key="mo_money",
-        title_ru="mo-money-inspired PAPER prototype (Maker + selective Taker)",
+        title_ru="PAPER-прототип по mo-money (Maker + Taker)",
         description_ru=(
             "PAPER-исследовательский прототип по публичной истории кошелька, не точная копия. "
             "Maker-заявки моделируются по живому CLOB WebSocket и видимой очереди L2; "
