@@ -224,3 +224,43 @@ def test_telegram_help_explains_history_and_risk_controls():
     assert "gross, комиссии и net" in message
     assert "а не по отдельным ногам исполнения" in message
     assert "расхождению Chainlink/Gamma" in message
+
+
+def test_telegram_pnl_breakdown_exposes_fees_in_net_formula():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            bankroll_usd=100.0,
+            strategy_preset="mo_money",
+            trading_mode="paper",
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        params=SimpleNamespace(title_ru="Mo Money"),
+        snapshot=lambda: {
+            "equity": 100.8,
+            "cash": 100.8,
+            "fees_paid": 0.2,
+            "stats": {
+                "today_total_net_pnl": 0.3,
+                "realized_gross_pnl": 0.5,
+                "merged_locked_pnl": 0.5,
+                "lifetime_total_net_pnl": 0.8,
+                "total_fees": 0.2,
+                "total_fills": 2,
+                "maker_fills": 0,
+                "maker_fill_pct": 0,
+                "merge_count": 1,
+                "resolved_markets": 1,
+                "completed_markets": 2,
+                "completed_win_markets": 2,
+                "completed_loss_markets": 0,
+                "completed_breakeven_markets": 0,
+                "completed_win_rate_pct": 100,
+            },
+        },
+    )
+    controller = TelegramController(engine)
+    message = controller._fmt_pnl()
+    assert "MERGE gross" in message
+    assert "Все комиссии: <b>−$0.20</b>" in message
+    assert "MERGE gross + resolved gross − комиссии = Lifetime net" in message
