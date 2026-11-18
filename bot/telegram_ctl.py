@@ -65,7 +65,7 @@ class TelegramController:
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nРежим: PAPER (демо)\nБанк: <b>${bank:,.0f}</b>\nНажми кнопку 👇",
+            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b> (пара+maker)\nБанк: <b>${bank:,.0f}</b>\nНажми кнопку 👇",
             keyboard=_kb_main(),
         )
 
@@ -81,13 +81,18 @@ class TelegramController:
             await self._session.close()
             self._session = None
 
-    async def send(self, text: str, keyboard: Optional[Dict] = None) -> None:
+    async def send(
+        self,
+        text: str,
+        keyboard: Optional[Dict] = None,
+        parse_mode: str = "HTML",
+    ) -> None:
         if not self.enabled or not self._session:
             return
         payload: Dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": text[:4090],
-            "parse_mode": "HTML",
+            "parse_mode": parse_mode,
             "disable_web_page_preview": True,
         }
         if keyboard:
@@ -95,14 +100,28 @@ class TelegramController:
         try:
             async with self._session.post(f"{self._base}/sendMessage", json=payload) as r:
                 if r.status != 200:
-                    logger.warning("sendMessage %s", r.status)
+                    body = await r.text()
+                    logger.warning("sendMessage %s: %s", r.status, body[:180])
+                    plain = (
+                        payload["text"]
+                        .replace("<b>", "").replace("</b>", "")
+                        .replace("<i>", "").replace("</i>", "")
+                        .replace("<code>", "").replace("</code>", "")
+                    )
+                    payload["text"] = plain[:4090]
+                    payload.pop("parse_mode", None)
+                    async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
+                        if r2.status != 200:
+                            logger.warning("sendMessage plain %s", r2.status)
         except Exception as e:
-            logger.warning("Telegram send: %s", e)
+            logger.warning("Telegram send failed: %s", e)
 
     async def notify(self, text: str) -> None:
         msg = (text or "").strip()
-        if msg:
-            await self.send(f"🔔 {msg}", keyboard=_kb_main())
+        if not msg:
+            return
+        await asyncio.sleep(0.35)
+        await self.send(f"🔔 {msg}", keyboard=_kb_main())
 
     async def _answer_callback(self, cq_id: str) -> None:
         if self._session:
@@ -132,7 +151,8 @@ class TelegramController:
         lines = [
             f"{state_emoji} <b>PolyBot — {state_txt}</b>",
             "━━━━━━━━━━━━━━━━",
-            f"Режим: <b>{mode}</b> · демо-счёт",
+            f"Стратегия: <b>mo-money</b>",
+            f"Режим: <b>{mode}</b> · демо",
             f"Пресет: <code>{st.get('preset', '—')}</code>",
             "",
             f"💵 Equity: <b>${equity:,.2f}</b>",
@@ -141,7 +161,6 @@ class TelegramController:
             "",
             f"Ставок: {n_fills} · MERGE: {stats.get('merge_count', 0)} (${merge_pnl:+.2f})",
             f"Окна: ✅ {wins} / ❌ {losses} · винрейт {stats.get('win_rate_pct', 0)}%",
-            f"Realized окон: ${stats.get('realized_net_pnl', 0):+.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
@@ -174,8 +193,6 @@ class TelegramController:
         resolved = int(stats.get("resolved_markets", 0) or 0)
         losses = max(0, resolved - wins)
         n_fills = int(stats.get("total_fills", 0) or 0)
-        if not n_fills:
-            n_fills = len(st.get("fill_history") or [])
         n_merge = int(stats.get("merge_count", 0) or 0)
         emoji = "📈" if pnl >= 0 else "📉"
         c_emoji = "📈" if closed >= 0 else "📉"
@@ -188,16 +205,15 @@ class TelegramController:
             f"{emoji} Итого: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
             f"Сегодня: <b>${day:+.2f}</b>\n\n"
             f"{c_emoji} <b>Закрыто всего: ${closed:+.2f}</b>\n"
-            f"  · по окнам (resolve): ${res_pnl:+.2f}\n"
+            f"  · по окнам: ${res_pnl:+.2f}\n"
             f"  · по MERGE: ${merge_pnl:+.2f}\n\n"
             f"📊 Журнал\n"
-            f"· Ставок (входов): <b>{n_fills}</b>\n"
-            f"· MERGE операций: <b>{n_merge}</b>\n"
+            f"· Ставок: <b>{n_fills}</b>\n"
+            f"· MERGE: <b>{n_merge}</b>\n"
             f"· Окон закрыто: <b>{resolved}</b>\n"
-            f"· ✅ Прибыльных окон: <b>{wins}</b>\n"
-            f"· ❌ Убыточных окон: <b>{losses}</b>\n"
-            f"· Винрейт: {stats.get('win_rate_pct', 0)}%\n\n"
-            f"<i>Итого = Equity − старт. Закрыто = уже зафиксировано.</i>"
+            f"· ✅ Прибыльных: <b>{wins}</b>\n"
+            f"· ❌ Убыточных: <b>{losses}</b>\n"
+            f"· Винрейт: {stats.get('win_rate_pct', 0)}%"
         )
 
     def _fmt_positions(self) -> str:
@@ -241,7 +257,7 @@ class TelegramController:
         merges = list(st.get("merge_history") or [])
         if not merges:
             for line in reversed(events):
-                if "MERGE" in line:
+                if "MERGE" in line or "ОБЪЕДИНЕНИЕ" in line:
                     merges.append({"raw": line})
                     if len(merges) >= 6:
                         break
@@ -262,13 +278,12 @@ class TelegramController:
             "━━━━━━━━━━━━━━━━",
             f"Ставок: <b>{n_fills}</b>",
             f"MERGE: {stats.get('merge_count', 0)} → ${merge_pnl:+.2f}",
-            f"Окна закрыто: {resolved} (✅ {wins} / ❌ {losses})",
-            f"Realized окон: ${stats.get('realized_net_pnl', 0):+.2f}",
+            f"Окна: {resolved} (✅ {wins} / ❌ {losses})",
             "",
-            "<b>Последние входы:</b>",
+            "<b>Последние:</b>",
         ]
-        if not fills and not merges and not resolves:
-            lines.append("пока пусто — после 🟢 Купил появится здесь")
+        if not fills and not merges:
+            lines.append("пока пусто")
         for f in fills[:10]:
             if f.get("raw"):
                 raw = f["raw"].split(" | ", 2)[-1] if " | " in f["raw"] else f["raw"]
@@ -281,7 +296,8 @@ class TelegramController:
                 shares = float(f.get("shares") or 0)
                 price = float(f.get("price") or 0)
                 asset = f.get("asset") or ""
-                lines.append(f"🟢 {side} {asset} {shares:.1f}×{price*100:.0f}¢")
+                reason = f.get("reason") or ""
+                lines.append(f"🟢 {side} {asset} {shares:.1f}×{price*100:.0f}¢ ({reason})")
         if merges:
             lines.append("")
             lines.append("<b>MERGE:</b>")
@@ -306,10 +322,11 @@ class TelegramController:
 
     def _fmt_help(self) -> str:
         return (
-            "ℹ️ <b>Помощь</b>\n━━━━━━━━━━━━━━━━\n"
-            "📊 Статус · 💰 PnL (журнал цифр)\n"
-            "📈 Позиции · 📋 Журнал сделок\n"
-            "PnL: итого, закрыто (окна+MERGE), ✅/❌."
+            "ℹ️ <b>Помощь · mo-money</b>\n━━━━━━━━━━━━━━━━\n"
+            "1) Пара Up+Down < $1 → MERGE\n"
+            "2) Maker vs fair (одна сторона)\n"
+            "3) Lock-in в конце окна\n"
+            "Рынки реальные Polymarket, баланс демо."
         )
 
     def _fmt_presets(self) -> str:
