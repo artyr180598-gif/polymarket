@@ -33,6 +33,7 @@ def test_discovery_uses_only_near_exact_rtds_sample_for_existing_window(monkeypa
         condition_id="0x" + "1" * 64,
         up_token="up-token",
         down_token="down-token",
+        fee_rate=0.0,
         start_ts=900.0,
         end_ts=1200.0,
         price_to_beat=None,
