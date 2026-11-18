@@ -1,24 +1,49 @@
-# PolyBot TWAP Hybrid
+# PolyBot — Polymarket research prototype
 
-Production-ready Polymarket crypto Up/Down (5m / 15m) trading bot modelled after verified wallets:
+> **Not production-ready. PAPER mode only. LIVE execution is deliberately blocked.**
+>
+> The current strategy is a taker-based research simulation using real Polymarket market data. It is **not** a faithful copy of the mo-money market-maker. Do not interpret simulated fills, MERGE records or PnL as real account activity or expected returns.
 
-- **@mo-money** — Post-Only Maker + synthetic TP/SL via opposite-side BUY + auto-MERGE
-- **@Bonereaper** — TWAP Lock-In (94–98¢ bids when P ≥ 99%)
-- **@dangerously-skip-permissions** — strict risk limits & inventory control
+## What the current prototype does
 
-Always starts in **paper** mode (live fills on real order books + real Chainlink/Binance streams, virtual bankroll). Live mode only after 200–300 paper windows.
+- Reads outcome order books from the Polymarket CLOB.
+- Reads Chainlink spot and 60-second TWAP from Polymarket's public RTDS stream through the official Python SDK.
+- Reads market metadata from Gamma and settled outcomes from the Polymarket Data API.
+- Simulates taker buys at the actual best ask, constrained by quantity resting at that exact price level.
+- Applies the market fee rate when Gamma publishes a per-market fee schedule; otherwise uses the configured fallback schedule.
+- Records fills, virtual MERGEs, resolutions and fees in a SQLite ledger.
+- Restores PAPER inventory and account equity from that ledger after restart, provided the database is on persistent storage.
 
-## Quick start (Railway + iPhone)
+## Strategy status
 
-1. Fork / clone this repo.
-2. Railway → New Project → Deploy from GitHub → select repo.
-3. **Region: `eu-west1` (Amsterdam)** — lowest latency to Polymarket matching engine.
-4. Add **Volume** mount path `/data` (SQLite persistence).
-5. Set variables (minimum):
+The target wallet mo-money is a market maker. Its edge depends on resting Post-Only orders, queue priority, partial fills, cancellations, spread capture and maker rebates. The current prototype does not yet reproduce those mechanics. It must not describe its current taker entries as Maker fills.
 
-```
+The next implementation stages are:
+
+1. Capture and paginate the target wallet's raw Data API trades/activity; classify maker/taker, fills, paired outcomes, order sizes, timing and merge lifecycle.
+2. Build a queue-aware Post-Only PAPER simulator using recorded CLOB book and trade events.
+3. Backtest against recorded data, accounting for fees, rebates, spread, latency, queue position and partial fills.
+4. Compare simulated fills and PnL with independent Polymarket account/ledger data.
+5. Only after independent verification, implement and separately review real order submission, fill reconciliation, cancellations, on-chain merge/redeem and restart recovery.
+
+No stage should be described as complete until its tests and data coverage are documented.
+
+## Railway deployment notes
+
+- Use TRADING_MODE=paper.
+- Set DB_PATH=/data/polybot.db.
+- Attach a Railway Volume mounted at /data; without a volume, SQLite history is ephemeral and can disappear on redeploy/restart.
+- Set a strong DASHBOARD_PIN. Protected dashboard APIs fail closed when it is missing.
+- Keep API keys and wallet secrets in Railway variables only; never commit .env or private keys.
+- The current service was observed without a Railway Volume. Persistent history is therefore **not yet guaranteed** until storage is attached and verified.
+
+## Configuration
+
+Example:
+
+```dotenv
 TRADING_MODE=paper
-DASHBOARD_PIN=123456          # 6 digits
+DASHBOARD_PIN=replace-with-a-strong-pin
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 BANKROLL_USD=2750
@@ -26,55 +51,37 @@ STRATEGY_PRESET=mo_money
 DB_PATH=/data/polybot.db
 ```
 
-6. Open the public Railway URL in Safari → enter PIN → Share → Add to Home Screen.
-7. Telegram: `/status`, `/pnl`, `/pause`, `/resume`, `/kill`, `/preset`.
+## Telegram
 
-Full iPhone/iPad guide: [GUIDE_IPHONE_RU.md](GUIDE_IPHONE_RU.md)
+The Telegram bot reports PAPER status, ledger fills, virtual MERGE events, official market resolutions and ledger-based PnL. It must distinguish virtual events from real exchange executions. /positions is restored from the ledger when persistent storage is available.
 
-## Architecture
+## Main modules
 
 ```
 main.py                 FastAPI + Uvicorn + Engine + Telegram
 bot/
-  config.py             BotConfig + 3 strategy presets
-  fees.py               Exact Polymarket fee formula + 2026-11-20 switchover
-  twap_model.py         Chainlink 60s TWAP fair-value model + Binance lead-lag
-  ledger.py             SQLite WAL (fills / merges / resolutions / equity)
-  execution.py          PaperExecutor (queue-aware) + LiveExecutor
-  engine.py             3 async loops + discovery + risk + strategies
-  telegram_ctl.py       Pure aiohttp Telegram controller
-  web.py                Mobile PWA dashboard (all HTML/JS inlined)
+  config.py             Configuration and experimental strategy presets
+  fees.py               Fee calculation and fallback schedule
+  oracle_feed.py        Public Polymarket RTDS Chainlink spot + TWAP60
+  twap_model.py         Experimental fair-value model
+  ledger.py             SQLite WAL ledger and portfolio reconstruction
+  execution.py          Paper and live executor scaffolding
+  engine.py             Market discovery, PAPER simulation, risk and resolution
+  telegram_ctl.py       Telegram status, PnL, fills and controls
+  web.py                Dashboard API and PIN guard
 ```
 
-## Risk defaults (bankroll $2 750)
+## Risk defaults
 
-| Limit                    | Value  |
-|--------------------------|--------|
-| Order clip               | $18    |
-| Max risk per window      | $60    |
-| Max total exposure       | $350   |
-| Daily loss stop          | $95    |
-| Pause after N losses     | 6      |
+The configured limits are guardrails for the PAPER prototype, not proof of a profitable strategy. Each limit must be exercised by tests before any live use.
 
-## Local / VPS
+## Validation
 
-```bash
-cp .env.example .env
-# edit .env
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python main.py
-```
-
-One-shot Ubuntu install: `sudo bash deploy/install_vps.sh`
+The repository includes CI checks for Python compilation and unit tests. CI passing is necessary but not sufficient for live trading. Integration tests against Polymarket's public APIs, data-quality checks, historical backtests and order-execution reconciliation are still required.
 
 ## Safety
 
-- Never commit `.env` or private keys.
-- Live trading: use a dedicated wallet only.
-- Check `https://polymarket.com/api/geoblock` from the server IP before enabling live.
-- Rollout path: paper 200–300 windows → live $220 → $600 → $1 300 → full bankroll. Withdraw 50% of profits to cold storage.
-
-## License
-
-Private / personal use. Not financial advice. Trade at your own risk.
+- LIVE trading raises an error at startup.
+- No real order is submitted and no on-chain MERGE/REDEEM is executed by this prototype.
+- Never commit .env, private keys, Telegram tokens or API credentials.
+- Do not enable real-money trading based on paper PnL.
