@@ -1346,6 +1346,32 @@ class TradingEngine:
             w.resolved = True
             return
 
+        # Once Gamma publishes the settled priceToBeat, compare it with the
+        # RTDS boundary sample used for trading. A material mismatch is a data
+        # integrity fault: persist it and halt new entries rather than hide it.
+        gamma_price_to_beat = None
+        anchor_delta = None
+        anchor_verified = None
+        gamma_meta = await self._gamma(w.slug)
+        if gamma_meta and gamma_meta.get("price_to_beat") is not None:
+            gamma_price_to_beat = float(gamma_meta["price_to_beat"])
+            if w.price_to_beat is None:
+                w.price_to_beat = gamma_price_to_beat
+                w.price_to_beat_source = "gamma.eventMetadata.priceToBeat"
+            else:
+                anchor_delta = abs(float(w.price_to_beat) - gamma_price_to_beat)
+                anchor_verified = anchor_delta <= 0.01
+                if not anchor_verified:
+                    self.paused = True
+                    if self.executor is not None:
+                        await self.executor.cancel_all()
+                    self._log_event(
+                        "ALERT",
+                        f"Несовпадение стартового Chainlink TWAP/Gamma priceToBeat: "
+                        f"Δ ${anchor_delta:.4f} · торговля поставлена на паузу · {w.slug}",
+                        notify=True,
+                    )
+
         payout = float(w.up_shares if winner == "Up" else w.down_shares)
         gross_cost = float(w.up_cost + w.down_cost)
         market_fees = self.ledger.fees_for_market(self.cfg.trading_mode, w.slug)
@@ -1356,6 +1382,10 @@ class TradingEngine:
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
                 price_to_beat=w.price_to_beat, final_price=w.final_price,
+                price_to_beat_source=w.price_to_beat_source,
+                gamma_price_to_beat=gamma_price_to_beat,
+                anchor_delta=anchor_delta,
+                anchor_verified=anchor_verified,
                 up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
                 merged_pairs=0.0, gross_cost=gross_cost, total_fees=market_fees, total_payout=payout,
             )
@@ -1376,9 +1406,16 @@ class TradingEngine:
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
         if gross >= 0:
-            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\nПрибыль: <b>${net:+.2f}</b>\n<code>{w.slug}</code>"
+            msg = f"✅ Окно закрыто по результату Polymarket · победил {side}\nПрибыль: <b>${net:+.2f}</b>"
         else:
-            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\nУбыток: <b>${net:+.2f}</b>\n<code>{w.slug}</code>"
+            msg = f"❌ Окно закрыто по результату Polymarket · победил {side}\nУбыток: <b>${net:+.2f}</b>"
+        if anchor_verified is True:
+            msg += f"\nПроверка стартового TWAP: OK · Δ ${anchor_delta:.4f}"
+        elif anchor_verified is False:
+            msg += f"\n⚠️ Несовпадение стартового TWAP · Δ ${anchor_delta:.4f} · бот на паузе"
+        else:
+            msg += "\nПроверка стартового TWAP: Gamma-сверка пока недоступна"
+        msg += f"\n<code>{w.slug}</code>"
         self._log_event("INFO", msg, notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
