@@ -177,6 +177,7 @@ class PaperExecutor:
             if (
                 not is_sell_aggressor
                 or last_trade_price is None
+                or not math.isfinite(last_trade_price)
                 or not math.isfinite(last_trade_size)
                 or last_trade_size <= 0
                 or last_trade_price > o.price + 1e-9
