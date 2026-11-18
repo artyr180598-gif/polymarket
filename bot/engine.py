@@ -1,4 +1,9 @@
-"""TradingEngine: discovery, streams, strategies, risk, resolve, Telegram notify."""
+"""TradingEngine — Polymarket Up/Down paper/live trading.
+
+Сделки только на Polymarket (CLOB Up/Down).
+Chainlink TWAP60 — источник резолва окон.
+Binance spot — только lead-lag сигнал для fair value (не биржа сделок).
+"""
 
 from __future__ import annotations
 
@@ -49,7 +54,7 @@ class WindowState:
     best_ask_up: float = 1.0
     best_bid_down: float = 0.0
     best_ask_down: float = 1.0
-    bid_size_up: float = 0.0
+    last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
 
@@ -80,7 +85,7 @@ class TradingEngine:
         self.running = False
         self.paused = not cfg.auto_start
         self._tasks: List[asyncio.Task] = []
-        self.executor = None
+        self.executor: Any = None
         self.cash = float(cfg.bankroll_usd)
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
@@ -116,7 +121,8 @@ class TradingEngine:
         else:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"PaperExecutor bankroll=${self.cfg.bankroll_usd:.0f}", notify=True)
+            self._log_event("INFO", f"Демо-счёт ${self.cfg.bankroll_usd:.0f} · сделки на Polymarket (paper)", notify=True)
+
         self.running = True
         self._tasks = [
             asyncio.create_task(self._price_loop(), name="prices"),
@@ -124,7 +130,7 @@ class TradingEngine:
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
         ]
-        self._log_event("INFO", f"Engine started mode={self.cfg.trading_mode} preset={self.cfg.strategy_preset}", notify=True)
+        self._log_event("INFO", f"Старт · {self.cfg.trading_mode} · {self.cfg.strategy_preset}", notify=True)
 
     async def stop(self) -> None:
         self.running = False
@@ -146,7 +152,7 @@ class TradingEngine:
             return False
         self.cfg.strategy_preset = key
         self.params = PRESETS[key]
-        self._log_event("INFO", f"Пресет → {key}", notify=True)
+        self._log_event("INFO", f"Пресет → {PRESETS[key].title_ru}", notify=True)
         return True
 
     async def emergency_kill(self) -> Dict[str, Any]:
@@ -158,17 +164,19 @@ class TradingEngine:
         for w in list(self.windows.values()):
             if w.mergeable_pairs >= 1.0 and not w.merge_in_flight:
                 merged += await self._execute_merge(w)
-        self._log_event("ALERT", f"KILL: canceled={canceled} merged=${merged:.2f}", notify=True)
+        self._log_event("ALERT", f"СТОП: ордеров {canceled}, merge ${merged:.2f}", notify=True)
         return {"canceled": canceled, "merged_usd": round(merged, 2)}
 
     async def _price_loop(self) -> None:
         if not HAS_POLY:
-            self._log_event("WARNING", "Нет polymarket-client — fair недоступен", notify=True)
+            self._log_event("WARNING", "polymarket-client не установлен", notify=True)
             while self.running:
-                await asyncio.sleep(10)
+                await asyncio.sleep(20)
             return
         cl_syms = [f"{a.lower()}/usd" for a in self.cfg.enabled_assets]
         bn_syms = [f"{a.lower()}usdt" for a in self.cfg.enabled_assets]
+        notified = False
+        backoff = 3.0
         while self.running:
             try:
                 client = AsyncPublicClient()
@@ -178,7 +186,10 @@ class TradingEngine:
                     CryptoPricesSpec(topic="prices.crypto.binance", symbols=bn_syms),
                 ]
                 self._streams_ok = True
-                self._log_event("INFO", "Потоки Chainlink TWAP60 + Spot + Binance подключены", notify=True)
+                backoff = 3.0
+                if not notified:
+                    self._log_event("INFO", "Цены подключены (Chainlink TWAP = резолв окон Polymarket)", notify=True)
+                    notified = True
                 async for ev in client.stream(specs):
                     if not self.running:
                         break
@@ -200,19 +211,21 @@ class TradingEngine:
                             tr.on_chainlink_spot(val, ts_ms)
                     except Exception:
                         pass
+                await asyncio.sleep(1.0)
             except Exception as e:
                 self._streams_ok = False
-                self._log_event("WARNING", f"Потоки переподключение: {e}")
-                await asyncio.sleep(3)
+                log.warning("stream reconnect in %.0fs: %s", backoff, e)
+                await asyncio.sleep(backoff)
+                backoff = min(90.0, backoff * 1.8)
 
     def _capture_boundary(self, asset: str, ts: float, twap_val: float) -> None:
         for w in self.windows.values():
             if w.asset != asset:
                 continue
-            if w.price_to_beat is None and -2.0 <= (ts - w.start_ts) <= 12.0:
+            if w.price_to_beat is None and -2.0 <= (ts - w.start_ts) <= 15.0:
                 w.price_to_beat = twap_val
                 self._log_event("INFO", f"{w.slug}: priceToBeat=${twap_val:,.2f}")
-            if w.final_price is None and -2.0 <= (ts - w.end_ts) <= 12.0:
+            if w.final_price is None and -2.0 <= (ts - w.end_ts) <= 15.0:
                 w.final_price = twap_val
 
     async def _discovery_loop(self) -> None:
@@ -222,11 +235,11 @@ class TradingEngine:
                 self._prune_windows()
             except Exception as e:
                 log.warning("discovery: %s", e)
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
 
     def _prune_windows(self) -> None:
         now = time.time()
-        dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 90 and w.mergeable_pairs < 1)]
+        dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 60 and w.mergeable_pairs < 0.5)]
         for s in dead:
             del self.windows[s]
 
@@ -236,10 +249,10 @@ class TradingEngine:
             for tf in self.cfg.enabled_timeframes:
                 sec = 300 if tf == "5m" else 900
                 base = int(now // sec) * sec
-                for offset in (0, 1, 2):
+                for offset in (0, 1):
                     start = base + offset * sec
                     end = start + sec
-                    if end <= now:
+                    if end <= now + 5:
                         continue
                     slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
                     if slug in self.windows:
@@ -254,18 +267,19 @@ class TradingEngine:
                         start_ts=float(start), end_ts=float(end),
                         price_to_beat=meta.get("price_to_beat"),
                     )
-                    if w.price_to_beat is None and asset in self.trackers:
-                        ptb = self.trackers[asset].lookup_twap_at(float(start), max_diff_sec=12.0)
+                    if w.price_to_beat is None:
+                        ptb = self.trackers[asset].lookup_twap_at(float(start), max_diff_sec=15.0)
                         if ptb:
                             w.price_to_beat = ptb
                     self.windows[slug] = w
-                    self._log_event("INFO", f"Окно: {slug} τ={w.remain_sec:.0f}s")
+                    self._log_event("INFO", f"Окно Polymarket: {slug} τ={w.remain_sec:.0f}s")
 
-    async def _fetch_gamma(self, slug: str) -> Optional[Dict[str, Any]]:
+    async def _fetch_gamma(self, slug: str):
         url = f"https://gamma-api.polymarket.com/events?slug={slug}"
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url) as r:
                     if r.status != 200:
                         return None
                     data = await r.json()
@@ -302,13 +316,13 @@ class TradingEngine:
             try:
                 if not self.paused and not self._risk_halted():
                     for w in list(self.windows.values()):
-                        if w.resolved or w.remain_sec < 8:
+                        if w.resolved or w.remain_sec < 10:
                             continue
                         await self._run_strategies(w)
                         await self._try_merge(w)
             except Exception as e:
                 log.warning("strategy: %s", e)
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(0.8)
 
     def _risk_halted(self) -> bool:
         if self.day_pnl <= -self.cfg.max_daily_loss_usd:
@@ -319,118 +333,94 @@ class TradingEngine:
 
     async def _run_strategies(self, w: WindowState) -> None:
         if w.price_to_beat is None:
-            ptb = self.trackers[w.asset].lookup_twap_at(w.start_ts, max_diff_sec=15.0)
+            ptb = self.trackers[w.asset].lookup_twap_at(w.start_ts, max_diff_sec=20.0)
             if ptb:
                 w.price_to_beat = ptb
             else:
-                return
+                tr = self.trackers[w.asset]
+                if tr.cl_spot and w.remain_sec > 60:
+                    w.price_to_beat = tr.cl_spot
+                else:
+                    return
         fv = self.trackers[w.asset].compute_fair_value(w.price_to_beat, w.end_ts)
         p = self.params
         tau = w.remain_sec
-        ask_up = w.best_ask_up if 0 < w.best_ask_up < 1 else min(0.99, max(0.01, round(fv.prob_up + 0.02, 2)))
-        bid_up = w.best_bid_up if 0 < w.best_bid_up < 1 else max(0.01, round(fv.prob_up - 0.02, 2))
+        if time.monotonic() - w.last_trade_mono < 8.0:
+            return
+        ask_up = w.best_ask_up if 0.01 < w.best_ask_up < 0.99 else min(0.98, round(fv.prob_up + 0.03, 2))
+        bid_up = w.best_bid_up if 0.01 < w.best_bid_up < 0.99 else max(0.02, round(fv.prob_up - 0.03, 2))
 
         if getattr(p, "enable_lockin", True) and tau <= getattr(p, "lockin_start_remain_sec", 120):
             if fv.prob_up >= getattr(p, "lockin_min_prob", 0.99):
                 bid = min(getattr(p, "lockin_max_bid", 0.98), round(fv.prob_up - 0.01, 2))
-                if bid >= 0.94:
+                if bid >= 0.94 and w.up_shares < 40:
                     size = max(5.0, round(self.cfg.order_clip_usd / bid, 2))
-                    await self._place_maker(w, "Up", bid, size, "lockin_maker", ask_up)
+                    await self._open_position(w, "Up", bid, size, "lockin")
+                    return
 
         if getattr(p, "enable_maker", True) and tau >= getattr(p, "maker_start_sec", 6):
             edge = fv.prob_up - ask_up
-            if edge >= getattr(p, "min_maker_edge", 0.024) and getattr(p, "maker_min_price", 0.30) <= fv.prob_up <= getattr(p, "maker_max_price", 0.89):
+            lo = getattr(p, "maker_min_price", 0.30)
+            hi = getattr(p, "maker_max_price", 0.89)
+            if edge >= getattr(p, "min_maker_edge", 0.024) and lo <= fv.prob_up <= hi:
                 px = min(round(fv.prob_up - 0.005, 2), bid_up + 0.01, ask_up - 0.01)
-                if px >= getattr(p, "maker_min_price", 0.30):
-                    size = max(5.0, round(self.cfg.order_clip_usd / px, 2))
-                    await self._place_maker(w, "Up", px, size, "maker_entry", ask_up)
-            if w.up_shares >= 5 and w.down_shares < w.up_shares:
+                if px >= lo and w.up_shares < 50:
+                    size = max(5.0, round(self.cfg.order_clip_usd / max(px, 0.05), 2))
+                    await self._open_position(w, "Up", px, size, "maker_entry")
+                    return
+            if w.up_shares >= 5 and w.down_shares < w.up_shares - 0.5:
                 target = 1.0 - w.entry_vwap_up - getattr(p, "take_profit_edge", 0.015)
                 if target > 0.05:
-                    need = w.up_shares - w.down_shares
-                    await self._place_maker(w, "Down", min(round(target, 2), 0.97), need, "syn_tp", w.best_ask_down or 0.99)
+                    need = round(w.up_shares - w.down_shares, 2)
+                    if need >= 5:
+                        await self._open_position(w, "Down", min(round(target, 2), 0.97), need, "syn_tp")
+                        return
 
-        if getattr(p, "enable_taker", True) and 5 <= tau <= 280 and 0 < w.best_ask_up < 1:
+        if getattr(p, "enable_taker", True) and 12 <= tau <= 240 and 0.05 < w.best_ask_up < 0.95:
             fee_ps = calc_taker_fee_per_share(w.best_ask_up, w.asset, w.timeframe)
-            net_edge = fv.prob_up - w.best_ask_up - fee_ps
-            min_edge = getattr(p, "min_taker_net_edge_btc", 0.038) if w.asset == "BTC" else getattr(p, "min_taker_net_edge_alt", 0.024)
-            if net_edge >= min_edge:
+            net = fv.prob_up - w.best_ask_up - fee_ps
+            min_e = getattr(p, "min_taker_net_edge_btc", 0.038) if w.asset == "BTC" else getattr(p, "min_taker_net_edge_alt", 0.024)
+            if net >= min_e and w.up_shares < 40:
                 size = max(5.0, round(self.cfg.order_clip_usd / w.best_ask_up, 2))
-                await self._place_taker(w, "Up", size, w.best_ask_up)
+                await self._open_position(w, "Up", w.best_ask_up, size, "taker", taker=True)
 
-    async def _place_maker(self, w, outcome, price, size, reason, best_ask) -> None:
-        if not self.executor:
-            return
-        token = w.up_token if outcome == "Up" else w.down_token
-        if any(o == outcome for o in w.open_orders.values()):
-            return
+    async def _open_position(self, w, outcome, price, size, reason, taker=False) -> None:
         price = round(max(0.01, min(0.99, price)), 2)
         size = round(max(5.0, size), 2)
-        oid = None
-        if hasattr(self.executor, "place_post_only_buy"):
-            oid = await self.executor.place_post_only_buy(
-                token, price, size, best_bid=price - 0.01,
-                best_ask=best_ask if best_ask > 0 else price + 0.02, bid_size_at_or_better=0.0,
-            )
-        if not oid:
-            return
-        w.open_orders[str(oid)] = outcome
-        self._log_event("INFO", f"MAKER {outcome} {size:.1f}@{price:.2f} {w.asset} {reason}", notify=True)
-        if self.cfg.trading_mode == "paper" and reason in ("lockin_maker", "maker_entry", "syn_tp"):
-            await self._paper_sim_fill(w, outcome, price, size, reason, str(oid))
-
-    async def _paper_sim_fill(self, w, outcome, price, size, reason, order_id) -> None:
-        await asyncio.sleep(0.15)
+        cost = price * size
+        if cost > self.cash + 1e-6:
+            size = max(5.0, round((self.cash * 0.95) / max(price, 0.01), 2))
+            cost = price * size
+            if size < 5:
+                return
+        role = "TAKER" if taker else "MAKER"
+        fee = calc_taker_fee_per_share(price, w.asset, w.timeframe) * size if taker else 0.0
+        self.cash -= cost + fee
         if outcome == "Up":
             w.up_shares += size
-            w.up_cost += price * size
+            w.up_cost += cost
         else:
             w.down_shares += size
-            w.down_cost += price * size
-        w.open_orders.pop(order_id, None)
-        try:
-            self.ledger.record_fill(
-                mode="paper", slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="MAKER",
-                reason=reason, shares=size, price=price, fee=0.0,
-                fair_prob=price, tx_or_order_id=order_id,
-            )
-        except Exception:
-            pass
-        self._log_event("INFO", f"FILL MAKER {outcome} {size:.1f}@{price:.2f} {w.asset} [{reason}] (0% fee)", notify=True)
-
-    async def _place_taker(self, w, outcome, size, ask) -> None:
-        if not self.executor or not hasattr(self.executor, "place_market_buy"):
-            return
-        token = w.up_token if outcome == "Up" else w.down_token
-        fill = await self.executor.place_market_buy(token, size, best_ask=ask, asset=w.asset, timeframe=w.timeframe)
-        if not fill:
-            return
-        fee = getattr(fill, "fee", 0.0) or 0.0
-        if outcome == "Up":
-            w.up_shares += fill.size
-            w.up_cost += fill.price * fill.size
-        else:
-            w.down_shares += fill.size
-            w.down_cost += fill.price * fill.size
+            w.down_cost += cost
+        w.last_trade_mono = time.monotonic()
         self.fees_paid += fee
-        self.cash = getattr(self.executor, "cash", self.cash)
         try:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER",
-                reason="sniper_taker", shares=fill.size, price=fill.price, fee=fee,
-                fair_prob=0.0, tx_or_order_id=getattr(fill, "order_id", ""),
+                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role=role,
+                reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
+                tx_or_order_id=f"paper-{int(time.time())}",
             )
         except Exception:
             pass
-        self._log_event("INFO", f"TAKER {outcome} {fill.size:.1f}@{fill.price:.2f} fee=${fee:.3f}", notify=True)
+        fee_s = f" fee ${fee:.3f}" if fee else " 0% fee"
+        self._log_event("INFO", f"{'⚡' if taker else '🟢'} {role} {outcome} {size:.1f}@{price:.2f} {w.asset} [{reason}]{fee_s}\n<code>{w.slug}</code>", notify=True)
 
     async def _try_merge(self, w) -> None:
         pairs = w.mergeable_pairs
-        if pairs < 1.0 or w.merge_in_flight:
+        if pairs < 5.0 and not (pairs >= 1.0 and abs(w.net_shares) < 0.5):
             return
-        if pairs < 5.0 and abs(w.net_shares) > 0.5:
+        if w.merge_in_flight:
             return
         await self._execute_merge(w)
 
@@ -440,27 +430,25 @@ class TradingEngine:
             return 0.0
         w.merge_in_flight = True
         try:
-            res = await self.executor.merge_positions(w.condition_id, pairs)
-            if not res.get("ok"):
-                return 0.0
-            cost = 0.0
-            if w.up_shares > 0:
-                cost += (pairs / w.up_shares) * w.up_cost
-            if w.down_shares > 0:
-                cost += (pairs / w.down_shares) * w.down_cost
-            locked = pairs - cost
+            up_part = (pairs / w.up_shares) * w.up_cost if w.up_shares > 0 else 0.0
+            dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares > 0 else 0.0
+            cost = up_part + dn_part
+            locked = pairs * 1.0 - cost
             w.up_shares = max(0.0, w.up_shares - pairs)
             w.down_shares = max(0.0, w.down_shares - pairs)
+            w.up_cost = max(0.0, w.up_cost - up_part)
+            w.down_cost = max(0.0, w.down_cost - dn_part)
             self.cash += pairs
             self.realized_pnl += locked
             try:
                 self.ledger.record_merge(
                     mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=str(res.get("tx", "")),
+                    pairs=pairs, cost_basis=cost, locked_pnl=locked,
+                    tx_hash=f"paper-merge-{int(time.time())}",
                 )
             except Exception:
                 pass
-            self._log_event("INFO", f"MERGE {pairs:.1f} pairs ${locked:+.2f}", notify=True)
+            self._log_event("INFO", f"♻️ MERGE {pairs:.1f} пар → ${locked:+.2f} · <code>{w.slug}</code>", notify=True)
             return pairs
         finally:
             w.merge_in_flight = False
@@ -469,19 +457,20 @@ class TradingEngine:
         while self.running:
             try:
                 for w in list(self.windows.values()):
-                    if w.resolved or w.remain_sec > -20:
+                    if w.resolved or w.remain_sec > -15:
                         continue
                     await self._resolve_window(w)
             except Exception as e:
                 log.warning("resolve: %s", e)
-            await asyncio.sleep(5)
+            await asyncio.sleep(6)
 
     async def _resolve_window(self, w) -> None:
         winner = None
         try:
             url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url) as r:
                     if r.status == 200:
                         data = await r.json()
                         items = data.get("data") if isinstance(data, dict) else data
@@ -494,9 +483,19 @@ class TradingEngine:
             pass
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
+        if winner is None and w.price_to_beat is not None:
+            tw = self.trackers[w.asset].twap60
+            if tw is not None and w.remain_sec <= 0:
+                winner = "Up" if tw >= w.price_to_beat else "Down"
         if winner is None:
             return
-        gross = (w.up_shares if winner == "Up" else w.down_shares) - w.up_cost - w.down_cost
+        if winner == "Up":
+            payout = w.up_shares * 1.0
+            gross = payout - w.up_cost - w.down_cost
+        else:
+            payout = w.down_shares * 1.0
+            gross = payout - w.up_cost - w.down_cost
+        self.cash += payout
         net = gross
         self.realized_pnl += net
         self.day_pnl += net
@@ -511,8 +510,10 @@ class TradingEngine:
             )
         except Exception:
             pass
+        w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
-        self._log_event("INFO", f"RESOLVED {winner} net ${net:+.2f}", notify=True)
+        emoji = "✅" if net >= 0 else "❌"
+        self._log_event("INFO", f"{emoji} RESOLVED <b>{winner}</b> · Net <b>${net:+.2f}</b>\n<code>{w.slug}</code>", notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
         try:
@@ -523,7 +524,7 @@ class TradingEngine:
         now = time.time()
         windows = []
         for w in self.windows.values():
-            if w.resolved or w.end_ts < now - 5:
+            if w.resolved or w.end_ts < now - 3:
                 continue
             fair = None
             if w.price_to_beat is not None:
@@ -551,7 +552,7 @@ class TradingEngine:
             "cash": round(self.cash, 2),
             "realized_pnl": round(self.realized_pnl, 2),
             "day_pnl": round(self.day_pnl, 2),
-            "total_exposure": 0.0,
+            "total_exposure": round(sum(max(w.up_shares, w.down_shares) * 0.5 for w in self.windows.values() if not w.resolved), 2),
             "stats": stats,
             "windows": windows,
             "events": self.events[-40:],
