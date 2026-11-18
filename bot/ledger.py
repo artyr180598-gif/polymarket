@@ -94,6 +94,21 @@ class Ledger:
             );
             """
         )
+        # Additive migrations for auditable settlement-anchor verification.
+        existing_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(resolutions)")
+        }
+        migrations = {
+            "price_to_beat_source": "TEXT NOT NULL DEFAULT ''",
+            "gamma_price_to_beat": "REAL",
+            "anchor_delta": "REAL",
+            "anchor_verified": "INTEGER",
+        }
+        for column, definition in migrations.items():
+            if column not in existing_columns:
+                self.conn.execute(
+                    f"ALTER TABLE resolutions ADD COLUMN {column} {definition}"
+                )
         self.conn.commit()
 
     def record_fill(
@@ -194,6 +209,10 @@ class Ledger:
         winner: str,
         price_to_beat: float | None,
         final_price: float | None,
+        price_to_beat_source: str = "",
+        gamma_price_to_beat: float | None = None,
+        anchor_delta: float | None = None,
+        anchor_verified: bool | None = None,
         up_shares_total: float,
         down_shares_total: float,
         merged_pairs: float,
@@ -208,13 +227,16 @@ class Ledger:
             INSERT OR REPLACE INTO resolutions (
                 ts, mode, slug, condition_id, asset, timeframe, winner, price_to_beat, final_price,
                 up_shares_total, down_shares_total, merged_pairs, gross_cost, total_fees,
-                total_payout, gross_pnl, net_pnl
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                total_payout, gross_pnl, net_pnl, price_to_beat_source,
+                gamma_price_to_beat, anchor_delta, anchor_verified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 time.time(), mode, slug, condition_id, asset, timeframe, winner,
                 price_to_beat, final_price, up_shares_total, down_shares_total,
                 merged_pairs, gross_cost, total_fees, total_payout, gross_pnl, net_pnl,
+                price_to_beat_source, gamma_price_to_beat, anchor_delta,
+                None if anchor_verified is None else int(anchor_verified),
             ),
         )
         self.conn.commit()
