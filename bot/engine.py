@@ -40,6 +40,8 @@ class WindowState:
     down_shares: float = 0.0
     up_cost: float = 0.0
     down_cost: float = 0.0
+    up_fees: float = 0.0
+    down_fees: float = 0.0
     last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
@@ -205,6 +207,8 @@ class TradingEngine:
             window.down_shares = float(position["down_shares"])
             window.up_cost = float(position["up_cost"])
             window.down_cost = float(position["down_cost"])
+            window.up_fees = float(position.get("up_fees", 0.0))
+            window.down_fees = float(position.get("down_fees", 0.0))
             self.windows[slug] = window
             self._log_event(
                 "INFO",
@@ -529,8 +533,9 @@ class TradingEngine:
             need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
+                fee_up_per_share = w.up_fees / max(w.up_shares, 1e-9)
                 fee = calc_taker_fee_usdc(need, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
-                if need * ask_dn + fee + need * vwap_up < need * 0.998:
+                if need * ask_dn + fee + need * (vwap_up + fee_up_per_share) < need * 0.998:
                     await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
@@ -538,8 +543,9 @@ class TradingEngine:
             need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
+                fee_dn_per_share = w.down_fees / max(w.down_shares, 1e-9)
                 fee = calc_taker_fee_usdc(need, ask_up, w.asset, w.timeframe, market_override_rate=w.fee_rate)
-                if need * ask_up + fee + need * vwap_dn < need * 0.998:
+                if need * ask_up + fee + need * (vwap_dn + fee_dn_per_share) < need * 0.998:
                     await self._open(w, "Up", float(ask_up), need, "syn_tp", fee=fee, fair_prob=fair_up)
                     await self._try_merge(w)
                     return
@@ -642,6 +648,8 @@ class TradingEngine:
         w.down_shares += size
         w.up_cost += size * price_up
         w.down_cost += size * price_down
+        w.up_fees += fee_up
+        w.down_fees += fee_down
         w.last_trade_mono = time.monotonic()
         self.cash -= combined_cost
         self.fees_paid += fee_up + fee_down
@@ -698,9 +706,11 @@ class TradingEngine:
         if outcome == "Up":
             w.up_shares += size
             w.up_cost += price * size
+            w.up_fees += fee
         else:
             w.down_shares += size
             w.down_cost += price * size
+            w.down_fees += fee
         w.last_trade_mono = time.monotonic()
         self._fill_history.insert(0, fill)
         self._fill_history = self._fill_history[:80]
@@ -724,11 +734,17 @@ class TradingEngine:
             return
         if w.merge_in_flight:
             return
-        if w.up_shares > 0 and w.down_shares > 0 and w.remain_sec > 20:
-            up_part = (pairs / w.up_shares) * w.up_cost
-            dn_part = (pairs / w.down_shares) * w.down_cost
-            if (up_part + dn_part) > pairs * 0.99:
-                return
+        if w.up_shares <= 0 or w.down_shares <= 0:
+            return
+        up_part = (pairs / w.up_shares) * w.up_cost
+        dn_part = (pairs / w.down_shares) * w.down_cost
+        up_fee_part = (pairs / w.up_shares) * w.up_fees
+        dn_fee_part = (pairs / w.down_shares) * w.down_fees
+        net_locked_after_fees = pairs - up_part - dn_part - up_fee_part - dn_fee_part
+        # A merge is economically positive only after both legs' entry fees.
+        # Emergency kill still bypasses this guard to reduce outstanding risk.
+        if w.remain_sec > 20 and net_locked_after_fees <= 0:
+            return
         await self._execute_merge(w)
 
     async def _execute_merge(self, w: WindowState) -> float:
@@ -739,8 +755,11 @@ class TradingEngine:
         try:
             up_part = (pairs / w.up_shares) * w.up_cost if w.up_shares else 0.0
             dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares else 0.0
+            up_fee_part = (pairs / w.up_shares) * w.up_fees if w.up_shares else 0.0
+            dn_fee_part = (pairs / w.down_shares) * w.down_fees if w.down_shares else 0.0
             cost = up_part + dn_part
             locked = pairs - cost
+            net_locked = locked - up_fee_part - dn_fee_part
             try:
                 self.ledger.record_merge(
                     mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
@@ -753,14 +772,21 @@ class TradingEngine:
             w.down_shares = max(0.0, w.down_shares - pairs)
             w.up_cost = max(0.0, w.up_cost - up_part)
             w.down_cost = max(0.0, w.down_cost - dn_part)
+            w.up_fees = max(0.0, w.up_fees - up_fee_part)
+            w.down_fees = max(0.0, w.down_fees - dn_fee_part)
             self.cash += pairs
             self.realized_pnl += locked
-            self.day_pnl += locked
-            self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked})
+            self.day_pnl += net_locked
+            self._merge_history.insert(0, {
+                "ts": time.time(), "slug": w.slug, "pairs": pairs,
+                "locked_pnl": locked, "net_pnl": net_locked,
+            })
             self._merge_history = self._merge_history[:40]
             self._log_event(
                 "INFO",
-                f"♻️ MERGE: закрыл {pairs:.1f} пар\nGross до комиссий: ${locked:+.2f}\n<code>{w.slug}</code>",
+                f"♻️ MERGE: закрыл {pairs:.1f} пар\n"
+                f"Gross: ${locked:+.2f} · комиссии входа: ${up_fee_part + dn_fee_part:.2f}\n"
+                f"Net: ${net_locked:+.2f}\n<code>{w.slug}</code>",
                 notify=True,
             )
             return pairs
