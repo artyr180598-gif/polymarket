@@ -1,0 +1,20 @@
+[Unit]
+Description=PolyBot TWAP Hybrid (Polymarket Trading Bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polybot
+EnvironmentFile=/opt/polybot/.env
+ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/main.py
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
