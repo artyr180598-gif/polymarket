@@ -260,3 +260,29 @@ def test_gamma_active_event_ignores_metadata_price_to_beat(monkeypatch) -> None:
     assert result["price_to_beat_source"] == ""
     assert result["fee_rate"] == 0.25
     engine.ledger.conn.close()
+
+
+
+def test_oracle_tracker_rejects_out_of_order_spot_and_twap_updates() -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    tracker = AssetPriceTracker("BTC")
+    tracker.on_chainlink_spot(100_000.0, 1_000_000)
+    tracker.on_chainlink_spot(99_000.0, 999_000)
+    assert tracker.cl_spot == 100_000.0
+    assert tracker.cl_spot_ts == 1_000.0
+
+    tracker.on_chainlink_twap60(100_001.0, 1_000_000)
+    tracker.on_chainlink_twap60(99_001.0, 999_000)
+    assert tracker.cl_twap60 == 100_001.0
+    assert tracker.cl_twap60_ts == 1_000.0
+
+
+def test_binance_basis_tracker_rejects_out_of_order_spot_updates() -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    tracker = AssetPriceTracker("BTC")
+    tracker.on_binance_spot(100_010.0, 1_000_000)
+    tracker.on_binance_spot(99_010.0, 999_000)
+    assert tracker.bn_spot == 100_010.0
+    assert tracker.bn_spot_ts == 1_000.0
