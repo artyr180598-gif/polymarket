@@ -137,6 +137,69 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
     }
 
 
+async def check_strike_reconciliation(
+    session: aiohttp.ClientSession,
+    current_start_ts: int,
+) -> dict[str, float]:
+    # Use a market that closed at least 25 minutes ago so Gamma has time to
+    # publish the settled priceToBeat field.
+    start_ts = current_start_ts - 1800
+    slug = f"btc-updown-5m-{start_ts}"
+    event = None
+    gamma_strike = None
+    for _ in range(15):
+        rows = await get_json(
+            session,
+            "https://gamma-api.polymarket.com/events",
+            {"slug": slug},
+        )
+        if isinstance(rows, list) and rows:
+            event = rows[0]
+            sources = [event, *(event.get("markets") or [])[:1]]
+            for source in sources:
+                metadata = source.get("eventMetadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if isinstance(metadata, dict) and metadata.get("priceToBeat") is not None:
+                    gamma_strike = float(metadata["priceToBeat"])
+                    break
+        if gamma_strike is not None and gamma_strike > 0:
+            break
+        await asyncio.sleep(1.0)
+    if gamma_strike is None or gamma_strike <= 0:
+        raise RuntimeError(f"Gamma did not publish settled priceToBeat for {slug}")
+
+    start_iso = datetime.fromtimestamp(start_ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = datetime.fromtimestamp(start_ts + 300, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = await get_json(
+        session,
+        "https://polymarket.com/api/crypto/crypto-price",
+        {
+            "symbol": "BTC",
+            "eventStartTime": start_iso,
+            "endDate": end_iso,
+            "variant": "fiveminute",
+        },
+    )
+    if not isinstance(payload, dict) or payload.get("openPrice") is None:
+        raise RuntimeError(f"Polymarket crypto-price missing historical openPrice for {slug}")
+    open_price = float(payload["openPrice"])
+    delta = abs(open_price - gamma_strike)
+    if delta > 0.01:
+        raise RuntimeError(
+            f"Strike mismatch for {slug}: crypto-price openPrice={open_price}, "
+            f"Gamma priceToBeat={gamma_strike}, delta={delta}"
+        )
+    return {
+        "crypto_price_open": open_price,
+        "gamma_price_to_beat": gamma_strike,
+        "absolute_delta": delta,
+    }
+
+
 async def check_clob_websocket(token_id: str) -> dict[str, bool]:
     iterator = PolymarketMarketFeed([token_id]).events().__aiter__()
     got_book = False
@@ -182,12 +245,17 @@ async def main() -> None:
         # RTDS uses its own SDK websocket client; HTTP checks share this session.
         rtds = await check_rtds()
         gamma_clob = await check_gamma_and_clob(session)
+        strike_reconciliation = await check_strike_reconciliation(
+            session,
+            int(gamma_clob["slug"].rsplit("-", 1)[1]),
+        )
         clob_ws = await check_clob_websocket(gamma_clob["clob_token_ids"][0])
         data_api = await check_data_api(session)
     print(json.dumps({
         "status": "PASS",
         "rtds_chainlink": rtds,
         "gamma_and_clob": gamma_clob,
+        "strike_reconciliation": strike_reconciliation,
         "clob_websocket": clob_ws,
         "data_api_v2": data_api,
     }, indent=2))
