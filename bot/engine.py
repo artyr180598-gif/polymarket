@@ -1,4 +1,4 @@
-"""TradingEngine — paper/live Polymarket. Coinbase prices, guarded MERGE."""
+"""TradingEngine — paper/live. Forced window settle for correct journal."""
 
 from __future__ import annotations
 
@@ -229,7 +229,7 @@ class TradingEngine:
             try:
                 await self._discover()
                 now = time.time()
-                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 60 and w.mergeable_pairs < 0.5)]
+                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 180)]
                 for s in dead:
                     del self.windows[s]
             except Exception as e:
@@ -383,7 +383,8 @@ class TradingEngine:
             w.down_cost += cost
         w.last_trade_mono = time.monotonic()
         fill = {"ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
-                "outcome": outcome, "role": "MAKER", "reason": reason, "shares": size, "price": price, "fee": 0.0, "notional": cost}
+                "outcome": outcome, "role": "MAKER", "reason": reason, "shares": size, "price": price,
+                "fee": 0.0, "notional": cost}
         self._fill_history.insert(0, fill)
         self._fill_history = self._fill_history[:80]
         try:
@@ -405,7 +406,7 @@ class TradingEngine:
             return
         if w.merge_in_flight:
             return
-        if w.up_shares > 0 and w.down_shares > 0:
+        if w.up_shares > 0 and w.down_shares > 0 and w.remain_sec > 15:
             up_part = (pairs / w.up_shares) * w.up_cost
             dn_part = (pairs / w.down_shares) * w.down_cost
             if (up_part + dn_part) > pairs * 0.995:
@@ -435,7 +436,7 @@ class TradingEngine:
                 self.ledger.record_merge(mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id, pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}")
             except Exception as e:
                 log.warning("record_merge: %s", e)
-            self._log_event("INFO", f"♻️ MERGE: закрыл {pairs:.1f} пар Up+Down\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>", notify=True)
+            self._log_event("INFO", f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>", notify=True)
             return pairs
         finally:
             w.merge_in_flight = False
@@ -444,19 +445,22 @@ class TradingEngine:
         while self.running:
             try:
                 for w in list(self.windows.values()):
-                    if w.resolved or w.remain_sec > -15:
+                    if w.resolved:
+                        continue
+                    if w.remain_sec > -3:
                         continue
                     await self._resolve(w)
             except Exception as e:
                 log.warning("resolve: %s", e)
-            await asyncio.sleep(6)
+            await asyncio.sleep(3)
 
     async def _resolve(self, w: WindowState) -> None:
         winner = None
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}") as r:
+                url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
+                async with s.get(url) as r:
                     if r.status == 200:
                         data = await r.json()
                         items = data.get("data") if isinstance(data, dict) else data
@@ -467,13 +471,22 @@ class TradingEngine:
                                 winner = "Up" if payouts and float(payouts[0]) > 0 else "Down"
         except Exception:
             pass
+        spot = getattr(self.trackers[w.asset], "cl_spot", None)
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
-        if winner is None and w.price_to_beat is not None:
-            spot = getattr(self.trackers[w.asset], "cl_spot", None)
-            if spot is not None:
+        if winner is None and w.price_to_beat is not None and spot is not None:
+            winner = "Up" if spot >= w.price_to_beat else "Down"
+        if winner is None and w.remain_sec <= -20:
+            if w.price_to_beat and spot:
                 winner = "Up" if spot >= w.price_to_beat else "Down"
+            elif w.up_shares >= w.down_shares:
+                winner = "Down"
+            else:
+                winner = "Up"
         if winner is None:
+            return
+        if w.up_shares < 0.01 and w.down_shares < 0.01:
+            w.resolved = True
             return
         payout = float(w.up_shares if winner == "Up" else w.down_shares)
         gross_cost = float(w.up_cost + w.down_cost)
@@ -486,13 +499,13 @@ class TradingEngine:
             self.ledger.record_resolution(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
-                price_to_beat=w.price_to_beat, final_price=w.final_price,
+                price_to_beat=w.price_to_beat, final_price=w.final_price or spot,
                 up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
                 merged_pairs=0.0, gross_cost=gross_cost, total_fees=0.0, total_payout=payout,
             )
         except Exception as e:
             log.warning("record_resolution: %s", e)
-        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross})
+        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "pnl": gross})
         self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
