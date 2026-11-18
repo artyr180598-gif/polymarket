@@ -161,3 +161,35 @@ def test_atomic_pair_fill_persists_both_legs_together(tmp_path) -> None:
     fills = ledger.recent_fills("paper", 10)
     assert len(fills) == 2
     assert {row["outcome"] for row in fills} == {"Up", "Down"}
+
+
+
+def test_resolution_persists_chainlink_anchor_reconciliation(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "anchor-audit.db"))
+    ledger.record_resolution(
+        mode="paper",
+        slug="btc-updown-5m-1795035600",
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=62_236.25808880998,
+        final_price=62_240.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=62_236.25808880998,
+        anchor_delta=0.0,
+        anchor_verified=True,
+        up_shares_total=10.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=4.0,
+        total_fees=0.0,
+        total_payout=10.0,
+    )
+
+    row = ledger.recent_resolutions("paper", 1)[0]
+    assert row["price_to_beat_source"] == "rtds.chainlink_twap60.near_exact_window_start"
+    assert row["gamma_price_to_beat"] == 62_236.25808880998
+    assert row["anchor_delta"] == 0.0
+    assert row["anchor_verified"] == 1
+    ledger.conn.close()
