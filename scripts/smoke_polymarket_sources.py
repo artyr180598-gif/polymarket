@@ -13,6 +13,7 @@ from typing import Any
 import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bot.market_feed import PolymarketMarketFeed
 from bot.oracle_feed import PolymarketOracleFeed
 
 
@@ -111,6 +112,43 @@ async def check_gamma_and_clob(session: aiohttp.ClientSession) -> dict[str, Any]
         "clob_asks": len(book["asks"]),
         "clob_bids": len(book["bids"]),
     }
+
+
+async def check_clob_websocket(token_id: str) -> dict[str, Any]:
+    stream = PolymarketMarketFeed([token_id]).events()
+    observed: dict[str, Any] = {
+        "book_snapshot_received": False,
+        "last_trade_event_seen": False,
+        "bid_levels": 0,
+        "ask_levels": 0,
+    }
+
+    async def consume() -> None:
+        try:
+            async for event in stream:
+                if event.get("type") == "book":
+                    observed["book_snapshot_received"] = True
+                    observed["bid_levels"] = len(event.get("bids") or [])
+                    observed["ask_levels"] = len(event.get("asks") or [])
+                elif event.get("type") == "last_trade":
+                    observed["last_trade_event_seen"] = True
+                if observed["book_snapshot_received"] and observed["last_trade_event_seen"]:
+                    return
+        finally:
+            try:
+                await asyncio.wait_for(stream.aclose(), timeout=5.0)
+            except (asyncio.TimeoutError, RuntimeError):
+                pass
+
+    try:
+        await asyncio.wait_for(consume(), timeout=25.0)
+    except asyncio.TimeoutError:
+        # A quiet market may have no tape prints during this short smoke; a
+        # fresh book snapshot is still mandatory for the maker simulator.
+        pass
+    if not observed["book_snapshot_received"]:
+        raise RuntimeError("CLOB WebSocket did not deliver a book snapshot within 25 seconds")
+    return observed
 
 
 async def check_open_price_reference_vs_gamma_ptb(
@@ -286,6 +324,7 @@ async def main() -> None:
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         gamma_clob = await check_gamma_and_clob(session)
+        clob_websocket = await check_clob_websocket(gamma_clob["clob_token_ids"][0])
         open_price_reference = await check_open_price_reference_vs_gamma_ptb(
             session,
             int(gamma_clob["slug"].rsplit("-", 1)[1]),
@@ -295,6 +334,7 @@ async def main() -> None:
     print(json.dumps({
         "status": "PASS",
         "gamma_and_clob": gamma_clob,
+        "clob_websocket": clob_websocket,
         "open_price_reference_vs_gamma_ptb": open_price_reference,
         "data_api_v2": data_api,
         "boundary_strike_reconciliation": boundary_strike,
