@@ -352,6 +352,10 @@ def test_market_history_includes_fully_merged_markets_without_resolution(tmp_pat
     assert rows[0]["merge_pnl"] == 2.0
     assert rows[0]["market_net_pnl"] == 1.98
     assert rows[0]["anchor_verified"] == 1
+    stats = ledger.get_stats("paper")
+    assert stats["completed_markets"] == 1
+    assert stats["completed_win_markets"] == 1
+    assert stats["completed_loss_markets"] == 0
     ledger.conn.close()
 
 
@@ -408,4 +412,29 @@ def test_combined_daily_pnl_deducts_fees_once_across_merge_and_resolution(tmp_pa
     # Gross: $0.50 merge + $0.50 resolution; the $0.20 fees are deducted once.
     assert round(stats["today_total_net_pnl"], 2) == 0.80
     assert round(stats["lifetime_total_net_pnl"], 2) == 0.80
+    ledger.conn.close()
+
+
+
+def test_market_history_excludes_partially_merged_markets_with_open_inventory(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "partial-merge-history.db"))
+    slug = "btc-updown-5m-1795035600"
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.40, fee=0.10)
+    _record_buy(ledger, slug=slug, outcome="Down", shares=5, price=0.50, fee=0.05)
+    ledger.record_merge(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "3" * 64,
+        pairs=5,
+        cost_basis=4.50,
+        locked_pnl=0.50,
+        tx_hash="paper-partial-merge",
+    )
+
+    # Five Up shares remain open: this is not a completed profitable trade.
+    assert ledger.market_history("paper", 10) == []
+    stats = ledger.get_stats("paper")
+    assert stats["completed_markets"] == 0
+    assert stats["completed_win_markets"] == 0
+    assert stats["completed_loss_markets"] == 0
     ledger.conn.close()
