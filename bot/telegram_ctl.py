@@ -309,7 +309,8 @@ class TelegramController:
             price = float(f.get("price") or 0)
             asset = f.get("asset") or ""
             reason = f.get("reason") or ""
-            role = str(f.get("role") or "TAKER").upper()
+            role_raw = str(f.get("role") or "TAKER").upper()
+            role = "MAKER" if role_raw == "MAKER" else "TAKER"
             fee = float(f.get("fee") or 0)
             fee_s = f" fee ${fee:.2f}" if fee else ""
             lines.append(f"🟢 {role} {side} {asset} {shares:.1f}×{price*100:.0f}¢ ({reason}){fee_s}")
