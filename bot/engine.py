@@ -833,7 +833,7 @@ class TradingEngine:
             "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
             "merge_history": self.ledger.recent_merges(self.cfg.trading_mode, 10),
             "resolve_history": self.ledger.recent_resolutions(self.cfg.trading_mode, 10),
-            "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
-            "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
-            "merge_profit": round(sum(x.get("locked_pnl", 0) for x in self._merge_history), 2),
+            "wins": int(stats.get("win_markets", 0) or 0),
+            "losses": max(0, int(stats.get("resolved_markets", 0) or 0) - int(stats.get("win_markets", 0) or 0)),
+            "merge_profit": round(float(stats.get("merged_locked_pnl", 0) or 0), 2),
         }
