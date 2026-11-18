@@ -90,6 +90,7 @@ class PaperExecutor:
             or tick_size <= 0
             or best_bid < 0
             or not 0 < best_ask < 1
+            or best_bid >= best_ask
             or bid_size_at_or_better < 0
         ):
             return None
@@ -194,6 +195,7 @@ class PaperExecutor:
                 not is_sell_aggressor
                 or last_trade_price is None
                 or not math.isfinite(last_trade_price)
+                or not 0 < last_trade_price < 1
                 or not math.isfinite(last_trade_size)
                 or last_trade_size <= 0
                 or last_trade_price > o.price + 1e-9
