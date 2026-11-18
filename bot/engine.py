@@ -752,7 +752,7 @@ class TradingEngine:
         self._log_event(
             "INFO",
             f"🟢 PAPER MAKER fill {window.asset} {outcome}: "
-            f"{fill.size:.2f} шт. × \${fill.price:.4f} · очередь пройдена · "
+            f"{fill.size:.2f} шт. × ${fill.price:.4f} · очередь пройдена · "
             f"<code>{window.slug}</code>",
             notify=True,
         )
@@ -930,7 +930,7 @@ class TradingEngine:
                 self._log_event(
                     "INFO",
                     f"📌 PAPER post-only {window.asset} {outcome}: "
-                    f"{size:.2f} шт. по \${quote_price:.4f}; очередь впереди {queue_ahead:.2f}",
+                    f"{size:.2f} шт. по ${quote_price:.4f}; очередь впереди {queue_ahead:.2f}",
                     notify=False,
                 )
 
