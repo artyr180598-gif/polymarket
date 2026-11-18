@@ -614,11 +614,8 @@ class TradingEngine:
                                 winner = "Up" if payouts and float(payouts[0]) > 0 else "Down"
         except Exception:
             pass
-        spot = getattr(self.trackers[w.asset], "cl_spot", None)
         # Never guess a winner from inventory or an unrelated exchange quote.
         # Only the official Polymarket resolution feed may settle this position.
-        if winner is None:
-            return
         if winner is None:
             return
         if w.up_shares < 0.01 and w.down_shares < 0.01:
