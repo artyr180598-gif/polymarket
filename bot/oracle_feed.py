@@ -5,6 +5,7 @@ This is read-only market data. It never places orders.
 
 from __future__ import annotations
 
+import asyncio
 from typing import AsyncIterator, Tuple
 
 
@@ -45,4 +46,7 @@ class PolymarketOracleFeed:
                     ):
                         yield asset, "chainlink_twap60", value, timestamp_ms
         finally:
-            await client.close()
+            try:
+                await asyncio.wait_for(client.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                pass
