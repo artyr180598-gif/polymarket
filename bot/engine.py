@@ -1,4 +1,4 @@
-"""TradingEngine — Polymarket paper/live. Coinbase/Kraken prices (EU-safe)."""
+"""TradingEngine — paper/live Polymarket. Coinbase prices, guarded MERGE."""
 
 from __future__ import annotations
 
@@ -78,6 +78,9 @@ class TradingEngine:
         self._notify_cb: Optional[NotifyFn] = None
         self._streams_ok = False
         self._price_ok = False
+        self._fill_history: List[Dict[str, Any]] = []
+        self._merge_history: List[Dict[str, Any]] = []
+        self._resolve_history: List[Dict[str, Any]] = []
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -306,7 +309,7 @@ class TradingEngine:
                         await self._try_merge(w)
             except Exception as e:
                 log.warning("strategy: %s", e)
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(1.0)
 
     def _risk_halted(self) -> bool:
         if self.day_pnl <= -self.cfg.max_daily_loss_usd:
@@ -329,7 +332,7 @@ class TradingEngine:
             return
         p = self.params
         tau = w.remain_sec
-        if time.monotonic() - w.last_trade_mono < 12.0:
+        if time.monotonic() - w.last_trade_mono < 20.0:
             return
         if getattr(p, "enable_lockin", True) and tau <= 120:
             if fv.prob_up >= 0.97 and w.up_shares < 40:
@@ -343,23 +346,23 @@ class TradingEngine:
                     await self._open(w, "Down", bid, max(5.0, round(self.cfg.order_clip_usd / bid, 2)), "lockin")
                     return
         if getattr(p, "enable_maker", True) and tau >= 8:
-            edge = getattr(p, "min_maker_edge", 0.024)
-            if fv.prob_up >= 0.55 and w.up_shares < 45:
-                px = round(max(0.05, min(0.90, fv.prob_up - edge)), 2)
-                if 0.25 <= px <= 0.90:
+            edge = max(0.03, getattr(p, "min_maker_edge", 0.03))
+            if fv.prob_up >= 0.58 and w.up_shares < 40:
+                px = round(max(0.05, min(0.88, fv.prob_up - edge)), 2)
+                if 0.28 <= px <= 0.88:
                     await self._open(w, "Up", px, max(5.0, round(self.cfg.order_clip_usd / px, 2)), "maker_entry")
                     return
             fair_dn = 1.0 - fv.prob_up
-            if fair_dn >= 0.55 and w.down_shares < 45:
-                px = round(max(0.05, min(0.90, fair_dn - edge)), 2)
-                if 0.25 <= px <= 0.90:
+            if fair_dn >= 0.58 and w.down_shares < 40:
+                px = round(max(0.05, min(0.88, fair_dn - edge)), 2)
+                if 0.28 <= px <= 0.88:
                     await self._open(w, "Down", px, max(5.0, round(self.cfg.order_clip_usd / px, 2)), "maker_entry")
                     return
             if w.up_shares >= 5 and w.down_shares < w.up_shares - 0.5:
-                target = 1.0 - w.entry_vwap_up - getattr(p, "take_profit_edge", 0.015)
+                target = 1.0 - w.entry_vwap_up - getattr(p, "take_profit_edge", 0.02)
                 need = round(w.up_shares - w.down_shares, 2)
-                if target > 0.05 and need >= 5:
-                    await self._open(w, "Down", min(round(target, 2), 0.97), need, "syn_tp")
+                if target > 0.08 and need >= 5 and (w.entry_vwap_up + target) < 0.98:
+                    await self._open(w, "Down", min(round(target, 2), 0.90), need, "syn_tp")
                     return
 
     async def _open(self, w, outcome, price, size, reason) -> None:
@@ -379,6 +382,10 @@ class TradingEngine:
             w.down_shares += size
             w.down_cost += cost
         w.last_trade_mono = time.monotonic()
+        fill = {"ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
+                "outcome": outcome, "role": "MAKER", "reason": reason, "shares": size, "price": price, "fee": 0.0, "notional": cost}
+        self._fill_history.insert(0, fill)
+        self._fill_history = self._fill_history[:80]
         try:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
@@ -386,21 +393,26 @@ class TradingEngine:
                 reason=reason, shares=size, price=price, fee=0.0, fair_prob=price,
                 tx_or_order_id=f"paper-{int(time.time())}",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
         why = {"maker_entry": "вход по модели", "lockin": "фиксация перед закрытием", "syn_tp": "вторая сторона для MERGE"}.get(reason, reason)
         self._log_event("INFO", f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f})\n{why}\n<code>{w.slug}</code>", notify=True)
 
-    async def _try_merge(self, w) -> None:
+    async def _try_merge(self, w: WindowState) -> None:
         pairs = w.mergeable_pairs
         if pairs < 5 and not (pairs >= 1 and abs(w.net_shares) < 0.5):
             return
         if w.merge_in_flight:
             return
+        if w.up_shares > 0 and w.down_shares > 0:
+            up_part = (pairs / w.up_shares) * w.up_cost
+            dn_part = (pairs / w.down_shares) * w.down_cost
+            if (up_part + dn_part) > pairs * 0.995:
+                return
         await self._execute_merge(w)
 
-    async def _execute_merge(self, w) -> float:
+    async def _execute_merge(self, w: WindowState) -> float:
         pairs = round(w.mergeable_pairs, 4)
         if pairs < 1:
             return 0.0
@@ -416,10 +428,13 @@ class TradingEngine:
             w.down_cost = max(0.0, w.down_cost - dn_part)
             self.cash += pairs
             self.realized_pnl += locked
+            self.day_pnl += locked
+            self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked})
+            self._merge_history = self._merge_history[:40]
             try:
                 self.ledger.record_merge(mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id, pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}")
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("record_merge: %s", e)
             self._log_event("INFO", f"♻️ MERGE: закрыл {pairs:.1f} пар Up+Down\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>", notify=True)
             return pairs
         finally:
@@ -477,6 +492,8 @@ class TradingEngine:
             )
         except Exception as e:
             log.warning("record_resolution: %s", e)
+        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross})
+        self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
@@ -522,4 +539,9 @@ class TradingEngine:
             "realized_pnl": round(self.realized_pnl, 2), "day_pnl": round(self.day_pnl, 2),
             "total_exposure": round(inv, 2), "stats": stats, "windows": windows, "events": self.events[-40:],
             "fee_regime": fee_regime_label(), "assets": self.cfg.enabled_assets, "streams_ok": self._price_ok,
+            "fill_history": self._fill_history[:20], "merge_history": self._merge_history[:10],
+            "resolve_history": self._resolve_history[:10],
+            "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
+            "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
+            "merge_profit": round(sum(x.get("locked_pnl", 0) for x in self._merge_history), 2),
         }
