@@ -51,6 +51,7 @@ class PaperFill:
     fee: float
     role: str  # MAKER | TAKER
     ts: float
+    queue_ahead_before: Optional[float] = None
 
 
 class PaperExecutor:
@@ -185,8 +186,9 @@ class PaperExecutor:
                 continue
             # First consume the visible queue that was ahead when we joined.
             # Only the residual tape volume can execute our simulated order.
-            volume_before_us = max(0.0, last_trade_size - o.queue_ahead)
-            o.queue_ahead = max(0.0, o.queue_ahead - last_trade_size)
+            queue_ahead_before = o.queue_ahead
+            volume_before_us = max(0.0, last_trade_size - queue_ahead_before)
+            o.queue_ahead = max(0.0, queue_ahead_before - last_trade_size)
             # Fill only from tape volume remaining after the queue ahead.
             if volume_before_us > 0:
                     fill_size = min(o.remaining, volume_before_us)
@@ -203,6 +205,7 @@ class PaperExecutor:
                             fee=0.0,
                             role="MAKER",
                             ts=now,
+                            queue_ahead_before=queue_ahead_before,
                         )
                         self.fills.append(fill)
                         new_fills.append(fill)
@@ -230,6 +233,8 @@ class PaperExecutor:
         order = self.orders.get(fill.order_id)
         if order is not None:
             order.remaining = min(order.size, round(order.remaining + fill.size, 4))
+            if fill.queue_ahead_before is not None:
+                order.queue_ahead = fill.queue_ahead_before
             order.status = "open"
         return True
 
