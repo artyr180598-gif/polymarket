@@ -185,6 +185,8 @@ class TelegramController:
     def _fmt_status(self) -> str:
         st = self.engine.snapshot()
         stats = st.get("stats") or {}
+        risk_halt = bool(st.get("risk_halt_active"))
+        risk_halt_reason = str(st.get("risk_halt_reason") or "")
         mode = (st.get("mode") or "paper").upper()
         running = st.get("running")
         paused = st.get("paused")
@@ -227,6 +229,7 @@ class TelegramController:
             f"Chainlink RTDS: <b>{'OK' if oracle_ready else 'нет свежих данных'}</b>",
             f"Chainlink TWAP60 anchor: <b>{'OK' if strike_ready else 'ожидание'}</b>",
             f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
+            f"Защита риска: <b>{'HOLD' if risk_halt else 'OK'}</b>",
             f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
             f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв ${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
             f"Доступно: <b>${float(st.get('available_cash', cash) or 0):.2f}</b>",
@@ -237,6 +240,8 @@ class TelegramController:
             f"Комиссии всего: −${fees:.2f}",
             "Maker-rebates в PAPER PnL пока не моделируются.",
         ]
+        if risk_halt_reason:
+            lines.append(f"⚠️ Причина блокировки: {risk_halt_reason}")
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
             lines.append(f"\n⏱ Окон: <b>{len(windows)}</b>")
@@ -483,7 +488,10 @@ class TelegramController:
                     "но не запускает остановленный процесс. Проверьте состояние сервиса Railway.",
                     _kb_main(),
                 )
-            self.engine.resume()
+            resumed = self.engine.resume()
+            if resumed is False:
+                reason = getattr(self.engine, "_risk_halt_reason", "") or "активен защитный лимит"
+                return f"⛔ Возобновление заблокировано: {reason}", _kb_main()
             return "▶️ PAPER-торговля возобновлена", _kb_main()
         if a in ("pause", "/pause"):
             self.engine.pause()
