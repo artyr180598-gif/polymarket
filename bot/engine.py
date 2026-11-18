@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import logginglogging
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -159,7 +159,6 @@ class TradingEngine:
         self._log_event("INFO", f"KILL: canceled={canceled} merged=${merged_total:.2f}")
         return {"canceled": canceled, "merged_usd": round(merged_total, 2)}
 
-    # ── RTDS price streams ──────────────────────────────────────────
     async def _price_loop(self) -> None:
         if not HAS_POLY:
             while self.running:
@@ -210,14 +209,12 @@ class TradingEngine:
         for w in self.windows.values():
             if w.asset != asset:
                 continue
-            # Capture priceToBeat near start (first tick in [T0-2, T0+8])
             if w.price_to_beat is None and -2.0 <= (ts - w.start_ts) <= 8.0:
                 w.price_to_beat = twap_val
                 self._log_event("INFO", f"{w.slug}: зафиксирован точный priceToBeat = ${twap_val:,.2f}")
             if w.final_price is None and -2.0 <= (ts - w.end_ts) <= 8.0:
                 w.final_price = twap_val
 
-    # ── Discovery via Gamma ─────────────────────────────────────────
     async def _discovery_loop(self) -> None:
         while self.running:
             try:
@@ -231,7 +228,6 @@ class TradingEngine:
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
                 sec = 300 if tf == "5m" else 900
-                # current + next window
                 for offset in (0, 1):
                     start = int(now // sec) * sec + offset * sec
                     end = start + sec
@@ -292,7 +288,6 @@ class TradingEngine:
             log.debug("gamma %s: %s", slug, e)
             return None
 
-    # ── Strategy ────────────────────────────────────────────────────
     async def _strategy_loop(self) -> None:
         while self.running:
             try:
@@ -315,7 +310,6 @@ class TradingEngine:
 
     async def _run_strategies(self, w: WindowState) -> None:
         if w.price_to_beat is None:
-            # try live capture
             ptb = self.trackers[w.asset].lookup_twap_at(w.start_ts)
             if ptb:
                 w.price_to_beat = ptb
@@ -327,7 +321,6 @@ class TradingEngine:
         p = self.params
         tau = w.remain_sec
 
-        # Engine 2: TWAP Lock-In
         if p.enable_lockin and tau <= p.lockin_start_remain_sec and fv.prob_up >= p.lockin_min_prob:
             if abs(fv.lead_bps) <= p.lockin_max_lead_against_bps or fv.lead_bps >= 0:
                 bid = min(p.lockin_max_bid, round(fv.prob_up - 0.01, 2))
@@ -335,7 +328,6 @@ class TradingEngine:
                     size = max(5.0, round(self.cfg.order_clip_usd * p.lockin_size_mult / bid, 2))
                     await self._place_maker(w, "Up", bid, size, reason="lockin_maker")
 
-        # Engine 1: Maker entry
         if p.enable_maker and tau >= p.maker_start_sec:
             edge = fv.prob_up - w.best_ask_up
             if edge >= p.min_maker_edge and p.maker_min_price <= fv.prob_up <= p.maker_max_price:
@@ -345,7 +337,6 @@ class TradingEngine:
                     size = max(5.0, round(self.cfg.order_clip_usd / px, 2))
                     await self._place_maker(w, "Up", px, size, reason="maker_entry")
 
-            # Synthetic TP: buy opposite if we have net position
             if w.up_shares >= 5 and w.down_shares < w.up_shares:
                 target = 1.0 - w.entry_vwap_up - p.take_profit_edge
                 if target > 0.01 and w.best_ask_down <= target + 0.02:
@@ -354,7 +345,6 @@ class TradingEngine:
                     if px > 0.05:
                         await self._place_maker(w, "Down", px, need, reason="syn_tp")
 
-        # Engine 3: Selective taker
         if p.enable_taker and p.taker_start_sec <= tau <= 300:
             fee_ps = calc_taker_fee_per_share(w.best_ask_up, w.asset, w.timeframe)
             net_edge = fv.prob_up - w.best_ask_up - fee_ps
@@ -411,17 +401,16 @@ class TradingEngine:
         try:
             res = await self.executor.merge_positions(w.condition_id, pairs)
             if res.get("ok"):
-                # Cost basis of the pair
                 cost = 0.0
                 if w.up_shares > 0:
-                    cost += (pairs / w.up_shares) * w.up_cost if w.up_shares else 0
+                    cost += (pairs / w.up_shares) * w.up_cost
                 if w.down_shares > 0:
-                    cost += (pairs / w.down_shares) * w.down_cost if w.down_shares else 0
+                    cost += (pairs / w.down_shares) * w.down_cost
                 locked = pairs * 1.0 - cost
                 w.up_shares = max(0.0, w.up_shares - pairs)
                 w.down_shares = max(0.0, w.down_shares - pairs)
-                w.up_cost = max(0.0, w.up_cost - cost / 2)
-                w.down_cost = max(0.0, w.down_cost - cost / 2)
+                w.up_cost = max(0.0, w.up_cost * (1 - pairs / max(w.up_shares + pairs, 1e-9)))
+                w.down_cost = max(0.0, w.down_cost * (1 - pairs / max(w.down_shares + pairs, 1e-9)))
                 self.cash += pairs
                 self.realized_pnl += locked
                 self.ledger.record_merge(
@@ -434,7 +423,6 @@ class TradingEngine:
             w.merge_in_flight = False
         return 0.0
 
-    # ── Resolve ─────────────────────────────────────────────────────
     async def _resolve_loop(self) -> None:
         while self.running:
             try:
@@ -448,43 +436,34 @@ class TradingEngine:
 
     async def _resolve_window(self, w: WindowState) -> None:
         winner = None
-        # Data API v2
         try:
             url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
             async with aiohttp.ClientSession() as s:
                 async with s.get(url, timeout=10) as r:
                     if r.status == 200:
                         data = await r.json()
-                        items = data.get("data") or data if isinstance(data, list) else []
+                        items = data.get("data") or (data if isinstance(data, list) else [])
                         if items:
                             item = items[0] if isinstance(items, list) else items
                             if item.get("status") == "resolved":
                                 payouts = item.get("payouts") or []
-                                if payouts and payouts[0] > 0:
-                                    winner = "Up"
-                                else:
-                                    winner = "Down"
+                                winner = "Up" if payouts and payouts[0] > 0 else "Down"
         except Exception as e:
             log.debug("resolve api: %s", e)
 
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
-
         if winner is None:
             return
 
-        # PnL
         if winner == "Up":
             gross = w.up_shares * 1.0 - w.up_cost - w.down_cost
         else:
             gross = w.down_shares * 1.0 - w.up_cost - w.down_cost
-        net = gross  # fees already in cost for taker
+        net = gross
         self.realized_pnl += net
         self.day_pnl += net
-        if net < 0:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
+        self.consecutive_losses = self.consecutive_losses + 1 if net < 0 else 0
         self.ledger.record_resolution(
             mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
             asset=w.asset, timeframe=w.timeframe, winner=winner,
@@ -495,10 +474,9 @@ class TradingEngine:
         w.resolved = True
         self._log_event("INFO", f"{w.slug} RESOLVED {winner} net ${net:+.2f}")
 
-    # ── Dashboard snapshot ──────────────────────────────────────────
     def snapshot(self) -> Dict[str, Any]:
         stats = self.ledger.get_stats(self.cfg.trading_mode)
-        equity = self.cash + self.realized_pnl  # simplified
+        equity = self.cash + self.realized_pnl
         windows = []
         for w in self.windows.values():
             if w.resolved:
