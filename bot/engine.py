@@ -21,7 +21,7 @@ from .oracle_feed import PolymarketOracleFeed
 from .twap_model import AssetPriceTracker
 
 log = logging.getLogger(__name__)
-NotifyFn = Callable[[str], Any]
+NotifyFn = Callable[..., Any]
 
 
 @dataclass
@@ -127,14 +127,20 @@ class TradingEngine:
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
 
-    def _log_event(self, level: str, msg: str, notify: bool = False) -> None:
+    def _log_event(
+        self, level: str, msg: str, notify: bool = False,
+        notification_key: Optional[str] = None,
+    ) -> None:
         self.events.append(f"{time.strftime('%H:%M:%S')} | {level} | {msg}")
         if len(self.events) > 200:
             self.events = self.events[-150:]
         log.info("%s", msg)
         if notify and self._notify_cb is not None:
             try:
-                result = self._notify_cb(msg)
+                result = (
+                    self._notify_cb(msg, event_key=notification_key)
+                    if notification_key is not None else self._notify_cb(msg)
+                )
                 if asyncio.iscoroutine(result):
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
@@ -711,6 +717,12 @@ class TradingEngine:
                 fair_prob = float(fv.prob_up if outcome == "Up" else 1.0 - fv.prob_up)
             except Exception:
                 pass
+        maker_event_key = f"paper-maker-{fill.order_id}-{time.time_ns()}"
+        maker_message = (
+            f"🟢 PAPER MAKER fill {window.asset} {outcome}: "
+            f"{fill.size:.2f} шт. × ${fill.price:.4f} · очередь пройдена · "
+            f"<code>{window.slug}</code>"
+        )
         try:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode,
@@ -725,7 +737,9 @@ class TradingEngine:
                 price=float(fill.price),
                 fee=0.0,
                 fair_prob=fair_prob,
-                tx_or_order_id=f"paper-maker-{fill.order_id}-{time.time_ns()}",
+                tx_or_order_id=maker_event_key,
+                notification_message=maker_message,
+                notification_event_key=maker_event_key,
             )
         except Exception as exc:
             self.executor.rollback_fill(fill)
@@ -756,11 +770,7 @@ class TradingEngine:
         })
         self._fill_history = self._fill_history[:80]
         self._log_event(
-            "INFO",
-            f"🟢 PAPER MAKER fill {window.asset} {outcome}: "
-            f"{fill.size:.2f} шт. × ${fill.price:.4f} · очередь пройдена · "
-            f"<code>{window.slug}</code>",
-            notify=True,
+            "INFO", maker_message, notify=True, notification_key=maker_event_key,
         )
 
     async def _strategy_loop(self) -> None:
@@ -1171,8 +1181,18 @@ class TradingEngine:
                 "tx_or_order_id": f"paper-pair-down-{time.time_ns()}",
             },
         ]
+        pair_event_key = str(fills[0]["tx_or_order_id"])
+        pair_message = (
+            f"🟢 PAPER-пара Up/Down {w.asset}: {size:.2f} + {size:.2f} шт; "
+            f"цены {price_up:.4f}/{price_down:.4f}; комиссии ${fee_up + fee_down:.4f}; "
+            f"общая стоимость ${combined_cost:.4f}\n<code>{w.slug}</code>"
+        )
         try:
-            self.ledger.record_fills_atomic(fills)
+            self.ledger.record_fills_atomic(
+                fills,
+                notification_message=pair_message,
+                notification_event_key=pair_event_key,
+            )
         except Exception as exc:
             log.exception("PAPER pair not persisted; refusing both legs: %s", exc)
             return False
@@ -1186,11 +1206,7 @@ class TradingEngine:
         self.cash -= combined_cost
         self.fees_paid += fee_up + fee_down
         self._log_event(
-            "INFO",
-            f"🟢 PAPER-пара Up/Down {w.asset}: {size:.2f} + {size:.2f} шт; "
-            f"цены {price_up:.4f}/{price_down:.4f}; комиссии ${fee_up + fee_down:.4f}; "
-            f"общая стоимость ${combined_cost:.4f}\n<code>{w.slug}</code>",
-            notify=True,
+            "INFO", pair_message, notify=True, notification_key=pair_event_key,
         )
         return True
 
@@ -1242,12 +1258,27 @@ class TradingEngine:
             "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
             "fee": fee, "notional": cost,
         }
+        side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
+        why = {
+            "taker_entry": "CLOB ask дешевле fair (Taker PAPER simulation)",
+            "lockin": "lock-in по CLOB",
+            "syn_tp": "добор пары по CLOB",
+            "pair_arb": "пара CLOB+fee < $1",
+        }.get(reason, reason)
+        fee_s = f" · fee ${fee:.3f}" if fee > 0 else ""
+        taker_event_key = f"paper-clob-{time.time_ns()}"
+        taker_message = (
+            f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f})"
+            f"{fee_s}\n{why}\n<code>{w.slug}</code>"
+        )
         try:
             self.ledger.record_fill(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
                 reason=reason, shares=size, price=price, fee=fee, fair_prob=float(fair_prob if fair_prob is not None else price),
-                tx_or_order_id=f"paper-clob-{time.time_ns()}",
+                tx_or_order_id=taker_event_key,
+                notification_message=taker_message,
+                notification_event_key=taker_event_key,
             )
         except Exception as e:
             log.exception("PAPER fill was not persisted; refusing in-memory fill: %s", e)
@@ -1267,18 +1298,8 @@ class TradingEngine:
         w.last_trade_mono = time.monotonic()
         self._fill_history.insert(0, fill)
         self._fill_history = self._fill_history[:80]
-        side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
-        why = {
-            "taker_entry": "CLOB ask дешевле fair (Taker PAPER simulation)",
-            "lockin": "lock-in по CLOB",
-            "syn_tp": "добор пары по CLOB",
-            "pair_arb": "пара CLOB+fee < $1",
-        }.get(reason, reason)
-        fee_s = f" · fee ${fee:.3f}" if fee > 0 else ""
         self._log_event(
-            "INFO",
-            f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f}){fee_s}\n{why}\n<code>{w.slug}</code>",
-            notify=True,
+            "INFO", taker_message, notify=True, notification_key=taker_event_key,
         )
 
     async def _try_merge(self, w: WindowState) -> None:
