@@ -72,7 +72,7 @@ The Telegram bot provides inline buttons and native slash commands:
 - `/pnl` — lifetime and daily net PnL, fees, Maker share, profitable / losing / breakeven resolved markets.
 - `/positions` — current open virtual inventory.
 - `/fills` — recent PAPER fills and MERGE events from SQLite.
-- `/history` — recent officially resolved markets with merge-adjusted, fee-adjusted net PnL.
+- `/history` — recent resolved and fully merged markets with fee-adjusted net PnL and RTDS-to-Gamma anchor verification.
 - `/pause`, `/resume`, `/kill` — remote PAPER controls; emergency stop requires confirmation.
 
 All displayed fills, MERGEs and PnL are simulated PAPER ledger records, not real Polymarket account executions. Win/loss counts are explicitly limited to markets with an official resolution; fully merged markets remain included in lifetime PnL but are not misclassified as resolved wins or losses. Persistent history still requires a verified Railway Volume mounted at `/data`.
