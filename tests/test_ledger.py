@@ -438,3 +438,24 @@ def test_market_history_excludes_partially_merged_markets_with_open_inventory(tm
     assert stats["completed_win_markets"] == 0
     assert stats["completed_loss_markets"] == 0
     ledger.conn.close()
+
+
+
+def test_consecutive_net_losses_include_fully_merged_markets(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "merged-loss-streak.db"))
+    slug = "btc-updown-5m-1795035600"
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.60, fee=0.10)
+    _record_buy(ledger, slug=slug, outcome="Down", shares=10, price=0.60, fee=0.10)
+    ledger.record_merge(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "5" * 64,
+        pairs=10,
+        cost_basis=12.0,
+        locked_pnl=-2.0,
+        tx_hash="paper-losing-full-merge",
+    )
+
+    assert ledger.market_history("paper", 10)[0]["market_net_pnl"] == -2.2
+    assert ledger.consecutive_net_losses("paper") == 1
+    ledger.conn.close()
