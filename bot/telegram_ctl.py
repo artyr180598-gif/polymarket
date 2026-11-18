@@ -20,6 +20,7 @@ def _kb_main() -> Dict[str, Any]:
         "inline_keyboard": [
             [{"text": "📊 Статус", "callback_data": "status"}, {"text": "💰 PnL", "callback_data": "pnl"}],
             [{"text": "📈 Позиции", "callback_data": "positions"}, {"text": "📋 Сделки", "callback_data": "fills"}],
+            [{"text": "📚 История", "callback_data": "history"}],
             [{"text": "▶️ Старт", "callback_data": "resume"}, {"text": "⏸ Пауза", "callback_data": "pause"}, {"text": "🛑 СТОП", "callback_data": "kill"}],
             [{"text": "⚙️ Пресет", "callback_data": "presets"}, {"text": "ℹ️ Помощь", "callback_data": "help"}],
         ]
@@ -229,8 +230,9 @@ class TelegramController:
         merge_pnl = float(stats.get("merged_locked_pnl", 0) or 0)
         lifetime_pnl = float(stats.get("lifetime_total_net_pnl", 0) or 0)
         wins = int(stats.get("win_markets", 0) or 0)
+        losses = int(stats.get("loss_markets", 0) or 0)
+        breakeven = int(stats.get("breakeven_markets", 0) or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
-        losses = max(0, resolved - wins)
         n_fills = int(stats.get("total_fills", 0) or 0)
         maker_fills = int(stats.get("maker_fills", 0) or 0)
         maker_fill_pct = float(stats.get("maker_fill_pct", 0) or 0)
@@ -313,7 +315,7 @@ class TelegramController:
             asset = f.get("asset") or ""
             reason = f.get("reason") or ""
             role_raw = str(f.get("role") or "TAKER").upper()
-            role = "MAKER" if role_raw == "MAKER" else "TAKER"
+            role = "MAKER" if role_raw.startswith("MAKER") else "TAKER"
             fee = float(f.get("fee") or 0)
             fee_s = f" fee ${fee:.2f}" if fee else ""
             lines.append(f"🟢 {role} {side} {asset} {shares:.1f}×{price*100:.0f}¢ ({reason}){fee_s}")
@@ -323,6 +325,31 @@ class TelegramController:
             for m in merges[:6]:
                 lines.append(f"♻️ {m.get('pairs', 0):.0f} пар · gross до комиссий ${m.get('locked_pnl', 0):+.2f}")
         return "\n".join(lines)
+
+    def _fmt_history(self) -> str:
+        """Show resolved market outcomes with merge-adjusted net PnL."""
+        try:
+            rows = self.engine.ledger.market_history(self.engine.cfg.trading_mode, 15)
+        except Exception as exc:
+            logger.warning("market history unavailable for Telegram: %s", exc)
+            return "📚 <b>История рынков</b>\\nНе удалось прочитать журнал SQLite. Проверьте логи сервиса."
+        if not rows:
+            return (
+                "📚 <b>История закрытых рынков</b>\\n━━━━━━━━━━━━━━━━\\n"
+                "Пока нет рынков с подтверждённым официальным резолвом.\\n"
+                "MERGE-события смотри в разделе «Сделки»."
+            )
+        lines = ["📚 <b>История закрытых рынков</b>", "━━━━━━━━━━━━━━━━"]
+        for row in rows:
+            net = float(row.get("market_net_pnl") or 0.0)
+            icon = "✅" if net > 0.000001 else "❌" if net < -0.000001 else "➖"
+            lines.append(
+                f"\\n{icon} <b>{row.get('asset', '?')} {row.get('timeframe', '')}</b> "
+                f"· net <b>\${net:+.2f}</b>\\n"
+                f"Победил: {row.get('winner', '?')} · MERGE: \${float(row.get('merge_pnl') or 0):+.2f}\\n"
+                f"<code>{row.get('slug', '')}</code>"
+            )
+        return "\\n".join(lines)
 
     def _fmt_help(self) -> str:
         return (
@@ -356,6 +383,8 @@ class TelegramController:
             return self._fmt_positions(), _kb_main()
         if a in ("fills", "/fills"):
             return self._fmt_fills(), _kb_main()
+        if a in ("history", "/history"):
+            return self._fmt_history(), _kb_main()
         if a in ("presets", "/preset"):
             return self._fmt_presets(), _kb_presets()
         if a in ("resume", "/resume"):
