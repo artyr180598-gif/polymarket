@@ -267,9 +267,9 @@ class Ledger:
             """
             SELECT
                 COUNT(*) AS total_fills,
-                COALESCE(SUM(CASE WHEN role='MAKER' THEN 1 ELSE 0 END), 0) AS maker_fills,
+                COALESCE(SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN 1 ELSE 0 END), 0) AS maker_fills,
                 COALESCE(SUM(notional), 0) AS total_notional,
-                COALESCE(SUM(CASE WHEN role='MAKER' THEN notional ELSE 0 END), 0) AS maker_notional,
+                COALESCE(SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN notional ELSE 0 END), 0) AS maker_notional,
                 COALESCE(SUM(fee), 0) AS total_fees,
                 COALESCE(SUM(CASE WHEN ts >= ? THEN fee ELSE 0 END), 0) AS today_fees,
                 COALESCE(SUM(shares * price * (1.0 - price)), 0) AS weighted_vol
@@ -283,8 +283,14 @@ class Ledger:
             SELECT
                 COUNT(*) AS resolved_mkts,
                 COALESCE(SUM(CASE
-                    WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) > 0
+                    WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) > 0.000001
                     THEN 1 ELSE 0 END), 0) AS win_mkts,
+                COALESCE(SUM(CASE
+                    WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) < -0.000001
+                    THEN 1 ELSE 0 END), 0) AS loss_mkts,
+                COALESCE(SUM(CASE
+                    WHEN ABS(r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)) <= 0.000001
+                    THEN 1 ELSE 0 END), 0) AS breakeven_mkts,
                 COALESCE(SUM(r.gross_pnl), 0) AS gross_pnl,
                 COALESCE(SUM(r.net_pnl), 0) AS net_pnl,
                 COALESCE(SUM(CASE WHEN r.ts >= ? THEN r.net_pnl ELSE 0 END), 0) AS today_net_pnl
@@ -326,6 +332,8 @@ class Ledger:
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
             "win_markets": int(r_row["win_mkts"]),
+            "loss_markets": int(r_row["loss_mkts"]),
+            "breakeven_markets": int(r_row["breakeven_mkts"]),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
             "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
             "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
@@ -500,6 +508,29 @@ class Ledger:
             (mode, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def market_history(self, mode: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return resolved markets with merge-adjusted, fee-adjusted net PnL."""
+        rows = self.conn.execute(
+            """
+            SELECT r.*, COALESCE(m.merge_pnl, 0) AS merge_pnl,
+                   r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS market_net_pnl
+            FROM resolutions r
+            LEFT JOIN (
+                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl
+                FROM merges GROUP BY mode, slug
+            ) m ON m.mode = r.mode AND m.slug = r.slug
+            LEFT JOIN (
+                SELECT mode, slug, SUM(fee) AS fees
+                FROM fills GROUP BY mode, slug
+            ) f ON f.mode = r.mode AND f.slug = r.slug
+            WHERE r.mode = ?
+            ORDER BY r.ts DESC, r.id DESC
+            LIMIT ?
+            """
+            , (mode, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def equity_series(self, mode: str, limit: int = 120) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
