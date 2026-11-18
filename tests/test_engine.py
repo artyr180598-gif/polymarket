@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from bot.config import BotConfig
 from bot.engine import TradingEngine, WindowState
@@ -35,7 +36,7 @@ def test_discovery_retries_gamma_until_price_to_beat_is_published(monkeypatch) -
         start_ts=900.0,
         end_ts=1200.0,
         price_to_beat=None,
-        last_ptb_retry_mono=0.0,
+        last_ptb_retry_mono=time.monotonic() - 6.0,
     )
     calls: list[str] = []
 
@@ -51,7 +52,6 @@ def test_discovery_retries_gamma_until_price_to_beat_is_published(monkeypatch) -
 
     engine._gamma = fake_gamma  # type: ignore[method-assign]
     monkeypatch.setattr("bot.engine.time.time", lambda: 1_000.0)
-    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 10.0)
 
     asyncio.run(engine._discover())
 
