@@ -83,6 +83,19 @@ class Ledger:
                 UNIQUE(mode, slug)
             );
 
+            CREATE TABLE IF NOT EXISTS anchor_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                mode TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                price_to_beat REAL,
+                price_to_beat_source TEXT NOT NULL DEFAULT '',
+                gamma_price_to_beat REAL,
+                anchor_delta REAL,
+                anchor_verified INTEGER,
+                UNIQUE(mode, slug)
+            );
+
             CREATE TABLE IF NOT EXISTS equity_points (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts REAL NOT NULL,
@@ -241,6 +254,33 @@ class Ledger:
         )
         self.conn.commit()
         return net_pnl
+
+    def record_anchor_check(
+        self,
+        *,
+        mode: str,
+        slug: str,
+        price_to_beat: float | None,
+        price_to_beat_source: str,
+        gamma_price_to_beat: float | None,
+        anchor_delta: float | None,
+        anchor_verified: bool | None,
+    ) -> None:
+        """Persist independent RTDS-vs-Gamma settlement-anchor verification."""
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO anchor_checks (
+                ts, mode, slug, price_to_beat, price_to_beat_source,
+                gamma_price_to_beat, anchor_delta, anchor_verified
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time(), mode, slug, price_to_beat, price_to_beat_source,
+                gamma_price_to_beat, anchor_delta,
+                None if anchor_verified is None else int(anchor_verified),
+            ),
+        )
+        self.conn.commit()
 
     def record_equity(
         self,
@@ -517,6 +557,8 @@ class Ledger:
                 SELECT mode, slug FROM resolutions WHERE mode = ?
                 UNION
                 SELECT mode, slug FROM merges WHERE mode = ?
+                UNION
+                SELECT mode, slug FROM anchor_checks WHERE mode = ?
             ),
             merge_stats AS (
                 SELECT mode, slug, SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
@@ -538,19 +580,20 @@ class Ledger:
                 COALESCE(f.fees, 0) AS fees,
                 COALESCE(r.gross_pnl, 0) + COALESCE(m.merge_pnl, 0)
                     - COALESCE(f.fees, 0) AS market_net_pnl,
-                r.price_to_beat_source,
-                r.gamma_price_to_beat,
-                r.anchor_delta,
-                r.anchor_verified
+                COALESCE(r.price_to_beat_source, a.price_to_beat_source, '') AS price_to_beat_source,
+                COALESCE(r.gamma_price_to_beat, a.gamma_price_to_beat) AS gamma_price_to_beat,
+                COALESCE(r.anchor_delta, a.anchor_delta) AS anchor_delta,
+                COALESCE(r.anchor_verified, a.anchor_verified) AS anchor_verified
             FROM market_keys s
             LEFT JOIN resolutions r ON r.mode = s.mode AND r.slug = s.slug
             LEFT JOIN merge_stats m ON m.mode = s.mode AND m.slug = s.slug
             LEFT JOIN fill_stats f ON f.mode = s.mode AND f.slug = s.slug
+            LEFT JOIN anchor_checks a ON a.mode = s.mode AND a.slug = s.slug
             WHERE s.mode = ?
             ORDER BY ts DESC, s.slug DESC
             LIMIT ?
             """,
-            (mode, mode, mode, max(1, min(int(limit), 100))),
+            (mode, mode, mode, mode, max(1, min(int(limit), 100))),
         ).fetchall()
         return [dict(row) for row in rows]
 
