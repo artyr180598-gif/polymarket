@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -52,8 +53,18 @@ class TelegramController:
         self._running = False
         self._offset = 0
         self._session: Optional[aiohttp.ClientSession] = None
-        # Engine events can arrive during startup, before the HTTP session exists.
+        # Keep message text and durable outbox IDs aligned by queue position.
+        self.ledger = getattr(engine, "ledger", None)
         self._pending_notifications: list[str] = []
+        self._pending_notification_ids: list[Optional[int]] = []
+        if self.ledger is not None:
+            try:
+                for item in self.ledger.pending_telegram_notifications():
+                    self._pending_notifications.append(str(item["message"]))
+                    self._pending_notification_ids.append(int(item["id"]))
+            except Exception:
+                logger.exception("Could not restore Telegram notification outbox")
+                raise RuntimeError("Cannot restore pending Telegram notifications")
         self._notification_delivery_lock = asyncio.Lock()
 
     @property
@@ -191,9 +202,17 @@ class TelegramController:
             return
         if not self.enabled:
             return
-        # Never discard an older fill notification to enforce an arbitrary
-        # in-memory cap. Durable SQLite outbox is the next persistence step.
-        self._pending_notifications.append(msg[:3500])
+        clean = msg[:3500]
+        notification_id: Optional[int] = None
+        if self.ledger is not None:
+            try:
+                notification_id = self.ledger.enqueue_telegram_notification(
+                    clean, uuid.uuid4().hex
+                )
+            except Exception:
+                logger.exception("Could not persist Telegram notification; retaining in memory")
+        self._pending_notifications.append(clean)
+        self._pending_notification_ids.append(notification_id)
         self._notification_wakeup.set()
         if self._session is not None:
             await self._drain_pending_notifications()
@@ -208,12 +227,28 @@ class TelegramController:
         async with self._notification_delivery_lock:
             while self._pending_notifications and self._session is not None:
                 msg = self._pending_notifications[0]
+                notification_id = self._pending_notification_ids[0]
                 delivered = await self.send(f"🔔 {msg}", keyboard=_kb_main())
                 if not delivered:
+                    if notification_id is not None and self.ledger is not None:
+                        try:
+                            self.ledger.mark_telegram_notification_attempt(
+                                notification_id, "telegram_send_failed"
+                            )
+                        except Exception:
+                            logger.exception("Could not record Telegram delivery failure")
                     # Leave the head item queued. The dedicated delivery worker
                     # retries independently of Telegram's long-poll command loop.
                     break
+                if notification_id is not None and self.ledger is not None:
+                    try:
+                        self.ledger.mark_telegram_notification_delivered(notification_id)
+                    except Exception:
+                        # Do not drop the item if the durable acknowledgement failed.
+                        logger.exception("Could not acknowledge Telegram outbox delivery")
+                        break
                 self._pending_notifications.pop(0)
+                self._pending_notification_ids.pop(0)
 
     async def _notification_delivery_loop(self) -> None:
         """Retry queued trade events independently from the long-polling bot loop."""
