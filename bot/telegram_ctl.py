@@ -327,7 +327,7 @@ class TelegramController:
     def _fmt_help(self) -> str:
         return (
             "ℹ️ <b>Текущий PAPER-прототип</b>\n━━━━━━━━━━━━━━━━\n"
-            "• Strike: Polymarket crypto-price openPrice; Gamma priceToBeat — сверка после закрытия\n"
+            "• Strike: Chainlink TWAP60 на точной границе окна; Gamma priceToBeat — сверка после закрытия\n"
             "• Oracle: Polymarket RTDS Chainlink spot + TWAP60\n"
             "• Maker: PAPER post-only по живому CLOB WebSocket, очередь оценивается по видимой L2 глубине\n"
             "• Taker: PAPER по реальному CLOB best ask; победитель — официальный Data API resolution\n"
