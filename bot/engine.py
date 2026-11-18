@@ -1,4 +1,4 @@
-"""TradingEngine — paper/live. Forced window settle for correct journal."""
+"""TradingEngine — mo-money style: pair arb + balanced maker on real 5m windows."""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ class TradingEngine:
         else:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · paper Polymarket", notify=True)
+            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · стратегия mo-money (пара+maker)", notify=True)
         self.running = True
         self._tasks = [
             asyncio.create_task(self._rest_price_loop(), name="prices"),
@@ -319,6 +319,7 @@ class TradingEngine:
         return False
 
     async def _run(self, w: WindowState) -> None:
+        """mo-money: pair arb if Up+Down<0.98; else balanced maker; lock-in near end."""
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
         twap = getattr(tr, "cl_twap60", None)
@@ -330,40 +331,77 @@ class TradingEngine:
             fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
         except Exception:
             return
+
         p = self.params
         tau = w.remain_sec
-        if time.monotonic() - w.last_trade_mono < 20.0:
+        fair_up = float(fv.prob_up)
+        fair_dn = 1.0 - fair_up
+        edge = max(0.025, float(getattr(p, "min_maker_edge", 0.03)))
+        clip = max(8.0, float(self.cfg.order_clip_usd))
+        max_side = 35.0
+
+        if time.monotonic() - w.last_trade_mono < 15.0:
             return
-        if getattr(p, "enable_lockin", True) and tau <= 120:
-            if fv.prob_up >= 0.97 and w.up_shares < 40:
-                bid = min(0.98, round(fv.prob_up - 0.01, 2))
-                if bid >= 0.90:
-                    await self._open(w, "Up", bid, max(5.0, round(self.cfg.order_clip_usd / bid, 2)), "lockin")
+        if tau < 10:
+            return
+
+        # Lock-in last 90s
+        if getattr(p, "enable_lockin", True) and tau <= 90:
+            if fair_up >= 0.96 and w.up_shares < max_side:
+                px = min(0.97, round(fair_up - 0.01, 2))
+                if px >= 0.90:
+                    await self._open(w, "Up", px, max(5.0, round(clip / px, 2)), "lockin")
                     return
-            if fv.prob_up <= 0.03 and w.down_shares < 40:
-                bid = min(0.98, round(1.0 - fv.prob_up - 0.01, 2))
-                if bid >= 0.90:
-                    await self._open(w, "Down", bid, max(5.0, round(self.cfg.order_clip_usd / bid, 2)), "lockin")
+            if fair_dn >= 0.96 and w.down_shares < max_side:
+                px = min(0.97, round(fair_dn - 0.01, 2))
+                if px >= 0.90:
+                    await self._open(w, "Down", px, max(5.0, round(clip / px, 2)), "lockin")
                     return
-        if getattr(p, "enable_maker", True) and tau >= 8:
-            edge = max(0.03, getattr(p, "min_maker_edge", 0.03))
-            if fv.prob_up >= 0.58 and w.up_shares < 40:
-                px = round(max(0.05, min(0.88, fv.prob_up - edge)), 2)
-                if 0.28 <= px <= 0.88:
-                    await self._open(w, "Up", px, max(5.0, round(self.cfg.order_clip_usd / px, 2)), "maker_entry")
-                    return
-            fair_dn = 1.0 - fv.prob_up
-            if fair_dn >= 0.58 and w.down_shares < 40:
-                px = round(max(0.05, min(0.88, fair_dn - edge)), 2)
-                if 0.28 <= px <= 0.88:
-                    await self._open(w, "Down", px, max(5.0, round(self.cfg.order_clip_usd / px, 2)), "maker_entry")
-                    return
-            if w.up_shares >= 5 and w.down_shares < w.up_shares - 0.5:
-                target = 1.0 - w.entry_vwap_up - getattr(p, "take_profit_edge", 0.02)
-                need = round(w.up_shares - w.down_shares, 2)
-                if target > 0.08 and need >= 5 and (w.entry_vwap_up + target) < 0.98:
-                    await self._open(w, "Down", min(round(target, 2), 0.90), need, "syn_tp")
-                    return
+
+        bid_up = round(max(0.05, min(0.90, fair_up - edge)), 2)
+        bid_dn = round(max(0.05, min(0.90, fair_dn - edge)), 2)
+
+        # Pair arb: both sides if combined < 0.975
+        if bid_up + bid_dn <= 0.975 and w.up_shares < max_side and w.down_shares < max_side:
+            sz = max(5.0, round(clip / max(bid_up, bid_dn), 2))
+            if abs(w.net_shares) < 8:
+                await self._open(w, "Up", bid_up, sz, "pair_arb")
+                await self._open(w, "Down", bid_dn, sz, "pair_arb")
+                await self._try_merge(w)
+                return
+
+        # Complete pair if inventory skewed
+        if w.up_shares >= 8 and w.down_shares < w.up_shares:
+            vwap_up = w.up_cost / max(w.up_shares, 1e-9)
+            target_dn = round(min(0.90, max(0.05, 0.97 - vwap_up)), 2)
+            need = round(w.up_shares - w.down_shares, 2)
+            if need >= 5 and target_dn + vwap_up <= 0.98:
+                await self._open(w, "Down", target_dn, need, "syn_tp")
+                await self._try_merge(w)
+                return
+        if w.down_shares >= 8 and w.up_shares < w.down_shares:
+            vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
+            target_up = round(min(0.90, max(0.05, 0.97 - vwap_dn)), 2)
+            need = round(w.down_shares - w.up_shares, 2)
+            if need >= 5 and target_up + vwap_dn <= 0.98:
+                await self._open(w, "Up", target_up, need, "syn_tp")
+                await self._try_merge(w)
+                return
+
+        # Single-side maker: only one side per tick, prefer higher fair
+        want_up = fair_up >= 0.55 and bid_up <= fair_up - edge + 0.005 and w.up_shares < max_side
+        want_dn = fair_dn >= 0.55 and bid_dn <= fair_dn - edge + 0.005 and w.down_shares < max_side
+        if want_up and want_dn:
+            if fair_up >= fair_dn:
+                want_dn = False
+            else:
+                want_up = False
+        if want_up and 0.25 <= bid_up <= 0.88:
+            await self._open(w, "Up", bid_up, max(5.0, round(clip / bid_up, 2)), "maker_entry")
+            return
+        if want_dn and 0.25 <= bid_dn <= 0.88:
+            await self._open(w, "Down", bid_dn, max(5.0, round(clip / bid_dn, 2)), "maker_entry")
+            return
 
     async def _open(self, w, outcome, price, size, reason) -> None:
         price = round(max(0.01, min(0.99, price)), 2)
@@ -397,8 +435,17 @@ class TradingEngine:
         except Exception as e:
             log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
-        why = {"maker_entry": "вход по модели", "lockin": "фиксация перед закрытием", "syn_tp": "вторая сторона для MERGE"}.get(reason, reason)
-        self._log_event("INFO", f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f})\n{why}\n<code>{w.slug}</code>", notify=True)
+        why = {
+            "maker_entry": "maker vs fair",
+            "lockin": "lock-in перед закрытием",
+            "syn_tp": "добор пары для MERGE",
+            "pair_arb": "пара Up+Down < $1",
+        }.get(reason, reason)
+        self._log_event(
+            "INFO",
+            f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f})\n{why}\n<code>{w.slug}</code>",
+            notify=True,
+        )
 
     async def _try_merge(self, w: WindowState) -> None:
         pairs = w.mergeable_pairs
@@ -406,10 +453,10 @@ class TradingEngine:
             return
         if w.merge_in_flight:
             return
-        if w.up_shares > 0 and w.down_shares > 0 and w.remain_sec > 15:
+        if w.up_shares > 0 and w.down_shares > 0 and w.remain_sec > 20:
             up_part = (pairs / w.up_shares) * w.up_cost
             dn_part = (pairs / w.down_shares) * w.down_cost
-            if (up_part + dn_part) > pairs * 0.995:
+            if (up_part + dn_part) > pairs * 0.99:
                 return
         await self._execute_merge(w)
 
@@ -433,10 +480,17 @@ class TradingEngine:
             self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked})
             self._merge_history = self._merge_history[:40]
             try:
-                self.ledger.record_merge(mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id, pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}")
+                self.ledger.record_merge(
+                    mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
+                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}",
+                )
             except Exception as e:
                 log.warning("record_merge: %s", e)
-            self._log_event("INFO", f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>", notify=True)
+            self._log_event(
+                "INFO",
+                f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>",
+                notify=True,
+            )
             return pairs
         finally:
             w.merge_in_flight = False
@@ -541,18 +595,32 @@ class TradingEngine:
                         pass
             windows.append({
                 "slug": w.slug, "asset": w.asset, "remain_sec": round(w.remain_sec, 1),
-                "price_to_beat": w.price_to_beat, "fair_up": round(fair, 4) if fair is not None else None,
-                "net_shares": round(w.net_shares, 2), "up_shares": round(w.up_shares, 2),
-                "down_shares": round(w.down_shares, 2), "mergeable": round(w.mergeable_pairs, 2),
+                "price_to_beat": w.price_to_beat,
+                "fair_up": round(fair, 4) if fair is not None else None,
+                "net_shares": round(w.net_shares, 2),
+                "up_shares": round(w.up_shares, 2),
+                "down_shares": round(w.down_shares, 2),
+                "mergeable": round(w.mergeable_pairs, 2),
             })
         windows.sort(key=lambda x: x["remain_sec"])
         return {
-            "mode": self.cfg.trading_mode, "running": self.running and not self.paused, "paused": self.paused,
-            "preset": self.cfg.strategy_preset, "equity": round(equity, 2), "cash": round(self.cash, 2),
-            "realized_pnl": round(self.realized_pnl, 2), "day_pnl": round(self.day_pnl, 2),
-            "total_exposure": round(inv, 2), "stats": stats, "windows": windows, "events": self.events[-40:],
-            "fee_regime": fee_regime_label(), "assets": self.cfg.enabled_assets, "streams_ok": self._price_ok,
-            "fill_history": self._fill_history[:20], "merge_history": self._merge_history[:10],
+            "mode": self.cfg.trading_mode,
+            "running": self.running and not self.paused,
+            "paused": self.paused,
+            "preset": self.cfg.strategy_preset,
+            "equity": round(equity, 2),
+            "cash": round(self.cash, 2),
+            "realized_pnl": round(self.realized_pnl, 2),
+            "day_pnl": round(self.day_pnl, 2),
+            "total_exposure": round(inv, 2),
+            "stats": stats,
+            "windows": windows,
+            "events": self.events[-40:],
+            "fee_regime": fee_regime_label(),
+            "assets": self.cfg.enabled_assets,
+            "streams_ok": self._price_ok,
+            "fill_history": self._fill_history[:20],
+            "merge_history": self._merge_history[:10],
             "resolve_history": self._resolve_history[:10],
             "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
             "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
