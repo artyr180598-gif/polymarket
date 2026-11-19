@@ -719,10 +719,13 @@ class TradingEngine:
             iterator = stream.__aiter__()
             try:
                 self._market_feed_connected = False
+                # Connection churn is operational telemetry, not a trade event.
+                # Keep it in Railway logs; Telegram is reserved for fills, MERGEs,
+                # risk alerts and feed failures so users are not spammed on resubscribe.
                 self._log_event(
                     "INFO",
                     f"CLOB WebSocket подключён · {len(token_ids)} токенов",
-                    notify=True,
+                    notify=False,
                 )
                 while self.running:
                     next_task = asyncio.create_task(iterator.__anext__())
