@@ -495,7 +495,12 @@ class TradingEngine:
                         # Reject timestamps that are clearly stale or implausibly in the future.
                         source_ts = ts_ms / 1000.0
                         age = time.time() - source_ts
-                        if age > 5.0 or age < -2.0:
+                        accepted = not (age > 5.0 or age < -2.0)
+                        if self._clob_recorder is not None:
+                            self._clob_recorder.enqueue_oracle_event(
+                                asset, kind, price, ts_ms, accepted=accepted, age_sec=age
+                            )
+                        if not accepted:
                             metric_kind = self._oracle_metrics.get(asset, {}).get(kind)
                             if metric_kind is not None:
                                 metric_kind["stale_rejected"] += 1
