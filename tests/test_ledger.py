@@ -7,7 +7,10 @@ import pytest
 from bot.ledger import Ledger
 
 
-def _record_buy(ledger: Ledger, *, slug: str, outcome: str, shares: float, price: float, fee: float) -> None:
+def _record_buy(
+    ledger: Ledger, *, slug: str, outcome: str, shares: float, price: float,
+    fee: float, ts: float | None = None,
+) -> None:
     ledger.record_fill(
         mode="paper",
         slug=slug,
@@ -21,6 +24,7 @@ def _record_buy(ledger: Ledger, *, slug: str, outcome: str, shares: float, price
         price=price,
         fee=fee,
         fair_prob=price,
+        ts=ts,
     )
 
 
@@ -515,6 +519,40 @@ def test_consecutive_net_losses_include_fully_merged_markets(tmp_path) -> None:
 
     assert round(ledger.market_history("paper", 10)[0]["market_net_pnl"], 2) == -2.2
     assert ledger.consecutive_net_losses("paper") == 1
+    ledger.conn.close()
+
+
+def test_consecutive_net_losses_are_scoped_to_first_fill_in_session(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "session-loss-streak.db"))
+
+    def add_loss(slug: str, fill_ts: float) -> None:
+        _record_buy(
+            ledger, slug=slug, outcome="Up", shares=1.0,
+            price=1.0, fee=0.10, ts=fill_ts,
+        )
+        ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "5" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Down",
+            price_to_beat=100_000.0,
+            final_price=99_999.0,
+            up_shares_total=1.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=1.0,
+            total_fees=0.10,
+            total_payout=0.0,
+        )
+
+    add_loss("pre-session-loss", 100.0)
+    add_loss("session-loss-1", 300.0)
+    add_loss("session-loss-2", 400.0)
+
+    assert ledger.consecutive_net_losses("paper") == 3
+    assert ledger.consecutive_net_losses("paper", since_ts=200.0) == 2
     ledger.conn.close()
 
 

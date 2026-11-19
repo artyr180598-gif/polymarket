@@ -597,6 +597,64 @@ def test_unresolved_official_result_is_logged_and_not_booked(monkeypatch, tmp_pa
     engine.ledger.conn.close()
 
 
+def test_risk_guard_counts_only_losses_started_in_current_paper_session(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "session-risk-guard.db"),
+        paper_stats_since_ts=200.0,
+        max_consecutive_losses=2,
+        max_daily_loss_usd=1_000.0,
+    ))
+
+    def add_loss(slug: str, fill_ts: float) -> None:
+        engine.ledger.record_fill(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "8" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome="Up",
+            role="TAKER_CLOB",
+            reason="risk-guard-session-test",
+            shares=1.0,
+            price=1.0,
+            fee=0.10,
+            fair_prob=0.5,
+            ts=fill_ts,
+        )
+        engine.ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "8" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Down",
+            price_to_beat=100_000.0,
+            final_price=99_999.0,
+            price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+            gamma_price_to_beat=100_000.0,
+            anchor_delta=0.0,
+            anchor_verified=True,
+            up_shares_total=1.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=1.0,
+            total_fees=0.10,
+            total_payout=0.0,
+        )
+
+    add_loss("old-session-loss-1", 100.0)
+    add_loss("old-session-loss-2", 150.0)
+    add_loss("new-session-loss-1", 300.0)
+    add_loss("new-session-loss-2", 400.0)
+
+    assert engine._risk_halted() is True
+    assert engine.consecutive_losses == 2
+    assert "2/2" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
 def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],

@@ -67,6 +67,8 @@ def main() -> None:
             "yes" if cfg.telegram_bot_token else "NO",
             cfg.telegram_chat_id or "NO",
         )
+        if cfg.trading_mode == "paper":
+            log.info("PAPER experiment session starts at unix_ts=%.0f", cfg.paper_stats_since_ts)
         # Attach the notifier before engine.start(): startup can discover and fill
         # PAPER orders before Telegram's polling session is fully initialized.
         engine.set_notifier(tg.notify)
