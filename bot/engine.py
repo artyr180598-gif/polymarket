@@ -203,6 +203,8 @@ class TradingEngine:
                 "merge confirmation are not implemented. Use paper mode only."
             )
         self.executor = PaperExecutor(self.cfg.bankroll_usd)
+        if self._clob_recorder is not None:
+            self.executor.set_order_event_callback(self._record_paper_order_event)
         reset_id = str(getattr(self.cfg, "paper_reset_id", "") or "").strip()
         if self.cfg.paper_reset_once or reset_id:
             marker_path = _paper_reset_marker_path(self.cfg.db_path, reset_id)
@@ -932,6 +934,20 @@ class TradingEngine:
         )
         for fill in fills:
             await self._record_maker_fill(fill)
+
+    def _record_paper_order_event(self, event: dict[str, Any]) -> None:
+        if self._clob_recorder is None:
+            return
+        token = str(event.get("asset_id") or "")
+        window = next(
+            (
+                candidate for candidate in self.windows.values()
+                if candidate.up_token == token or candidate.down_token == token
+            ),
+            None,
+        )
+        if window is not None:
+            self._clob_recorder.enqueue_order_event(event, window)
 
     async def _record_maker_fill(self, fill: Any) -> None:
         window = None
