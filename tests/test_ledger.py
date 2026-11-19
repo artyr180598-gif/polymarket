@@ -765,8 +765,8 @@ def test_stats_separate_anchor_verified_and_unverified_resolution_pnl(tmp_path) 
         "merged_pairs": 0.0,
         "total_fees": 0.10,
     }
-    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Up", shares=2, price=0.50, fee=0.05)
-    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Down", shares=2, price=0.50, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Up", shares=2, price=0.25, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Down", shares=2, price=0.25, fee=0.05)
     _record_buy(ledger, slug="btc-updown-5m-unverified", outcome="Up", shares=2, price=0.50, fee=0.05)
     _record_buy(ledger, slug="btc-updown-5m-unverified", outcome="Down", shares=2, price=0.50, fee=0.05)
 
