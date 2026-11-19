@@ -148,6 +148,23 @@ def _scores(samples: list[tuple[int, float, float, int]], indices: set[int],
             "accuracy": round(correct / n, 6)}
 
 
+def _constant_scores(samples: list[tuple[int, float, float, int]], indices: set[int],
+                    probability: float = 0.5) -> dict[str, float | int]:
+    selected = [sample for sample in samples if sample[0] in indices]
+    if not selected:
+        return {"n": 0, "brier": float("nan"), "logloss": float("nan"), "accuracy": float("nan")}
+    p = max(0.01, min(0.99, probability))
+    brier = logloss = correct = 0.0
+    for _, _, _, outcome in selected:
+        y = float(outcome)
+        brier += (p - y) ** 2
+        logloss -= y * math.log(p) + (1.0 - y) * math.log(1.0 - p)
+        correct += 1.0 if (p >= 0.5) == bool(outcome) else 0.0
+    n = len(selected)
+    return {"n": n, "brier": round(brier / n, 6), "logloss": round(logloss / n, 6),
+            "accuracy": round(correct / n, 6)}
+
+
 def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     """Evaluate forecasts at 60s, 30s and 15s to settlement; chronological holdout."""
     samples: list[tuple[int, float, float, int]] = []
@@ -155,18 +172,15 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     var_fast = var_slow = DEFAULT_SIGMA_1S ** 2
     last_price: float | None = None
     last_global_ts: int | None = None
-    previous_twap: array | None = None
-    previous_boundaries: dict[int, Decimal] = {}
 
     for day_index, day in enumerate(days):
         spot_path = directory / f"btc-price-{day}.jsonl.gz"
         twap_path = directory / f"btc-twap60-{day}.jsonl.gz"
         spot, _ = _load_day(spot_path)
         twap, boundaries = _load_day(twap_path)
-        next_twap = None
         next_boundaries: dict[int, Decimal] = {}
         if day_index + 1 < len(days):
-            next_twap, next_boundaries = _load_day(
+            _, next_boundaries = _load_day(
                 directory / f"btc-twap60-{days[day_index + 1]}.jsonl.gz"
             )
         from datetime import datetime, timezone
@@ -238,6 +252,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 best = (float(score["brier"]), sigma_mult, jump_weight)
     calibrated_test = _scores(samples, test_indices, best[1], best[2])
     baseline_test = _scores(samples, test_indices, 1.0, 0.0)
+    constant_test = _constant_scores(samples, test_indices, 0.5)
     return {
         "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 60s, 30s, 15s",
         "valid_settlement_rounds": valid_rounds,
@@ -247,7 +262,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                   "fitted_sigma_multiplier": best[1], "fitted_jump_weight": best[2],
                   "fitted_brier": round(best[0], 6)},
         "holdout": {"days": len(test_indices), "default_model": base_test,
-                    "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test},
+                    "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,\n                    "constant_50_baseline": constant_test},
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
     }
 
