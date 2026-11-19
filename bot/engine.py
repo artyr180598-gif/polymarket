@@ -1660,8 +1660,11 @@ class TradingEngine:
                         await self._try_merge(w)
                         return
 
-        if w.up_shares >= 5 and w.down_shares < w.up_shares and ask_dn is not None:
-            need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
+        if w.up_shares >= 4.5 and w.down_shares < w.up_shares and ask_dn is not None:
+            raw_need = min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0)
+            # CLOB minimum is 5 shares: round a near-complete partial fill up to 5,
+            # leaving at most a few cents of residual exposure, still under the portfolio cap.
+            need = 5.0 if raw_need >= 4.5 and depth_dn * 0.45 >= 5.0 else round(raw_need, 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
                 fee_up_per_share = w.up_fees / max(w.up_shares, 1e-9)
@@ -1670,8 +1673,9 @@ class TradingEngine:
                     await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
-        if w.down_shares >= 5 and w.up_shares < w.down_shares and ask_up is not None:
-            need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
+        if w.down_shares >= 4.5 and w.up_shares < w.down_shares and ask_up is not None:
+            raw_need = min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0)
+            need = 5.0 if raw_need >= 4.5 and depth_up * 0.45 >= 5.0 else round(raw_need, 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
                 fee_dn_per_share = w.down_fees / max(w.down_shares, 1e-9)
