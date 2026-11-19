@@ -124,6 +124,7 @@ class BotConfig:
     telegram_chat_id: str = ""
     db_path: str = "data/polybot.db"
     paper_stats_since_ts: float = 0.0
+    paper_reset_once: bool = False
 
     @property
     def params(self) -> StrategyParams:
@@ -192,4 +193,5 @@ class BotConfig:
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             db_path=os.getenv("DB_PATH", "data/polybot.db").strip(),
             paper_stats_since_ts=max(0.0, float(os.getenv("PAPER_STATS_SINCE_TS", "0") or 0)),
+            paper_reset_once=os.getenv("PAPER_RESET_ONCE", "false").strip().lower() in ("1", "true", "yes"),
         )
