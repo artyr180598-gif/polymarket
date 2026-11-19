@@ -342,6 +342,116 @@ def test_resume_refuses_to_bypass_daily_loss_limit(tmp_path) -> None:
 
 
 
+def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(monkeypatch, tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "delayed-anchor-mismatch.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 100.0)
+    slug = "btc-updown-5m-delayed-anchor"
+    engine.ledger.record_resolution(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "6" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100_000.0,
+        final_price=100_010.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+
+    async def fake_gamma(requested_slug: str):
+        assert requested_slug == slug
+        return {"price_to_beat": 100_000.02}
+
+    engine._gamma = fake_gamma  # type: ignore[method-assign]
+    asyncio.run(engine._reconcile_pending_anchors())
+
+    row = engine.ledger.recent_resolutions("paper", 1)[0]
+    assert row["anchor_verified"] == 0
+    assert row["anchor_delta"] == 0.02
+    assert row["net_pnl"] == 3.0
+    assert engine.paused is True
+    assert engine._risk_halt_active is True
+    assert "Chainlink/Gamma settlement-anchor mismatch" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
+def test_unresolved_official_result_is_logged_and_not_booked(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "resolution-pending.db"),
+    ))
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 100.0)
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return {"data": []}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def get(self, url):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "bot.engine.aiohttp.ClientSession",
+        lambda **kwargs: FakeSession(),
+    )
+    window = WindowState(
+        slug="btc-updown-5m-resolution-pending",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "7" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=time.time() - 400,
+        end_ts=time.time() - 100,
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+    )
+    window.up_shares = 0.01
+    window.up_cost = 0.01
+
+    asyncio.run(engine._resolve(window))
+
+    assert window.resolved is False
+    assert window.up_shares == 0.01
+    assert engine.ledger.recent_resolutions("paper", 10) == []
+    assert any(
+        "PAPER resolution pending" in event and "no_resolution_rows" in event
+        for event in engine.events
+    )
+    engine.ledger.conn.close()
+
+
 def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],
