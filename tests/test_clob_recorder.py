@@ -74,3 +74,32 @@ def test_clob_capture_is_opt_in_and_paper_only(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("TRADING_MODE", "paper")
     monkeypatch.setenv("CLOB_CAPTURE_ENABLED", "false")
     assert BotConfig.from_env(env_file).clob_capture_enabled is False
+
+
+
+def test_recorder_writes_paper_order_lifecycle_events(tmp_path) -> None:
+    recorder = CLOBRecorder(tmp_path)
+    event = {
+        "type": "paper_order",
+        "action": "placed",
+        "event_ts": 1_800_000_001.2,
+        "order_id": "order-123",
+        "asset_id": "token-up",
+        "side": "BUY",
+        "price": 0.42,
+        "size": 10.0,
+        "remaining": 10.0,
+        "queue_ahead": 21.0,
+        "status": "open",
+    }
+    assert recorder.enqueue_order_event(event, _window())
+    recorder.request_stop()
+    asyncio.run(recorder.run())
+
+    files = list(tmp_path.glob("clob-btc-*.jsonl.gz"))
+    assert len(files) == 1
+    with gzip.open(files[0], "rt", encoding="utf-8") as stream:
+        record = json.loads(stream.readline())
+    assert record["event_type"] == "paper_order_placed"
+    assert record["payload"]["order_id"] == "order-123"
+    assert record["payload"]["queue_ahead"] == 21.0

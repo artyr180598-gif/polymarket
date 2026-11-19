@@ -276,3 +276,41 @@ def test_maker_fill_rejects_out_of_range_binary_trade_price(monkeypatch) -> None
     ) == []
     assert executor.orders[order_id].status == "open"
     assert executor.positions == {}
+
+
+
+def test_paper_order_callback_records_place_fill_and_cancel(monkeypatch) -> None:
+    now = [100.0]
+    monkeypatch.setattr("bot.execution.time.time", lambda: now[0])
+    executor = PaperExecutor(100.0)
+    executor._latency_sec = 0.0
+    events = []
+    executor.set_order_event_callback(events.append)
+
+    first = asyncio.run(executor.place_post_only_buy(
+        "token-up", 0.40, 5.0,
+        best_bid=0.39, best_ask=0.42, bid_size_at_or_better=0.0,
+    ))
+    assert first is not None
+    fills = executor.on_book_and_tape(
+        "token-up", best_bid=0.40, best_ask=0.42,
+        last_trade_price=0.40, last_trade_size=5.0,
+        last_trade_side="SELL", trade_ts=100.0,
+    )
+    assert len(fills) == 1
+    executor.confirm_fill(fills[0])
+
+    second = asyncio.run(executor.place_post_only_buy(
+        "token-up", 0.41, 5.0,
+        best_bid=0.40, best_ask=0.43, bid_size_at_or_better=2.0,
+    ))
+    assert second is not None
+    assert asyncio.run(executor.cancel_order(second)) is True
+
+    assert [event["action"] for event in events] == [
+        "placed", "fill", "placed", "canceled"
+    ]
+    assert events[0]["queue_ahead"] == 0.0
+    assert events[1]["fill_size"] == 5.0
+    assert events[1]["trade_ts"] == 100.0
+    assert events[3]["canceled_remaining"] == 5.0
