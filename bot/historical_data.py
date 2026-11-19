@@ -175,13 +175,17 @@ def _probability(delta: float, std: float, sigma_mult: float, jump_weight: float
     return max(0.01, min(0.99, p))
 
 
-def _scores(samples: list[tuple[int, float, float, int]], indices: set[int],
-            sigma_mult: float, jump_weight: float) -> dict[str, float | int]:
-    selected = [s for s in samples if s[0] in indices]
+def _scores(samples: list[tuple[int, int, float, float, int]], indices: set[int],
+            sigma_mult: float, jump_weight: float, horizon: int | None = None
+            ) -> dict[str, float | int]:
+    selected = [
+        sample for sample in samples
+        if sample[0] in indices and (horizon is None or sample[1] == horizon)
+    ]
     if not selected:
         return {"n": 0, "brier": float("nan"), "logloss": float("nan"), "accuracy": float("nan")}
     brier = logloss = correct = 0.0
-    for _, delta, std, outcome in selected:
+    for _, _, delta, std, outcome in selected:
         p = _probability(delta, std, sigma_mult, jump_weight)
         y = float(outcome)
         brier += (p - y) ** 2
@@ -192,14 +196,18 @@ def _scores(samples: list[tuple[int, float, float, int]], indices: set[int],
             "accuracy": round(correct / n, 6)}
 
 
-def _constant_scores(samples: list[tuple[int, float, float, int]], indices: set[int],
-                    probability: float = 0.5) -> dict[str, float | int]:
-    selected = [sample for sample in samples if sample[0] in indices]
+def _constant_scores(samples: list[tuple[int, int, float, float, int]], indices: set[int],
+                    probability: float = 0.5, horizon: int | None = None
+                    ) -> dict[str, float | int]:
+    selected = [
+        sample for sample in samples
+        if sample[0] in indices and (horizon is None or sample[1] == horizon)
+    ]
     if not selected:
         return {"n": 0, "brier": float("nan"), "logloss": float("nan"), "accuracy": float("nan")}
     p = max(0.01, min(0.99, probability))
     brier = logloss = correct = 0.0
-    for _, _, _, outcome in selected:
+    for _, _, _, _, outcome in selected:
         y = float(outcome)
         brier += (p - y) ** 2
         logloss -= y * math.log(p) + (1.0 - y) * math.log(1.0 - p)
@@ -210,8 +218,8 @@ def _constant_scores(samples: list[tuple[int, float, float, int]], indices: set[
 
 
 def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
-    """Evaluate forecasts at 60s, 30s and 15s to settlement; chronological holdout."""
-    samples: list[tuple[int, float, float, int]] = []
+    """Evaluate forecasts at six horizons; chronological holdout."""
+    samples: list[tuple[int, int, float, float, int]] = []
     valid_rounds = missing_boundary_rounds = 0
     var_fast = var_slow = DEFAULT_SIGMA_1S ** 2
     last_price: float | None = None
@@ -256,7 +264,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 last_price, last_global_ts = current, global_ts
 
             offset = sec % 300
-            if offset not in (240, 270, 285):
+            if offset not in (60, 120, 180, 240, 270, 285):
                 continue
             start_sec = sec - offset
             outcome = labels.get(start_sec)
@@ -280,7 +288,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 mean_final = weight * current_twap + (1.0 - weight) * current
                 variance = (current * sigma) ** 2 * max((tau ** 3) / 10800.0, 1e-12)
             std = math.sqrt(max(variance, 1e-12))
-            samples.append((day_index, mean_final - strike, std, outcome))
+            samples.append((day_index, int(tau), mean_final - strike, std, outcome))
 
     train_indices = set(range(0, min(21, len(days))))
     test_indices = set(range(min(21, len(days)), len(days)))
