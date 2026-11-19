@@ -69,6 +69,36 @@ class CLOBRecorder:
             "event_type": kind,
             "payload": event,
         }
+        return self._enqueue_record(record, received_ts)
+
+    def enqueue_order_event(self, event: dict[str, Any], window: Any) -> bool:
+        if self.stopping or window is None:
+            return False
+        if getattr(window, "asset", "") != "BTC":
+            return False
+        if getattr(window, "timeframe", "") not in {"5m", "15m"}:
+            return False
+        if not event.get("asset_id") or not event.get("order_id"):
+            return False
+        received_ts = time.time()
+        action = str(event.get("action") or "unknown")
+        record = {
+            "received_ts": received_ts,
+            "received_mono": time.monotonic(),
+            "exchange_ts": event.get("trade_ts"),
+            "asset": "BTC",
+            "timeframe": window.timeframe,
+            "slug": window.slug,
+            "condition_id": window.condition_id,
+            "window_start_ts": window.start_ts,
+            "window_end_ts": window.end_ts,
+            "asset_id": str(event["asset_id"]),
+            "event_type": f"paper_order_{action}",
+            "payload": event,
+        }
+        return self._enqueue_record(record, received_ts)
+
+    def _enqueue_record(self, record: dict[str, Any], received_ts: float) -> bool:
         try:
             line = json.dumps(record, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError):
