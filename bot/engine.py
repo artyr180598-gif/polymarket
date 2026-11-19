@@ -181,7 +181,11 @@ class TradingEngine:
 
         This never changes the trading fair value, quote prices, or risk limits.
         """
-        calibration = report.get("calibration") if isinstance(report, dict) else None
+        if not isinstance(report, dict) or report.get("calibration_version") != 7:
+            log.warning("Unsupported calibration report version; shadow mode remains off")
+            self._shadow_calibration = {}
+            return
+        calibration = report.get("calibration")
         holdout = calibration.get("holdout") if isinstance(calibration, dict) else None
         by_horizon = holdout.get("by_seconds_to_settlement") if isinstance(holdout, dict) else None
         if not isinstance(by_horizon, dict):
