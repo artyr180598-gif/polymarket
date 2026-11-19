@@ -876,3 +876,37 @@ def test_clob_timestamp_rejects_invalid_values() -> None:
     assert _clob_timestamp_seconds(None) is None
     assert _clob_timestamp_seconds("not-a-timestamp") is None
     assert _clob_timestamp_seconds(float("nan")) is None
+
+
+
+def test_maker_gate_diagnostics_are_rate_limited(monkeypatch, caplog, tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    )
+    engine = TradingEngine(cfg)
+    window = WindowState(
+        slug="btc-updown-5m-900",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=900.0,
+        end_ts=1200.0,
+    )
+    now = [100.0]
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: now[0])
+
+    with caplog.at_level("INFO"):
+        engine._log_maker_skip(window, "oracle", "spot_stale", spot_age_sec=7.0)
+        now[0] += 10.0
+        engine._log_maker_skip(window, "oracle", "spot_stale", spot_age_sec=8.0)
+        now[0] += 21.0
+        engine._log_maker_skip(window, "oracle", "spot_stale", spot_age_sec=9.0)
+
+    assert caplog.text.count("PAPER maker gate") == 2
+    assert "spot_age_sec=7.0" in caplog.text
+    assert "spot_age_sec=9.0" in caplog.text
+    engine.ledger.conn.close()
