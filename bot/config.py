@@ -125,6 +125,7 @@ class BotConfig:
     db_path: str = "data/polybot.db"
     paper_stats_since_ts: float = 0.0
     paper_reset_once: bool = False
+    paper_reset_id: str = ""
 
     @property
     def params(self) -> StrategyParams:
@@ -194,4 +195,5 @@ class BotConfig:
             db_path=os.getenv("DB_PATH", "data/polybot.db").strip(),
             paper_stats_since_ts=max(0.0, float(os.getenv("PAPER_STATS_SINCE_TS", "0") or 0)),
             paper_reset_once=os.getenv("PAPER_RESET_ONCE", "false").strip().lower() in ("1", "true", "yes"),
+            paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
         )
