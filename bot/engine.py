@@ -159,6 +159,7 @@ class TradingEngine:
         self._market_feed_last_event_mono = 0.0
         self._maker_diag_last: Dict[str, float] = {}
         self._anchor_reconcile_last: Dict[str, float] = {}
+        self._anchor_reconcile_cursor = 0
         self._risk_halt_active = False
         self._risk_halt_reason = ""
         # Set by the application after Telegram's delivery session initializes.
@@ -1723,8 +1724,13 @@ class TradingEngine:
     async def _reconcile_pending_anchors(self) -> None:
         """Retry RTDS-vs-Gamma checks after official resolution if Gamma lagged."""
         now_mono = time.monotonic()
-        pending = self.ledger.unverified_resolutions(self.cfg.trading_mode, limit=20)
-        for row in pending:
+        pending = self.ledger.unverified_resolutions(self.cfg.trading_mode, limit=100)
+        if not pending:
+            return
+        start = self._anchor_reconcile_cursor % len(pending)
+        batch = [pending[(start + index) % len(pending)] for index in range(min(5, len(pending)))]
+        self._anchor_reconcile_cursor = (start + len(batch)) % len(pending)
+        for row in batch:
             slug = str(row["slug"])
             if now_mono - self._anchor_reconcile_last.get(slug, 0.0) < 60.0:
                 continue
