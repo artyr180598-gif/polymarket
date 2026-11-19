@@ -313,6 +313,7 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
         paused=False,
         _notification_channel_ready=True,
     )
+    engine.resume_after_notification_recovery = lambda: setattr(engine, "paused", False)
     controller = TelegramController(engine)
     controller._startup_acknowledged = True
 
@@ -351,7 +352,7 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
     assert len(recovered.calls) == 1
     assert "PAPER MAKER fill BTC Up" in recovered.calls[0][1]["text"]
     assert engine._notification_channel_ready is True
-    assert engine.paused is True  # delivery recovery never auto-resumes trading
+    assert engine.paused is False  # notification-caused pause auto-recovers after delivery
 
 
 

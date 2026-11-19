@@ -446,6 +446,55 @@ def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path)
 
 
 
+def test_notification_recovery_resumes_only_notification_caused_pause(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "notification-recovery.db"),
+    ))
+    engine.running = True
+    engine._notification_channel_ready = False
+    engine.pause(reason="telegram_delivery", notify=False)
+    engine._notification_channel_ready = True
+
+    assert engine.resume_after_notification_recovery() is True
+    assert engine.paused is False
+    assert engine._pause_reason == ""
+    engine.ledger.conn.close()
+
+
+def test_notification_recovery_does_not_clear_manual_pause(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "manual-pause-preserved.db"),
+    ))
+    engine.running = True
+    engine.pause(reason="manual", notify=False)
+    engine._notification_channel_ready = True
+
+    assert engine.resume_after_notification_recovery() is False
+    assert engine.paused is True
+    assert engine._pause_reason == "manual"
+    engine.ledger.conn.close()
+
+
+def test_notification_recovery_does_not_bypass_risk_halt(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "risk-pause-preserved.db"),
+    ))
+    engine.running = True
+    engine._notification_channel_ready = False
+    engine.pause(reason="telegram_delivery", notify=False)
+    engine._notification_channel_ready = True
+    engine._risk_halted = lambda: True
+    engine._risk_halt_reason = "test risk halt"
+
+    assert engine.resume_after_notification_recovery() is False
+    assert engine.paused is True
+    assert engine._pause_reason == "risk"
+    engine.ledger.conn.close()
+
+
 def test_oracle_diagnostics_report_source_age_and_observed_twap_cadence(monkeypatch, tmp_path) -> None:
     cfg = BotConfig(
         enabled_assets=["BTC"],
