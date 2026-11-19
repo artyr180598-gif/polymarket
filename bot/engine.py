@@ -345,7 +345,12 @@ class TradingEngine:
         return result
 
     def _oracle_fresh(self) -> bool:
-        if not self.trackers:
+        # Readiness is defined by configured trading assets, never by legacy
+        # trackers restored only for inventory settlement. Empty/missing config
+        # must fail closed rather than letting all([]) report a fresh oracle.
+        if not self.cfg.enabled_assets or any(
+            asset not in self.trackers for asset in self.cfg.enabled_assets
+        ):
             return False
         diagnostics = self._oracle_diagnostics()
         return all(
@@ -916,14 +921,17 @@ class TradingEngine:
                     else:
                         self._risk_halt_active = False
                         for w in list(self.windows.values()):
-                            if w.resolved or w.remain_sec < 15:
-                                await self._cancel_window_maker_orders(w)
+                            if w.resolved:
                                 continue
                             if w.asset not in self.cfg.enabled_assets:
-                                # Disabled assets are management-only: no new entries,
-                                # but retain risk-reducing MERGE and official settlement.
+                                # Disabled assets are management-only at every point
+                                # in the window lifecycle: no new entries, but cancel
+                                # stale quotes and retain risk-reducing MERGE.
                                 await self._cancel_window_maker_orders(w)
                                 await self._try_merge(w)
+                                continue
+                            if w.remain_sec < 15:
+                                await self._cancel_window_maker_orders(w)
                                 continue
                             await self._run(w)
                             await self._try_merge(w)
