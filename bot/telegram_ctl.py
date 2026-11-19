@@ -49,6 +49,7 @@ class TelegramController:
         self._task: Optional[asyncio.Task] = None
         self._notification_task: Optional[asyncio.Task] = None
         self._notification_retry_interval = 1.0
+        self._notification_retry_at = 0.0
         self._notification_wakeup = asyncio.Event()
         self._running = False
         self._offset = 0
@@ -236,13 +237,16 @@ class TelegramController:
                                 self._set_notification_retry_delay(r2.status, result2)
                                 return False
                             self._notification_retry_interval = 1.0
+                            self._notification_retry_at = 0.0
                             return True
                     self._set_notification_retry_delay(r.status, result)
                     return False
                 self._notification_retry_interval = 1.0
+                self._notification_retry_at = 0.0
                 return True
         except Exception as e:
             logger.warning("Telegram send failed: %s", e)
+            self._set_notification_retry_delay(503, {})
             return False
 
     def _set_notification_retry_delay(self, status: int, result: Dict[str, Any]) -> None:
@@ -262,6 +266,7 @@ class TelegramController:
             # Keep the event queued and fail closed; avoid hammering a persistent
             # request/configuration error once per second.
             self._notification_retry_interval = max(30.0, self._notification_retry_interval)
+        self._notification_retry_at = time.monotonic() + self._notification_retry_interval
 
     async def notify(self, text: str, event_key: Optional[str] = None) -> None:
         msg = (text or "").strip()
@@ -298,6 +303,11 @@ class TelegramController:
             return
         async with self._notification_delivery_lock:
             while self._pending_notifications and self._session is not None:
+                # New events may wake this worker during a Telegram rate limit;
+                # never let those wakeups bypass retry_after/backoff.
+                delay_remaining = self._notification_retry_at - time.monotonic()
+                if delay_remaining > 0:
+                    break
                 msg = self._pending_notifications[0]
                 notification_id = self._pending_notification_ids[0]
                 event_key = self._pending_notification_keys[0]
