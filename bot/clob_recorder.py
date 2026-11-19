@@ -37,6 +37,7 @@ class CLOBRecorder:
         self.stopping = False
         self.dropped = 0
         self.written = 0
+        self._last_progress_log = 0
         self._segments: dict[str, Path] = {}
 
     def enqueue(self, event: dict[str, Any], window: Any) -> bool:
@@ -103,6 +104,12 @@ class CLOBRecorder:
             try:
                 await asyncio.to_thread(self._write_batch, batch)
                 self.written += len(batch)
+                if self.written == len(batch) or self.written - self._last_progress_log >= 10_000:
+                    log.info(
+                        "CLOB capture active · written=%s dropped=%s queued=%s",
+                        self.written, self.dropped, self.queue.qsize(),
+                    )
+                    self._last_progress_log = self.written
             except Exception:
                 self.dropped += len(batch)
                 log.exception("CLOB capture batch write failed")
