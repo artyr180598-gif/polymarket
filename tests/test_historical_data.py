@@ -150,3 +150,19 @@ def test_fit_parameters_falls_back_when_no_joint_candidate_exists() -> None:
     assert result["sigma_multiplier"] == 1.0
     assert result["jump_weight"] == 0.12
     assert result["train_objective"] is None
+
+
+
+def test_fit_parameters_requires_joint_train_improvement() -> None:
+    samples = [
+        (0, 60, 1.0, 10.0, 1),
+        (0, 60, -1.0, 10.0, 0),
+        (0, 60, 2.0, 10.0, 1),
+        (0, 60, -2.0, 10.0, 0),
+        (0, 60, 3.0, 10.0, 1),
+        (0, 60, -3.0, 10.0, 0),
+    ]
+    result = _fit_parameters(samples, {0}, sigma_values=[0.5, 1.0], jump_values=[0.12])
+    assert result["candidate_found"] is True
+    assert result["sigma_multiplier"] == 0.5
+    assert result["at_search_boundary"] is True
