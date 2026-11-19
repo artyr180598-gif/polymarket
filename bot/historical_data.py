@@ -264,6 +264,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
         "holdout": {"days": len(test_indices), "default_model": base_test,
                     "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
                     "constant_50_baseline": constant_test},
+        "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
     }
 
