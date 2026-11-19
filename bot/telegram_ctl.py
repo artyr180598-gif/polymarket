@@ -500,6 +500,11 @@ class TelegramController:
         resolved = int(stats.get("resolved_markets", 0) or 0)
         completed = int(stats.get("completed_markets", resolved) or 0)
         completed_win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
+        anchor_verified = int(stats.get("anchor_verified_markets", 0) or 0)
+        anchor_unverified = int(stats.get("anchor_unverified_markets", 0) or 0)
+        anchor_verified_rate = float(stats.get("anchor_verified_rate_pct", 0) or 0)
+        anchor_verified_pnl = float(stats.get("anchor_verified_realized_net_pnl", 0) or 0)
+        anchor_unverified_pnl = float(stats.get("anchor_unverified_realized_net_pnl", 0) or 0)
         n_fills = int(stats.get("total_fills", 0) or 0)
         maker_fills = int(stats.get("maker_fills", 0) or 0)
         taker_fills = int(stats.get("taker_fills", max(0, n_fills - maker_fills)) or 0)
@@ -522,7 +527,11 @@ class TelegramController:
                 f"· Завершено рынков: {int(session.get('completed_markets', 0) or 0)} · "
                 f"прибыльных {int(session.get('winning_markets', 0) or 0)} / "
                 f"убыточных {int(session.get('losing_markets', 0) or 0)}\n"
-                f"· Реализованный net PnL: ${float(session.get('realized_net_pnl', 0) or 0):+.2f}"
+                f"· Реализованный net PnL: ${float(session.get('realized_net_pnl', 0) or 0):+.2f}\n"
+                f"· PTB сверка: подтверждено {int(session.get('anchor_verified_markets', 0) or 0)} / "
+                f"не подтверждено {int(session.get('anchor_unverified_markets', 0) or 0)}\n"
+                f"· Verified net: ${float(session.get('anchor_verified_realized_net_pnl', 0) or 0):+.2f} · "
+                f"unverified net: ${float(session.get('anchor_unverified_realized_net_pnl', 0) or 0):+.2f}"
             )
         else:
             session_block = (
@@ -587,7 +596,11 @@ class TelegramController:
             f"· Доли объёма: Maker {maker_notional_pct:.1f}% / Taker {taker_notional_pct:.1f}%\n"
             f"· MERGE: <b>{n_merge}</b> · официально resolved: <b>{resolved}</b>\n"
             f"· Завершённых рынков: <b>{completed}</b> · +{wins} / −{losses} / ={breakeven}\n"
-            f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n\n"
+            f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n"
+            f"· PTB сверка: подтверждено {anchor_verified}/{resolved} ({anchor_verified_rate:.1f}%) · "
+            f"не подтверждено {anchor_unverified}\n"
+            f"· Verified net: ${anchor_verified_pnl:+.2f} · "
+            f"unverified net: ${anchor_unverified_pnl:+.2f}\n\n"
             f"<b>Текущий эксперимент после сброса</b>\n{session_block}\n\n"
             f"<b>Разбивка по таймфреймам (весь Ledger)</b>\n{timeframe_block}\n\n"
             f"ℹ️ Частичный MERGE не считается завершённым рынком. Его результат попадёт в net после полного MERGE или официального резолва. Открытый инвентарь показан отдельно."

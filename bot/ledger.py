@@ -483,6 +483,16 @@ class Ledger:
             """
             SELECT
                 COUNT(*) AS resolved_mkts,
+                COALESCE(SUM(CASE WHEN r.anchor_verified = 1 THEN 1 ELSE 0 END), 0) AS anchor_verified_mkts,
+                COALESCE(SUM(CASE WHEN COALESCE(r.anchor_verified, 0) != 1 THEN 1 ELSE 0 END), 0) AS anchor_unverified_mkts,
+                COALESCE(SUM(CASE
+                    WHEN r.anchor_verified = 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS anchor_verified_net_pnl,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(r.anchor_verified, 0) != 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS anchor_unverified_net_pnl,
                 COALESCE(SUM(CASE
                     WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) > 0.000001
                     THEN 1 ELSE 0 END), 0) AS win_mkts,
@@ -578,6 +588,14 @@ class Ledger:
             "total_fees": round(float(f_row["total_fees"]), 4),
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
+            # NULL means no independent RTDS-vs-Gamma verification was available.
+            "anchor_verified_markets": int(r_row["anchor_verified_mkts"]),
+            "anchor_unverified_markets": int(r_row["anchor_unverified_mkts"]),
+            "anchor_verified_rate_pct": round(
+                100.0 * r_row["anchor_verified_mkts"] / resolved_mkts, 1
+            ) if resolved_mkts else 0.0,
+            "anchor_verified_realized_net_pnl": round(float(r_row["anchor_verified_net_pnl"]), 2),
+            "anchor_unverified_realized_net_pnl": round(float(r_row["anchor_unverified_net_pnl"]), 2),
             "win_markets": int(r_row["win_mkts"]),
             "loss_markets": int(r_row["loss_mkts"]),
             "breakeven_markets": int(r_row["breakeven_mkts"]),
@@ -694,6 +712,46 @@ class Ledger:
             (mode, since_ts, mode),
         ).fetchone()
 
+        anchor_stats = self.conn.execute(
+            """
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            ),
+            merge_stats AS (
+                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl
+                FROM merges
+                GROUP BY mode, slug
+            ),
+            fee_stats AS (
+                SELECT mode, slug, SUM(fee) AS fees
+                FROM fills
+                GROUP BY mode, slug
+            )
+            SELECT
+                COUNT(*) AS resolved_markets,
+                COALESCE(SUM(CASE WHEN r.anchor_verified = 1 THEN 1 ELSE 0 END), 0) AS verified_markets,
+                COALESCE(SUM(CASE WHEN COALESCE(r.anchor_verified, 0) != 1 THEN 1 ELSE 0 END), 0) AS unverified_markets,
+                COALESCE(SUM(CASE
+                    WHEN r.anchor_verified = 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS verified_net_pnl,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(r.anchor_verified, 0) != 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS unverified_net_pnl
+            FROM resolutions r
+            JOIN eligible e ON e.mode = r.mode AND e.slug = r.slug
+            LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
+            LEFT JOIN fee_stats f ON f.mode = r.mode AND f.slug = r.slug
+            WHERE r.mode = ?
+            """,
+            (mode, since_ts, mode),
+        ).fetchone()
+
         total = int(fills["total_fills"] or 0)
         maker = int(fills["maker_fills"] or 0)
         return {
@@ -708,6 +766,11 @@ class Ledger:
             "winning_markets": int(completed["wins"] or 0),
             "losing_markets": int(completed["losses"] or 0),
             "realized_net_pnl": round(float(completed["net_pnl"] or 0.0), 2),
+            "resolved_markets_with_anchor_audit": int(anchor_stats["resolved_markets"] or 0),
+            "anchor_verified_markets": int(anchor_stats["verified_markets"] or 0),
+            "anchor_unverified_markets": int(anchor_stats["unverified_markets"] or 0),
+            "anchor_verified_realized_net_pnl": round(float(anchor_stats["verified_net_pnl"] or 0.0), 2),
+            "anchor_unverified_realized_net_pnl": round(float(anchor_stats["unverified_net_pnl"] or 0.0), 2),
             "pnl_scope": "only markets whose first fill is at/after session start; open markets excluded",
         }
 
