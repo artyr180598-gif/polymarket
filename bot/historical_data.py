@@ -212,6 +212,7 @@ def _constant_scores(samples: list[tuple[int, float, float, int]], indices: set[
 def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     """Evaluate forecasts at 60s, 30s and 15s to settlement; chronological holdout."""
     samples: list[tuple[int, float, float, int]] = []
+    samples_by_horizon: dict[int, list[tuple[int, float, float, int]]] = {60: [], 30: [], 15: []}
     valid_rounds = missing_boundary_rounds = 0
     var_fast = var_slow = DEFAULT_SIGMA_1S ** 2
     last_price: float | None = None
@@ -280,23 +281,64 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 mean_final = weight * current_twap + (1.0 - weight) * current
                 variance = (current * sigma) ** 2 * max((tau ** 3) / 10800.0, 1e-12)
             std = math.sqrt(max(variance, 1e-12))
-            samples.append((day_index, mean_final - strike, std, outcome))
+            sample = (day_index, mean_final - strike, std, outcome)
+            samples.append(sample)
+            samples_by_horizon[int(tau)].append(sample)
 
     train_indices = set(range(0, min(21, len(days))))
     test_indices = set(range(min(21, len(days)), len(days)))
     base_train = _scores(samples, train_indices, 1.0, 0.12)
     base_test = _scores(samples, test_indices, 1.0, 0.12)
     best = (float("inf"), 1.0, 0.12)
-    for step in range(10, 51):
-        sigma_mult = step / 20.0  # 0.50 .. 2.50
-        for jump_step in range(0, 16):
-            jump_weight = jump_step * 0.02
+    for step in range(5, 51):
+        sigma_mult = step / 20.0  # 0.25 .. 2.50
+        for jump_step in range(0, 26):
+            jump_weight = jump_step * 0.02  # 0.00 .. 0.50
             score = _scores(samples, train_indices, sigma_mult, jump_weight)
             if score["n"] and float(score["brier"]) < best[0]:
                 best = (float(score["brier"]), sigma_mult, jump_weight)
     calibrated_test = _scores(samples, test_indices, best[1], best[2])
     baseline_test = _scores(samples, test_indices, 1.0, 0.0)
     constant_test = _constant_scores(samples, test_indices, 0.5)
+
+    horizon_reports: dict[str, Any] = {}
+    for horizon, horizon_samples in samples_by_horizon.items():
+        h_default_train = _scores(horizon_samples, train_indices, 1.0, 0.12)
+        h_default_test = _scores(horizon_samples, test_indices, 1.0, 0.12)
+        h_constant_test = _constant_scores(horizon_samples, test_indices, 0.5)
+        best_brier = (float("inf"), 1.0, 0.12)
+        best_logloss = (float("inf"), 1.0, 0.12)
+        for sigma_step in range(5, 51):
+            sigma_mult = sigma_step / 20.0
+            for jump_step in range(0, 26):
+                jump_weight = jump_step * 0.02
+                score = _scores(horizon_samples, train_indices, sigma_mult, jump_weight)
+                if score["n"]:
+                    if float(score["brier"]) < best_brier[0]:
+                        best_brier = (float(score["brier"]), sigma_mult, jump_weight)
+                    if float(score["logloss"]) < best_logloss[0]:
+                        best_logloss = (float(score["logloss"]), sigma_mult, jump_weight)
+        brier_test = _scores(horizon_samples, test_indices, best_brier[1], best_brier[2])
+        logloss_test = _scores(horizon_samples, test_indices, best_logloss[1], best_logloss[2])
+        horizon_reports[f"{horizon}s"] = {
+            "train_default": h_default_train,
+            "holdout_default": h_default_test,
+            "holdout_constant_50": h_constant_test,
+            "fit_brier": {
+                "sigma_multiplier": best_brier[1],
+                "jump_weight": best_brier[2],
+                "train_brier": round(best_brier[0], 6),
+                "holdout": brier_test,
+                "at_search_boundary": best_brier[1] in (0.25, 2.5) or best_brier[2] in (0.0, 0.5),
+            },
+            "fit_logloss": {
+                "sigma_multiplier": best_logloss[1],
+                "jump_weight": best_logloss[2],
+                "train_logloss": round(best_logloss[0], 6),
+                "holdout": logloss_test,
+                "at_search_boundary": best_logloss[1] in (0.25, 2.5) or best_logloss[2] in (0.0, 0.5),
+            },
+        }
     return {
         "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 60s, 30s, 15s",
         "valid_settlement_rounds": valid_rounds,
@@ -308,8 +350,9 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
         "holdout": {"days": len(test_indices), "default_model": base_test,
                     "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
                     "constant_50_baseline": constant_test},
+        "by_horizon": horizon_reports,
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
-        "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
+        "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate. Do not apply parameters if Brier and log-loss disagree or the optimum hits a grid boundary."
     }
 
 
