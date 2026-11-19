@@ -1340,3 +1340,72 @@ def test_try_merge_closes_profitable_single_matched_pair_with_residual_inventory
     asyncio.run(engine._try_merge(window))
     assert called == [1.0]
     engine.ledger.conn.close()
+
+
+def test_mark_to_market_values_matched_pairs_at_redemption_and_residual_at_bid(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "mtm-pair-and-residual.db"),
+    ))
+    slug = "btc-updown-5m-mtm"
+    condition = "0x" + "3" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=5.0, price=0.60, fee=0.05, fair_prob=0.5,
+    )
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Down", role="MAKER", reason="test",
+        shares=2.0, price=0.30, fee=0.02, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+        up_shares=5.0, down_shares=2.0, up_cost=3.0, down_cost=0.6,
+        up_fees=0.05, down_fees=0.02,
+    )
+    engine.windows[slug] = window
+    engine._market_feed_connected = True
+    engine._market_books = {
+        "up-token": {"bids": {0.20: 100.0}, "asks": {0.21: 100.0},
+                     "recv_mono": time.monotonic()},
+        "down-token": {"bids": {0.10: 100.0}, "asks": {0.11: 100.0},
+                       "recv_mono": time.monotonic()},
+    }
+    state = engine._mark_to_market_state()
+    assert state["complete"] is True
+    assert round(state["market_value"], 2) == 2.60
+    assert round(state["unrealized_pnl"], 2) == -1.07
+    assert round(state["unpaired_exposure_usd"], 2) == 1.83
+    engine.ledger.conn.close()
+
+
+def test_mark_to_market_fails_closed_when_residual_book_is_stale(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "mtm-stale.db"),
+    ))
+    slug = "btc-updown-5m-mtm-stale"
+    condition = "0x" + "4" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=5.0, price=0.60, fee=0.05, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+    )
+    engine.windows[slug] = window
+    engine._market_feed_connected = True
+    engine._market_books = {
+        "up-token": {"bids": {0.20: 100.0}, "asks": {0.21: 100.0},
+                     "recv_mono": time.monotonic() - 10.0},
+    }
+    state = engine._mark_to_market_state()
+    assert state["complete"] is False
+    assert "stale" in state["reason"]
+    engine.ledger.conn.close()
