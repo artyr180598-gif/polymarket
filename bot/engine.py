@@ -1248,7 +1248,8 @@ class TradingEngine:
             best_bid, best_ask = self._book_best(book)
             tick = float(book.get("tick_size") or 0.01)
             if (
-                tick <= 0
+                not all(math.isfinite(value) for value in (tick, best_bid, best_ask, min_size))
+                or tick <= 0
                 or best_bid <= 0
                 or best_ask >= 1
                 or best_bid >= best_ask
