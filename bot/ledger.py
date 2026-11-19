@@ -1101,6 +1101,76 @@ class Ledger:
         ).fetchone()
         return float(row["fees"] or 0.0)
 
+    def recent_consecutive_net_loss_details(
+        self, mode: str, limit: int = 6
+    ) -> List[Dict[str, Any]]:
+        """Return the current loss streak with settlement-audit provenance."""
+        rows = self.conn.execute(
+            """
+            WITH merge_stats AS (
+                SELECT mode, slug, SUM(pairs) AS merged_pairs,
+                       SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
+                FROM merges GROUP BY mode, slug
+            ),
+            fill_stats AS (
+                SELECT mode, slug, SUM(fee) AS fees,
+                       SUM(CASE WHEN lower(outcome) IN ('up', 'yes') THEN shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(outcome) IN ('down', 'no') THEN shares ELSE 0 END) AS down_shares
+                FROM fills GROUP BY mode, slug
+            ),
+            completed AS (
+                SELECT r.mode, r.slug, r.ts,
+                       r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS market_net_pnl,
+                       r.anchor_verified, r.price_to_beat_source, r.anchor_delta,
+                       'resolution' AS completion_type
+                FROM resolutions r
+                LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
+                LEFT JOIN fill_stats f ON f.mode = r.mode AND f.slug = r.slug
+                UNION ALL
+                SELECT m.mode, m.slug, m.merge_ts AS ts,
+                       m.merge_pnl - COALESCE(f.fees, 0) AS market_net_pnl,
+                       NULL AS anchor_verified, '' AS price_to_beat_source,
+                       NULL AS anchor_delta, 'full_merge' AS completion_type
+                FROM merge_stats m
+                JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM resolutions r
+                    WHERE r.mode = m.mode AND r.slug = m.slug
+                )
+                  AND ABS(f.up_shares - m.merged_pairs) <= 0.0001
+                  AND ABS(f.down_shares - m.merged_pairs) <= 0.0001
+            )
+            SELECT slug, ts, market_net_pnl, anchor_verified,
+                   price_to_beat_source, anchor_delta, completion_type
+            FROM completed
+            WHERE mode = ?
+            ORDER BY ts DESC, slug DESC
+            LIMIT ?
+            """,
+            (mode, max(1, int(limit))),
+        ).fetchall()
+        streak: List[Dict[str, Any]] = []
+        for row in rows:
+            net = float(row["market_net_pnl"])
+            if net >= -0.000001:
+                break
+            streak.append({
+                "slug": str(row["slug"]),
+                "ts": float(row["ts"]),
+                "net_pnl": round(net, 4),
+                "anchor_verified": (
+                    bool(row["anchor_verified"])
+                    if row["anchor_verified"] is not None else None
+                ),
+                "price_to_beat_source": str(row["price_to_beat_source"] or ""),
+                "anchor_delta": (
+                    float(row["anchor_delta"])
+                    if row["anchor_delta"] is not None else None
+                ),
+                "completion_type": str(row["completion_type"]),
+            })
+        return streak
+
     def consecutive_net_losses(self, mode: str) -> int:
         """Count consecutive completed market losses, including fully merged markets."""
         rows = self.conn.execute(
