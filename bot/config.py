@@ -102,6 +102,7 @@ class BotConfig:
     enabled_assets: List[str] = field(default_factory=lambda: ["BTC"])
     enabled_timeframes: List[str] = field(default_factory=lambda: ["5m"])
     auto_start: bool = True
+    clob_capture_enabled: bool = False
 
     order_clip_usd: float = 18.0
     max_window_risk_usd: float = 60.0
@@ -174,6 +175,10 @@ class BotConfig:
             enabled_assets=assets,
             enabled_timeframes=tfs,
             auto_start=os.getenv("AUTO_START", "true").strip().lower() in ("1", "true", "yes"),
+            clob_capture_enabled=(
+                mode == "paper"
+                and os.getenv("CLOB_CAPTURE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            ),
             order_clip_usd=max(5.0, float(os.getenv("ORDER_CLIP_USD", "18"))),
             max_window_risk_usd=max(10.0, float(os.getenv("MAX_WINDOW_RISK_USD", "60"))),
             max_total_exposure_usd=max(25.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "350"))),
