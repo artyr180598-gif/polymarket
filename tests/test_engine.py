@@ -1223,3 +1223,56 @@ def test_maker_gate_diagnostics_are_rate_limited(monkeypatch, caplog, tmp_path) 
     assert "spot_age_sec=7.0" in caplog.text
     assert "spot_age_sec=9.0" in caplog.text
     engine.ledger.conn.close()
+
+
+
+def test_maker_quote_keeps_queue_priority_after_twenty_seconds(monkeypatch, tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "maker-queue-priority.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = [1_000.0]
+    monkeypatch.setattr("bot.engine.time.time", lambda: now[0])
+    window = WindowState(
+        slug="btc-updown-5m-maker-queue-priority",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "7" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=900.0,
+        end_ts=1_200.0,
+        price_to_beat=100_000.0,
+    )
+    for token, bid in (("up-token", 0.40), ("down-token", 0.37)):
+        engine._market_books[token] = {
+            "bids": {bid: 10.0},
+            "asks": {bid + 0.05: 20.0},
+            "best_bid": bid,
+            "best_ask": bid + 0.05,
+            "tick_size": 0.01,
+            "recv_mono": time.monotonic(),
+        }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    before = {
+        order.asset_id: (order.order_id, order.created_ts, order.queue_ahead)
+        for order in engine.executor.get_open_orders()
+    }
+    assert len(before) == 2
+
+    now[0] += 25.0
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    after = {
+        order.asset_id: (order.order_id, order.created_ts, order.queue_ahead)
+        for order in engine.executor.get_open_orders()
+    }
+
+    assert after == before
+    engine.ledger.conn.close()
