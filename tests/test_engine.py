@@ -186,6 +186,97 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
     engine.ledger.conn.close()
 
 
+def test_maker_pair_quotes_reject_combined_cost_above_limit(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-cost-filter.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-pair-cost-filter",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "2" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0}, "asks": {0.45: 20.0},
+        "best_bid": 0.40, "best_ask": 0.45,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+    engine._market_books["down-token"] = {
+        "bids": {0.57: 10.0}, "asks": {0.62: 20.0},
+        "best_bid": 0.57, "best_ask": 0.62,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+
+    # Even a strongly directional fair-value estimate cannot open one leg.
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.99, fair_down=0.01))
+
+    assert engine.executor.get_open_orders("up-token") == []
+    assert engine.executor.get_open_orders("down-token") == []
+    engine.ledger.conn.close()
+
+
+def test_maker_pair_quotes_only_the_opposite_leg_for_unpaired_inventory(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-completion-maker.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-pair-completion-maker",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "3" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+        up_shares=5.0,
+        up_cost=3.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0}, "asks": {0.45: 20.0},
+        "best_bid": 0.40, "best_ask": 0.45,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+    engine._market_books["down-token"] = {
+        "bids": {0.37: 10.0}, "asks": {0.42: 20.0},
+        "best_bid": 0.37, "best_ask": 0.42,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+
+    # Existing Up cost is $0.60/share; Down at $0.38 keeps pair cost at $0.98.
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.01, fair_down=0.99))
+
+    assert engine.executor.get_open_orders("up-token") == []
+    down_orders = engine.executor.get_open_orders("down-token")
+    assert len(down_orders) == 1
+    assert down_orders[0].price == 0.38
+    assert down_orders[0].size == 5.0
+    engine.ledger.conn.close()
+
+
 def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path, caplog) -> None:
     from bot.execution import PaperExecutor
 
