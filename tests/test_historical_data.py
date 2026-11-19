@@ -8,12 +8,11 @@ from decimal import Decimal
 import pytest
 
 from bot.historical_data import (
-    _constant_scores,
     _date_range,
     _load_day,
-    _scores,
     _norm_cdf,
     _probability,
+    _scores,
     _validate_gzip,
 )
 
@@ -77,15 +76,17 @@ def test_validate_gzip_rejects_duplicate_or_unordered_timestamps(tmp_path) -> No
 
 
 
-def test_forecast_scores_and_neutral_baseline() -> None:
+def test_scores_can_be_split_by_seconds_to_settlement() -> None:
     samples = [
-        (0, 100.0, 50.0, 1),
-        (0, -100.0, 50.0, 0),
-        (1, 0.0, 50.0, 1),
+        (0, 240, 1.0, 1.0, 1),
+        (0, 15, -1.0, 1.0, 0),
+        (1, 240, -1.0, 1.0, 0),
     ]
-    selected = _scores(samples, {0}, 1.0, 0.12)
-    neutral = _constant_scores(samples, {0}, 0.5)
-    assert selected["n"] == 2
-    assert selected["accuracy"] == 1.0
-    assert neutral["n"] == 2
-    assert neutral["brier"] == 0.25
+    all_scores = _scores(samples, {0, 1}, 1.0, 0.0)
+    early_scores = _scores(samples, {0, 1}, 1.0, 0.0, horizon=240)
+    late_scores = _scores(samples, {0, 1}, 1.0, 0.0, horizon=15)
+    assert all_scores["n"] == 3
+    assert early_scores["n"] == 2
+    assert late_scores["n"] == 1
+    assert early_scores["brier"] > 0
+    assert late_scores["brier"] > 0
