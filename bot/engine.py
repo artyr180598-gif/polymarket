@@ -1237,13 +1237,15 @@ class TradingEngine:
                     await self._open(w, "Down", float(ask_dn), sz, "lockin", fee=fee, fair_prob=fair_dn)
                     return
 
-        want_up = (
+        # Directional entries rely on an uncalibrated heuristic fair-value model.
+        # Keep them disabled by default; profitable pair completion above remains active.
+        want_up = self.params.enable_directional_taker and (
             ask_up is not None and fair_up >= 0.56
             and ask_up <= fair_up - edge
             and 0.20 <= ask_up <= 0.90
             and w.up_shares < max_side and depth_up >= 5
         )
-        want_dn = (
+        want_dn = self.params.enable_directional_taker and (
             ask_dn is not None and fair_dn >= 0.56
             and ask_dn <= fair_dn - edge
             and 0.20 <= ask_dn <= 0.90
