@@ -486,47 +486,76 @@ class TelegramController:
         res_pnl = float(stats.get("realized_gross_pnl", 0) or 0)
         merge_pnl = float(stats.get("merged_locked_pnl", 0) or 0)
         lifetime_pnl = float(stats.get("lifetime_total_net_pnl", 0) or 0)
-        wins = int(stats.get("win_markets", 0) or 0)
-        losses = int(stats.get("loss_markets", 0) or 0)
-        breakeven = int(stats.get("breakeven_markets", 0) or 0)
+        wins = int(stats.get("completed_win_markets", stats.get("win_markets", 0)) or 0)
+        losses = int(stats.get("completed_loss_markets", stats.get("loss_markets", 0)) or 0)
+        breakeven = int(stats.get("completed_breakeven_markets", stats.get("breakeven_markets", 0)) or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
         completed = int(stats.get("completed_markets", resolved) or 0)
-        wins = int(stats.get("completed_win_markets", wins) or 0)
-        losses = int(stats.get("completed_loss_markets", losses) or 0)
-        breakeven = int(stats.get("completed_breakeven_markets", breakeven) or 0)
         completed_win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
         n_fills = int(stats.get("total_fills", 0) or 0)
         maker_fills = int(stats.get("maker_fills", 0) or 0)
+        taker_fills = int(stats.get("taker_fills", max(0, n_fills - maker_fills)) or 0)
         maker_fill_pct = float(stats.get("maker_fill_pct", 0) or 0)
+        taker_fill_pct = float(stats.get("taker_fill_pct", max(0, 100.0 - maker_fill_pct) if n_fills else 0) or 0)
+        maker_notional_pct = float(stats.get("maker_usdc_pct", 0) or 0)
+        taker_notional_pct = float(stats.get("taker_usdc_pct", max(0, 100.0 - maker_notional_pct) if stats.get("total_notional") else 0) or 0)
         n_merge = int(stats.get("merge_count", 0) or 0)
+
+        timeframe_lines = []
+        ledger = getattr(self.engine, "ledger", None)
+        if ledger is not None and hasattr(ledger, "get_timeframe_stats"):
+            try:
+                for row in ledger.get_timeframe_stats(self.engine.cfg.trading_mode):
+                    taker_pct = max(0.0, 100.0 - float(row["maker_fill_pct"])) if row["total_fills"] else 0.0
+                    timeframe_lines.append(
+                        f"· <b>{row['timeframe']}</b>: fills {row['total_fills']} "
+                        f"(M {row['maker_fills']}/{row['maker_fill_pct']:.1f}% · "
+                        f"T {row['taker_fills']}/{taker_pct:.1f}%) · "
+                        f"объём M/T \${row['maker_notional']:.2f}/\${row['taker_notional']:.2f} · "
+                        f"fees −\${row['fees']:.2f}\n"
+                        f"  закрыто {row['completed_markets']} "
+                        f"(+{row['wins']}/−{row['losses']}/={row['breakeven']}) · "
+                        f"win {row['win_rate_pct']:.1f}% · net \${row['realized_net_pnl']:+.2f}\n"
+                        f"  MERGE {row['merge_count']} / {row['merged_pairs']:.2f} пар · "
+                        f"gross \${row['merge_gross_pnl']:+.2f} · "
+                        f"открыто {row['open_markets']} рынков · "
+                        f"инвентарь \${row['open_inventory_cost']:.2f} · "
+                        f"комиссии входа −\${row['open_fees']:.2f}"
+                    )
+            except Exception:
+                logger.exception("Could not build timeframe PAPER statistics")
+                timeframe_lines = ["Разбивка по таймфреймам временно недоступна: ошибка чтения SQLite."]
+        timeframe_block = (
+            "\n".join(timeframe_lines)
+            if timeframe_lines else "Пока нет исполнений по таймфреймам."
+        )
         emoji = "📈" if lifetime_pnl >= 0 else "📉"
         return (
             f"💰 <b>PnL — PAPER / виртуальный учёт</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Стратегия: <b>{preset_title}</b>\n"
-            f"Стартовый виртуальный банк: <b>${bank:,.0f}</b>\n"
-            f"Equity текущего процесса (cash + позиции по себестоимости): <b>${equity:,.2f}</b>\n"
-            f"Cash текущего процесса: ${cash:,.2f}\n"
-            f"{emoji} Lifetime net PnL по Ledger: <b>${lifetime_pnl:+.2f}</b>\n"
-            f"Сегодня net PnL по Ledger: <b>${day:+.2f}</b>\n"
-            f"Комиссии за всё время: <b>−${float(stats.get('total_fees', 0) or 0):.2f}</b>\n\n"
+            f"Стартовый виртуальный банк: <b>\${bank:,.0f}</b>\n"
+            f"Equity (cash + позиции по себестоимости): <b>\${equity:,.2f}</b>\n"
+            f"Cash: \${cash:,.2f}\n"
+            f"{emoji} Lifetime net PnL по Ledger: <b>\${lifetime_pnl:+.2f}</b>\n"
+            f"Сегодня net PnL по Ledger: <b>\${day:+.2f}</b>\n"
+            f"Комиссии за всё время: <b>−\${float(stats.get('total_fees', fees) or 0):.2f}</b>\n\n"
             f"<b>Состав Lifetime PnL</b>\n"
-            f"· MERGE gross: <b>${merge_pnl:+.2f}</b>\n"
-            f"· Разрешённые рынки gross: <b>${res_pnl:+.2f}</b>\n"
-            f"· Все комиссии: <b>−${float(stats.get('total_fees', 0) or 0):.2f}</b>\n"
-            f"· Проверка: MERGE gross + resolved gross − комиссии = Lifetime net\n"
-            f"· Equity текущего процесса − старт: ${pnl:+.2f} (не lifetime)\n"
-            f"· Открытые позиции оцениваются по себестоимости, не по mark-to-market.\n"
+            f"· MERGE gross: <b>\${merge_pnl:+.2f}</b>\n"
+            f"· Разрешённые рынки gross: <b>\${res_pnl:+.2f}</b>\n"
+            f"· Все комиссии: <b>−\${float(stats.get('total_fees', fees) or 0):.2f}</b>\n"
+            f"· Формула: MERGE gross + resolved gross − все комиссии = Lifetime net\n"
+            f"· Equity − старт: \${pnl:+.2f}; открытые позиции пока по себестоимости, не mark-to-market.\n"
             f"· Это PAPER симуляция, не фактический PnL аккаунта Polymarket.\n\n"
-            f"📊 Журнал\n"
-            f"· Исполнений (отдельных ног): <b>{n_fills}</b>\n"
-            f"· Maker: <b>{maker_fills}</b> ({maker_fill_pct:.1f}%)\n"
-            f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Официально resolved: <b>{resolved}</b>\n"
-            f"· Завершённых рынков (резолв или полный MERGE): <b>{completed}</b>\n"
-            f"· Плюсовых: <b>{wins}</b> · минусовых: <b>{losses}</b> · около нуля: <b>{breakeven}</b>\n"
+            f"<b>Общее исполнение</b>\n"
+            f"· Fill-ног: <b>{n_fills}</b> · Maker {maker_fills} ({maker_fill_pct:.1f}%) · "
+            f"Taker {taker_fills} ({taker_fill_pct:.1f}%)\n"
+            f"· Доли объёма: Maker {maker_notional_pct:.1f}% / Taker {taker_notional_pct:.1f}%\n"
+            f"· MERGE: <b>{n_merge}</b> · официально resolved: <b>{resolved}</b>\n"
+            f"· Завершённых рынков: <b>{completed}</b> · +{wins} / −{losses} / ={breakeven}\n"
             f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n\n"
-            f"ℹ️ Частичный MERGE с оставшейся позицией не считается завершённой сделкой; его результат будет учтён после полного закрытия или официального резолва."
+            f"<b>Разбивка по таймфреймам</b>\n{timeframe_block}\n\n"
+            f"ℹ️ Частичный MERGE не считается завершённым рынком. Его результат попадёт в net после полного MERGE или официального резолва. Открытый инвентарь показан отдельно."
         )
 
     def _fmt_positions(self) -> str:
