@@ -102,6 +102,8 @@ class TradingEngine:
         self.windows: Dict[str, WindowState] = {}
         self.running = False
         self.paused = not cfg.auto_start
+        # Keep pause sources distinct so Telegram recovery cannot clear operator/risk stops.
+        self._pause_reason = "manual" if self.paused else ""
         self._tasks: List[asyncio.Task] = []
         self.executor: Any = None
         self.cash = float(cfg.bankroll_usd)
@@ -203,6 +205,7 @@ class TradingEngine:
         self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
         if self._risk_halted():
             self.paused = True
+            self._pause_reason = "risk"
             self._risk_halt_active = True
             self._log_event(
                 "ALERT",
@@ -230,24 +233,33 @@ class TradingEngine:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-    def pause(self) -> None:
+    def pause(self, reason: str = "manual", notify: bool = True) -> None:
+        # A Telegram outage must not overwrite an existing manual or critical stop.
+        if reason == "telegram_delivery":
+            if not self.paused or not self._pause_reason:
+                self._pause_reason = reason
+        else:
+            self._pause_reason = reason
         self.paused = True
         if self.executor is not None:
             try:
                 asyncio.get_running_loop().create_task(self.executor.cancel_all())
             except RuntimeError:
                 pass
-        self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=True)
+        self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=notify)
 
     def resume(self) -> bool:
         if self._notification_channel_ready is False:
             self.paused = True
+            if not self._pause_reason:
+                self._pause_reason = "telegram_delivery"
             self._risk_halt_reason = "Telegram delivery is not initialized; PAPER trading remains paused"
             self._log_event("ALERT", self._risk_halt_reason, notify=False)
             return False
         # Re-check durable risk and data-integrity guards before unpausing.
         if self._risk_halted():
             self.paused = True
+            self._pause_reason = "risk"
             self._risk_halt_active = True
             self._log_event(
                 "ALERT",
@@ -256,7 +268,29 @@ class TradingEngine:
             )
             return False
         self.paused = False
+        self._pause_reason = ""
         self._log_event("INFO", "PAPER-торговля возобновлена", notify=True)
+        return True
+
+    def resume_after_notification_recovery(self) -> bool:
+        """Resume only a pause caused solely by Telegram delivery recovery."""
+        if not self.paused or self._pause_reason != "telegram_delivery":
+            return False
+        if not self.running or self._notification_channel_ready is False:
+            return False
+        if self._risk_halted():
+            self._pause_reason = "risk"
+            self._risk_halt_active = True
+            self._log_event(
+                "ALERT",
+                f"Автовозобновление заблокировано защитой: {self._risk_halt_reason}",
+                notify=False,
+            )
+            return False
+        self.paused = False
+        self._pause_reason = ""
+        # Avoid enqueueing a new message while draining the Telegram outbox.
+        self._log_event("INFO", "PAPER-торговля автоматически возобновлена после восстановления Telegram", notify=False)
         return True
 
     def set_preset(self, key: str) -> bool:
@@ -273,6 +307,7 @@ class TradingEngine:
 
     async def emergency_kill(self) -> Dict[str, Any]:
         self.paused = True
+        self._pause_reason = "emergency"
         canceled = await self.executor.cancel_all() if self.executor is not None else 0
         merged = 0.0
         for w in list(self.windows.values()):
@@ -901,6 +936,9 @@ class TradingEngine:
         except Exception as exc:
             self.executor.rollback_fill(fill)
             self.paused = True
+            self._pause_reason = "risk"
+            self._risk_halt_active = True
+            self._risk_halt_reason = "Maker PAPER fill could not be persisted to SQLite"
             await self.executor.cancel_all()
             log.exception("Maker PAPER fill not persisted; trading paused: %s", exc)
             self._log_event("ALERT", "Ошибка записи maker-fill в SQLite · торговля остановлена", notify=True)
@@ -1621,6 +1659,7 @@ class TradingEngine:
                 anchor_verified = anchor_delta <= 0.01
                 if not anchor_verified:
                     self.paused = True
+                    self._pause_reason = "risk"
                     self._risk_halt_active = True
                     self._risk_halt_reason = (
                         f"Chainlink/Gamma settlement-anchor mismatch: {w.slug}, "
