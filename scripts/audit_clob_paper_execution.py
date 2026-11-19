@@ -40,6 +40,12 @@ def _num(value: Any, default: float = 0.0) -> float:
     return number if number == number and abs(number) != float("inf") else default
 
 
+def _timestamp_seconds(value: Any) -> float:
+    """Normalize Unix timestamps in seconds or milliseconds."""
+    number = _num(value)
+    return number / 1000.0 if number >= 100_000_000_000 else number
+
+
 def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
     event_counts: Counter[str] = Counter()
     trades_by_asset: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -76,7 +82,7 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         matched_prints = 0
         for trade_row in trades_by_asset.get(asset_id, []):
             trade = trade_row.get("payload") or {}
-            trade_ts = _num(trade.get("timestamp"))
+            trade_ts = _timestamp_seconds(trade.get("timestamp"))
             received_ts = _num(trade_row.get("received_ts"))
             side = str(trade.get("side") or "").upper()
             trade_price = _num(trade.get("price"))
@@ -137,7 +143,7 @@ def main() -> None:
     parser.add_argument("paths", nargs="+", type=Path, help="CLOB .jsonl.gz or .jsonl capture files")
     parser.add_argument("--output", type=Path, help="Optional JSON output path")
     args = parser.parse_args()
-    files = [path for item in args.paths for path in (sorted(item.glob("*.jsonl.gz")) if item.is_dir() else [item])]
+    files = [path for item in args.paths for path in (sorted([*item.glob("*.jsonl.gz"), *item.glob("*.jsonl")]) if item.is_dir() else [item])]
     result = analyze(read_records(files))
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
