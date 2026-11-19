@@ -1144,7 +1144,7 @@ class TradingEngine:
         down_value = (float(down_cost) + float(down_fees)) * down_residual / down if down > 0 else 0.0
         return max(0.0, up_value + down_value)
 
-    def _unpaired_exposure_usd(self, exclude_slug: Optional[str] = None) -> float:
+    def _unpaired_exposure_usd(self, exclude_slug: Optional[str] = None, include_orders: bool = True) -> float:
         """Portfolio unmatched inventory cost plus all outstanding Maker reserves."""
         exposure = 0.0
         for position in self.ledger.open_positions(self.cfg.trading_mode):
@@ -1155,7 +1155,7 @@ class TradingEngine:
                 position["up_cost"], position["down_cost"],
                 position["up_fees"], position["down_fees"],
             )
-        if self.executor is not None:
+        if include_orders and self.executor is not None:
             exposure += sum(max(0.0, float(order.price)) * max(0.0, float(order.remaining))
                             for order in self.executor.get_open_orders())
         return exposure
@@ -1870,7 +1870,7 @@ class TradingEngine:
         projected_down_cost = w.down_cost + (price * size if outcome == "Down" else 0.0)
         projected_up_fees = w.up_fees + (fee if outcome == "Up" else 0.0)
         projected_down_fees = w.down_fees + (fee if outcome == "Down" else 0.0)
-        other_unpaired = self._unpaired_exposure_usd(exclude_slug=w.slug)
+        other_unpaired = self._unpaired_exposure_usd(exclude_slug=w.slug, include_orders=False)
         pending_reserve = sum(order.price * order.remaining for order in self.executor.get_open_orders()) if self.executor is not None else 0.0
         projected_unpaired = other_unpaired + pending_reserve + self._unpaired_cost(
             projected_up_shares, projected_down_shares,
