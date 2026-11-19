@@ -158,6 +158,9 @@ class TradingEngine:
         self._market_feed_connected = False
         self._market_feed_last_event_mono = 0.0
         self._maker_diag_last: Dict[str, float] = {}
+        # Calibration remains telemetry-only until execution-aware validation passes.
+        self._shadow_calibration: Dict[int, Dict[str, float]] = {}
+        self._shadow_logged: set[tuple[str, int]] = set()
         self._anchor_reconcile_last: Dict[str, float] = {}
         self._anchor_reconcile_cursor = 0
         self._resolution_diag_last: Dict[str, float] = {}
@@ -175,6 +178,47 @@ class TradingEngine:
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
+
+    def set_shadow_calibration(self, report: Dict[str, Any]) -> None:
+        """Load only independently accepted BTC 5m horizons for diagnostics.
+
+        This never changes the trading fair value, quote prices, or risk limits.
+        """
+        if not isinstance(report, dict) or report.get("calibration_version") != 7:
+            log.warning("Unsupported calibration report version; shadow mode remains off")
+            self._shadow_calibration = {}
+            return
+        calibration = report.get("calibration")
+        holdout = calibration.get("holdout") if isinstance(calibration, dict) else None
+        by_horizon = holdout.get("by_seconds_to_settlement") if isinstance(holdout, dict) else None
+        if not isinstance(by_horizon, dict):
+            log.warning("Calibration report has no per-horizon holdout; shadow mode remains off")
+            return
+        accepted: Dict[int, Dict[str, float]] = {}
+        for key, metrics in by_horizon.items():
+            try:
+                horizon = int(key)
+                sigma = float(metrics["fitted_sigma_multiplier"])
+                jump = float(metrics["fitted_jump_weight"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                horizon not in {240, 180, 120, 60, 30, 15}
+                or metrics.get("accepted_for_shadow_research") is not True
+                or metrics.get("at_search_boundary") is True
+                or not math.isfinite(sigma)
+                or not math.isfinite(jump)
+                or not 0.4 <= sigma <= 2.5
+                or not 0.0 <= jump <= 0.8
+            ):
+                continue
+            accepted[horizon] = {"sigma_multiplier": sigma, "jump_weight": jump}
+        self._shadow_calibration = accepted
+        log.info(
+            "BTC 5m calibration shadow loaded · version=%s · horizons=%s · trading parameters unchanged",
+            report.get("calibration_version", "unknown"),
+            ",".join(str(x) for x in sorted(accepted, reverse=True)) or "none",
+        )
 
     def _log_event(
         self, level: str, msg: str, notify: bool = False,
@@ -1342,6 +1386,35 @@ class TradingEngine:
             return
 
         tau = w.remain_sec
+        # Compare calibrated probabilities only at the six trained horizons.
+        # The result is telemetry: existing fair_up/fair_dn and all orders below
+        # continue to use the unmodified production model.
+        if w.timeframe == "5m" and self._shadow_calibration:
+            nearest = min(self._shadow_calibration, key=lambda value: abs(tau - value))
+            shadow_key = (w.slug, nearest)
+            if abs(tau - nearest) <= 2.5 and shadow_key not in self._shadow_logged:
+                params = self._shadow_calibration[nearest]
+                try:
+                    shadow = tr.compute_fair_value(
+                        float(w.price_to_beat),
+                        float(w.end_ts),
+                        sigma_multiplier=params["sigma_multiplier"],
+                        jump_weight=params["jump_weight"],
+                    )
+                    log.info(
+                        "PAPER calibration shadow · slug=%s · horizon=%ss · base_up=%.5f "
+                        "shadow_up=%.5f · delta_pp=%.2f · sigma_mult=%.2f · jump_weight=%.2f "
+                        "· execution_model=unchanged",
+                        w.slug, nearest, fv.prob_up, shadow.prob_up,
+                        (shadow.prob_up - fv.prob_up) * 100.0,
+                        params["sigma_multiplier"], params["jump_weight"],
+                    )
+                    self._shadow_logged.add(shadow_key)
+                    if len(self._shadow_logged) > 5000:
+                        self._shadow_logged.clear()
+                except Exception:
+                    log.exception("Could not calculate BTC calibration shadow probability")
+
         fair_up = float(fv.prob_up)
         fair_dn = 1.0 - fair_up
         edge = (
