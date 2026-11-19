@@ -103,3 +103,29 @@ def test_recorder_writes_paper_order_lifecycle_events(tmp_path) -> None:
     assert record["event_type"] == "paper_order_placed"
     assert record["payload"]["order_id"] == "order-123"
     assert record["payload"]["queue_ahead"] == 21.0
+
+
+
+def test_recorder_writes_oracle_spot_and_twap_events(tmp_path) -> None:
+    recorder = CLOBRecorder(tmp_path)
+    assert recorder.enqueue_oracle_event(
+        "BTC", "chainlink_spot", 97000.25, 1_800_000_001_000,
+        accepted=True, age_sec=0.12,
+    )
+    assert recorder.enqueue_oracle_event(
+        "BTC", "chainlink_twap60", 96998.75, 1_800_000_001_000,
+        accepted=False, age_sec=6.2,
+    )
+    recorder.request_stop()
+    asyncio.run(recorder.run())
+
+    files = list(tmp_path.glob("clob-btc-*.jsonl.gz"))
+    assert len(files) == 1
+    with gzip.open(files[0], "rt", encoding="utf-8") as stream:
+        records = [json.loads(line) for line in stream]
+    assert [record["event_type"] for record in records] == [
+        "oracle_chainlink_spot", "oracle_chainlink_twap60"
+    ]
+    assert records[0]["payload"]["accepted"] is True
+    assert records[1]["payload"]["accepted"] is False
+    assert records[1]["payload"]["age_sec"] == 6.2
