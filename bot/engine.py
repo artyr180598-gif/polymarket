@@ -1361,8 +1361,11 @@ class TradingEngine:
                     other = "Down" if outcome == "Up" else "Up"
                     existing_pair_cost = order.price + float(candidates[other]["quote_price"])
                 moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
-                aged = now_wall - order.created_ts > 20.0
-                if moved or aged or existing_pair_cost > pair_max_cost + 1e-9:
+                # Keep the original order in the queue while its price and pair
+                # economics remain valid. A periodic age-based cancel/repost
+                # needlessly sends our Maker order to the back of the queue.
+                # Stale books are already failed closed above (5s freshness).
+                if moved or existing_pair_cost > pair_max_cost + 1e-9:
                     for stale in existing:
                         await self.executor.cancel_order(stale.order_id)
                 else:
