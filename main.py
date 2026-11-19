@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -36,6 +39,7 @@ def main() -> None:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        archive_task: asyncio.Task | None = None
         log.info(
             "Boot mode=%s bankroll=%s tg_token=%s tg_chat=%s",
             cfg.trading_mode,
@@ -61,9 +65,36 @@ def main() -> None:
             engine._notification_channel_ready = False
             log.exception("telegram.start failed; pausing PAPER trading")
             engine.pause(reason="telegram_delivery", notify=False)
+        archive_from = os.getenv("POLYTICKTAPE_ARCHIVE_FROM", "").strip()
+        archive_to = os.getenv("POLYTICKTAPE_ARCHIVE_TO", "").strip()
+        archive_key = os.getenv("POLYTICKTAPE_KEY", "").strip()
+        if archive_key and archive_from and archive_to:
+            from bot.historical_data import download_and_calibrate
+
+            archive_dir = Path(cfg.db_path).parent / "market-data" / "polyticktape"
+
+            async def run_archive_job() -> None:
+                try:
+                    await download_and_calibrate(
+                        archive_key, str(archive_dir), archive_from, archive_to
+                    )
+                except Exception:
+                    log.exception("Poly Tick Tape archive download/calibration failed")
+
+            archive_task = asyncio.create_task(
+                run_archive_job(), name="polyticktape_archive_calibration"
+            )
+            log.info(
+                "Poly Tick Tape archive job scheduled for %s..%s",
+                archive_from, archive_to,
+            )
         try:
             yield
         finally:
+            if archive_task is not None:
+                if not archive_task.done():
+                    archive_task.cancel()
+                await asyncio.gather(archive_task, return_exceptions=True)
             try:
                 await tg.stop()
             except Exception:
