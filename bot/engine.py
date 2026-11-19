@@ -1467,11 +1467,18 @@ class TradingEngine:
                     other = "Down" if outcome == "Up" else "Up"
                     existing_pair_cost = order.price + float(candidates[other]["quote_price"])
                 moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
-                # Keep the original order in the queue while its price and pair
-                # economics remain valid. A periodic age-based cancel/repost
-                # needlessly sends our Maker order to the back of the queue.
-                # Stale books are already failed closed above (5s freshness).
-                if moved or existing_pair_cost > pair_max_cost + 1e-9:
+                min_requote_age = max(0.0, float(self.params.maker_min_requote_sec))
+                order_age = max(0.0, now_wall - float(order.created_ts))
+                must_cancel = (
+                    existing_pair_cost > pair_max_cost + 1e-9
+                    or order.price >= float(candidate["best_ask"]) - 1e-9
+                )
+                should_requote = moved and order_age >= min_requote_age
+                # Avoid repeatedly surrendering queue priority during fast book
+                # oscillations. Pair-economics violations and a now-crossed quote
+                # still cancel immediately; otherwise a moved quote waits for
+                # the minimum resting age before it may be replaced.
+                if must_cancel or should_requote:
                     for stale in existing:
                         await self.executor.cancel_order(stale.order_id)
                 else:

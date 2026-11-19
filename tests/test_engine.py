@@ -1583,3 +1583,61 @@ def test_maker_quotes_respect_projected_portfolio_unpaired_cap(tmp_path, monkeyp
 
     assert engine.executor.get_open_orders() == []
     engine.ledger.conn.close()
+
+
+def test_maker_quote_reprice_waits_for_minimum_resting_age(monkeypatch, tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "maker-requote-cooldown.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = [2_000.0]
+    monkeypatch.setattr("bot.engine.time.time", lambda: now[0])
+    window = WindowState(
+        slug="btc-updown-5m-maker-requote-cooldown",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "b" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=1_900.0,
+        end_ts=2_200.0,
+        price_to_beat=100_000.0,
+    )
+
+    def set_books(up_bid: float) -> None:
+        for token, bid in (("up-token", up_bid), ("down-token", 0.37)):
+            engine._market_books[token] = {
+                "bids": {bid: 10.0},
+                "asks": {bid + 0.05: 20.0},
+                "best_bid": bid,
+                "best_ask": bid + 0.05,
+                "tick_size": 0.01,
+                "recv_mono": time.monotonic(),
+            }
+
+    set_books(0.40)
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    first_up = engine.executor.get_open_orders("up-token")[0]
+
+    # A three-tick book move after only two seconds must retain queue priority.
+    now[0] += 2.0
+    set_books(0.43)
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    retained_up = engine.executor.get_open_orders("up-token")[0]
+    assert retained_up.order_id == first_up.order_id
+    assert retained_up.price == 0.40
+
+    # After the minimum resting age, the quote may follow the new best bid.
+    now[0] += 9.0
+    set_books(0.43)
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    repriced_up = engine.executor.get_open_orders("up-token")[0]
+    assert repriced_up.order_id != first_up.order_id
+    assert repriced_up.price == 0.43
+    engine.ledger.conn.close()
