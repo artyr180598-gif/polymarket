@@ -8,8 +8,10 @@ from decimal import Decimal
 import pytest
 
 from bot.historical_data import (
+    _constant_scores,
     _date_range,
     _load_day,
+    _scores,
     _norm_cdf,
     _probability,
     _validate_gzip,
@@ -72,3 +74,18 @@ def test_validate_gzip_rejects_duplicate_or_unordered_timestamps(tmp_path) -> No
             stream.write(json.dumps(row) + "\n")
     with pytest.raises(ValueError):
         _validate_gzip(path, 2, day)
+
+
+
+def test_forecast_scores_and_neutral_baseline() -> None:
+    samples = [
+        (0, 100.0, 50.0, 1),
+        (0, -100.0, 50.0, 0),
+        (1, 0.0, 50.0, 1),
+    ]
+    selected = _scores(samples, {0}, 1.0, 0.12)
+    neutral = _constant_scores(samples, {0}, 0.5)
+    assert selected["n"] == 2
+    assert selected["accuracy"] == 1.0
+    assert neutral["n"] == 2
+    assert neutral["brier"] == 0.25
