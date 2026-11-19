@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -171,6 +172,25 @@ class TradingEngine:
                 "merge confirmation are not implemented. Use paper mode only."
             )
         self.executor = PaperExecutor(self.cfg.bankroll_usd)
+        if self.cfg.paper_reset_once:
+            marker_path = f"{self.cfg.db_path}.paper-reset-v1.done"
+            if not os.path.exists(marker_path):
+                if self.cfg.trading_mode != "paper":
+                    raise RuntimeError("PAPER ledger reset requested outside PAPER mode")
+                reset = self.ledger.reset_paper_history("paper")
+                with open(marker_path, "w", encoding="utf-8") as marker:
+                    json.dump(
+                        {"completed_at": time.time(), "backup_path": reset["backup_path"],
+                         "deleted": reset["deleted"]},
+                        marker,
+                    )
+                self.cfg.paper_stats_since_ts = time.time()
+                log.warning(
+                    "PAPER_LEDGER_RESET complete backup=%s deleted=%s remaining=%s",
+                    reset["backup_path"], reset["deleted"], reset["remaining"],
+                )
+            else:
+                log.info("PAPER_LEDGER_RESET already completed; marker=%s", marker_path)
         try:
             state = self.ledger.portfolio_state(self.cfg.trading_mode, self.cfg.bankroll_usd)
             self.cash = state["cash"]
