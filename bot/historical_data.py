@@ -313,17 +313,18 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     constant_test = _constant_scores(samples, test_indices, 0.5)
     horizon_scores: dict[str, Any] = {}
     for horizon in (240, 180, 120, 60, 30, 15):
+        horizon_samples = [sample for sample in samples if sample[1] == horizon]
         horizon_best = (float("inf"), 1.0, 0.12)
         for step in range(10, 51):
             sigma_mult = step / 20.0
             for jump_step in range(0, 16):
                 jump_weight = jump_step * 0.02
-                score = _scores(samples, train_indices, sigma_mult, jump_weight, horizon)
+                score = _scores(horizon_samples, train_indices, sigma_mult, jump_weight)
                 if score["n"] and float(score["brier"]) < horizon_best[0]:
                     horizon_best = (float(score["brier"]), sigma_mult, jump_weight)
-        default_horizon = _scores(samples, test_indices, 1.0, 0.12, horizon)
+        default_horizon = _scores(horizon_samples, test_indices, 1.0, 0.12)
         fitted_horizon = _scores(
-            samples, test_indices, horizon_best[1], horizon_best[2], horizon
+            horizon_samples, test_indices, horizon_best[1], horizon_best[2]
         )
         horizon_scores[str(horizon)] = {
             "fitted_sigma_multiplier": horizon_best[1],
@@ -336,6 +337,9 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
             "both_holdout_metrics_improved": (
                 float(fitted_horizon["brier"]) < float(default_horizon["brier"])
                 and float(fitted_horizon["logloss"]) < float(default_horizon["logloss"])
+            ),
+            "at_search_boundary": (
+                horizon_best[1] in (0.5, 2.5) or horizon_best[2] in (0.0, 0.3)
             ),
         }
     return {
@@ -355,7 +359,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 and float(calibrated_test["logloss"]) < float(base_test["logloss"])
             ),
             "automatic_strategy_parameter_update": False,
-            "per_horizon_parameters_are_exploratory_only": True,
+            "per_horizon_parameters_are_exploratory_only": True,\n            "per_horizon_acceptance_requires_both_metrics_and_no_search_boundary": True,
         },
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
@@ -390,7 +394,7 @@ async def download_and_calibrate(
         existing_report: dict[str, Any] | None = None
         try:
             candidate = json.loads(report_path.read_text(encoding="utf-8"))
-            if candidate.get("calibration_version") == 3 and candidate.get("range_utc") == {"from": start, "to": end}:
+            if candidate.get("calibration_version") == 4 and candidate.get("range_utc") == {"from": start, "to": end}:
                 existing_report = candidate
         except (OSError, ValueError, TypeError):
             existing_report = None
@@ -435,7 +439,7 @@ async def download_and_calibrate(
 
     report = {
         "source": "Poly Tick Tape",
-        "calibration_version": 3,
+        "calibration_version": 4,
         "range_utc": {"from": start, "to": end},
         "days": len(days_expected),
         "files": len(files),
