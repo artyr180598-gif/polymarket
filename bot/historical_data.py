@@ -305,8 +305,17 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     calibrated_test = _scores(samples, test_indices, best[1], best[2])
     baseline_test = _scores(samples, test_indices, 1.0, 0.0)
     constant_test = _constant_scores(samples, test_indices, 0.5)
+    horizon_scores = {
+        str(horizon): {
+            "default_model": _scores(samples, test_indices, 1.0, 0.12, horizon),
+            "calibrated_model": _scores(samples, test_indices, best[1], best[2], horizon),
+            "zero_jump_baseline": _scores(samples, test_indices, 1.0, 0.0, horizon),
+            "constant_50_baseline": _constant_scores(samples, test_indices, 0.5, horizon),
+        }
+        for horizon in (240, 180, 120, 60, 30, 15)
+    }
     return {
-        "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 60s, 30s, 15s",
+        "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 240s, 180s, 120s, 60s, 30s, 15s",
         "valid_settlement_rounds": valid_rounds,
         "rounds_missing_exact_twap_boundary": missing_boundary_rounds,
         "forecast_samples": len(samples),
@@ -315,7 +324,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                   "fitted_brier": round(best[0], 6)},
         "holdout": {"days": len(test_indices), "default_model": base_test,
                     "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
-                    "constant_50_baseline": constant_test},
+                    "constant_50_baseline": constant_test, "by_seconds_to_settlement": horizon_scores},
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
     }
