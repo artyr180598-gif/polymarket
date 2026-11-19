@@ -360,7 +360,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
             ),
             "automatic_strategy_parameter_update": False,
             "per_horizon_parameters_are_exploratory_only": True,
-            ""per_horizon_acceptance_requires_both_metrics_and_no_search_boundary"": True,
+            "per_horizon_acceptance_requires_both_metrics_and_no_search_boundary": True,
         },
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
