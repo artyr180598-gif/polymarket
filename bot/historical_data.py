@@ -462,6 +462,68 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     }
 
 
+def load_cached_calibration_report(
+    output_dir: str, start: str, end: str
+) -> dict[str, Any] | None:
+    """Load a previously verified calibration report without re-downloading raw data.
+
+    The report is written atomically only after all source files pass SHA-256 and
+    gzip/record validation. Requiring a complete manifest and the current
+    algorithm/range prevents stale or partial reports from enabling shadow mode.
+    Raw archive files remain available for later execution-aware research.
+    """
+    report_path = Path(output_dir) / "calibration-report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not _is_current_calibration_report(report, start, end):
+        return None
+    if report.get("source") != "Poly Tick Tape":
+        return None
+    expected_days = _date_range(start, end)
+    expected_keys = {(day, stream) for day in expected_days for stream in ("price", "twap60")}
+    manifest = report.get("files_manifest")
+    if not isinstance(manifest, list) or len(manifest) != len(expected_keys):
+        return None
+    seen: set[tuple[str, str]] = set()
+    for item in manifest:
+        if not isinstance(item, dict):
+            return None
+        day = item.get("date")
+        stream = item.get("stream")
+        name = item.get("name")
+        digest = str(item.get("sha256", "")).lower()
+        try:
+            records = int(item.get("records", 0))
+            size = int(item.get("bytes", 0))
+        except (TypeError, ValueError):
+            return None
+        key = (str(day), str(stream))
+        if (
+            key not in expected_keys
+            or key in seen
+            or not isinstance(name, str)
+            or not name
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+            or records <= 0
+            or size <= 0
+        ):
+            return None
+        seen.add(key)
+    if seen != expected_keys:
+        return None
+    calibration = report.get("calibration")
+    holdout = calibration.get("holdout") if isinstance(calibration, dict) else None
+    by_horizon = holdout.get("by_seconds_to_settlement") if isinstance(holdout, dict) else None
+    if not isinstance(by_horizon, dict) or not by_horizon:
+        return None
+    if report.get("verified_files") != len(expected_keys):
+        return None
+    return report
+
+
 async def download_and_calibrate(
     api_key: str, output_dir: str, start: str, end: str
 ) -> dict[str, Any]:
