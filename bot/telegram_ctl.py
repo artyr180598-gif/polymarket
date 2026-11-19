@@ -501,6 +501,27 @@ class TelegramController:
         taker_notional_pct = float(stats.get("taker_usdc_pct", max(0, 100.0 - maker_notional_pct) if stats.get("total_notional") else 0) or 0)
         n_merge = int(stats.get("merge_count", 0) or 0)
 
+        session = st.get("session_stats") or {}
+        if session.get("enabled"):
+            session_fills = int(session.get("total_fills", 0) or 0)
+            session_maker = int(session.get("maker_fills", 0) or 0)
+            session_maker_pct = float(session.get("maker_fill_pct", 0) or 0)
+            session_block = (
+                f"· Fill-ног: {session_fills} · Maker {session_maker} ({session_maker_pct:.1f}%) · "
+                f"Taker {max(0, session_fills-session_maker)} ({max(0.0, 100.0-session_maker_pct) if session_fills else 0.0:.1f}%)\n"
+                f"· Объём: \${float(session.get('notional', 0) or 0):.2f} · "
+                f"комиссии −\${float(session.get('fees', 0) or 0):.2f}\n"
+                f"· Завершено рынков: {int(session.get('completed_markets', 0) or 0)} · "
+                f"прибыльных {int(session.get('winning_markets', 0) or 0)} / "
+                f"убыточных {int(session.get('losing_markets', 0) or 0)}\n"
+                f"· Реализованный net PnL: \${float(session.get('realized_net_pnl', 0) or 0):+.2f}"
+            )
+        else:
+            session_block = (
+                "Статистика эксперимента после сброса не активна: "
+                "PAPER_STATS_SINCE_TS отсутствует или некорректен."
+            )
+
         timeframe_lines = []
         ledger = getattr(self.engine, "ledger", None)
         if ledger is not None and hasattr(ledger, "get_timeframe_stats"):
@@ -559,7 +580,8 @@ class TelegramController:
             f"· MERGE: <b>{n_merge}</b> · официально resolved: <b>{resolved}</b>\n"
             f"· Завершённых рынков: <b>{completed}</b> · +{wins} / −{losses} / ={breakeven}\n"
             f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n\n"
-            f"<b>Разбивка по таймфреймам</b>\n{timeframe_block}\n\n"
+            f"<b>Текущий эксперимент после сброса</b>\n{session_block}\n\n"
+            f"<b>Разбивка по таймфреймам (весь Ledger)</b>\n{timeframe_block}\n\n"
             f"ℹ️ Частичный MERGE не считается завершённым рынком. Его результат попадёт в net после полного MERGE или официального резолва. Открытый инвентарь показан отдельно."
         )
 
