@@ -23,6 +23,8 @@ jobs:
           python-version: "3.12"
       - name: Install API client
         run: python -m pip install --disable-pip-version-check aiohttp
+      - name: Test wallet strategy profile
+        run: python -m unittest tests/test_wallet_forensics_profile.py
       - name: Analyze public Polymarket wallet history
         run: python scripts/analyze_target_wallet.py --out-dir artifacts/mo_money --verbose
       - name: Upload concise analysis

@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import unittest
+
+from scripts.analyze_target_wallet import build_analysis
+
+
+class WalletProfileTests(unittest.TestCase):
+    def test_reports_timeframe_price_and_unpaired_market_profile(self) -> None:
+        common = {
+            "transaction_hash": "0xabc",
+            "condition_id": "condition-1",
+            "token_id": "token-up",
+            "side": "BUY",
+            "size": "10",
+            "price": "0.25",
+            "timestamp": 1795130400,
+            "outcome": "Up",
+            "slug": "btc-updown-5m-1795130400",
+        }
+        taker = dict(common)
+        taker["transaction_hash"] = "0xdef"
+        taker["token_id"] = "token-down"
+        taker["outcome"] = "Down"
+        taker["price"] = "0.65"
+        all_rows = [common, taker]
+        taker_rows = [taker]
+
+        result = build_analysis(all_rows, taker_rows, [], {}, {}, {
+            "all_roles_trades": 1,
+            "taker_only_trades": 1,
+            "activity": 1,
+        })
+
+        self.assertEqual(result["by_timeframe"]["5m"]["fills"], 2)
+        self.assertEqual(result["by_timeframe"]["5m"]["maker_fills"], 1)
+        self.assertEqual(result["by_timeframe"]["5m"]["taker_fills"], 1)
+        self.assertEqual(result["by_entry_price_bucket"]["0.20-0.30"]["fills"], 1)
+        self.assertEqual(result["by_entry_price_bucket"]["0.60-0.70"]["fills"], 1)
+        market = result["paired_up_down_buy_markets"][0]
+        self.assertEqual(market["paired_shares"], 10.0)
+        self.assertEqual(market["unpaired_shares"], 0.0)
+        self.assertEqual(market["one_sided_share_pct"], 0.0)
+
+    def test_one_sided_buy_inventory_is_visible(self) -> None:
+        row = {
+            "transaction_hash": "0xabc",
+            "condition_id": "condition-2",
+            "token_id": "token-up",
+            "side": "BUY",
+            "size": "7",
+            "price": "0.40",
+            "timestamp": 1795130400,
+            "outcome": "Up",
+            "slug": "btc-updown-5m-1795130400",
+        }
+        result = build_analysis([row], [], [], {}, {}, {
+            "all_roles_trades": 1,
+            "taker_only_trades": 1,
+            "activity": 1,
+        })
+        market = result["paired_up_down_buy_markets"][0]
+        self.assertEqual(market["paired_shares"], 0.0)
+        self.assertEqual(market["unpaired_shares"], 7.0)
+        self.assertEqual(market["one_sided_share_pct"], 100.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

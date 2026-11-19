@@ -85,7 +85,16 @@ def build_analysis(
     asset_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {
         "fills": 0, "notional_usdc": Decimal("0"), "maker_fills": 0, "taker_fills": 0
     })
+    timeframe_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "fills": 0, "notional_usdc": Decimal("0"), "maker_fills": 0, "taker_fills": 0
+    })
+    price_buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "fills": 0, "shares": Decimal("0"), "notional_usdc": Decimal("0"),
+        "maker_fills": 0, "taker_fills": 0
+    })
     market_sides: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    market_fill_counts: Counter[str] = Counter()
+    market_notional: Counter[str] = Counter()
     market_info: dict[str, dict[str, str]] = {}
 
     for row in classified:
@@ -100,7 +109,30 @@ def build_analysis(
         asset_stats[asset]["fills"] += 1
         asset_stats[asset]["notional_usdc"] += notional
         asset_stats[asset][f"{role.lower()}_fills"] += 1
+        timeframe_stats[timeframe]["fills"] += 1
+        timeframe_stats[timeframe]["notional_usdc"] += notional
+        timeframe_stats[timeframe][f"{role.lower()}_fills"] += 1
+        # Price distribution is reported separately from profitability: a fill
+        # price alone says nothing about whether the position later won.
+        price_bucket = (
+            "0.00-0.10" if price < Decimal("0.10") else
+            "0.10-0.20" if price < Decimal("0.20") else
+            "0.20-0.30" if price < Decimal("0.30") else
+            "0.30-0.40" if price < Decimal("0.40") else
+            "0.40-0.50" if price < Decimal("0.50") else
+            "0.50-0.60" if price < Decimal("0.60") else
+            "0.60-0.70" if price < Decimal("0.70") else
+            "0.70-0.80" if price < Decimal("0.80") else
+            "0.80-0.90" if price < Decimal("0.90") else
+            "0.90-1.00"
+        )
+        price_buckets[price_bucket]["fills"] += 1
+        price_buckets[price_bucket]["shares"] += size
+        price_buckets[price_bucket]["notional_usdc"] += notional
+        price_buckets[price_bucket][f"{role.lower()}_fills"] += 1
         slug = str(row.get("slug") or row.get("condition_id") or "UNKNOWN")
+        market_fill_counts[slug] += 1
+        market_notional[slug] += notional
         outcome = str(row.get("outcome") or "").lower()
         side = str(row.get("side") or "").upper()
         if side == "BUY" and outcome in ("up", "down"):
@@ -124,6 +156,10 @@ def build_analysis(
                 "down_buy_shares": float(down),
                 "paired_shares": float(min(up, down)),
                 "paired_share_ratio": float((Decimal(2) * min(up, down)) / total),
+                "unpaired_shares": float(abs(up - down)),
+                "one_sided_share_pct": round(100 * float(abs(up - down) / total), 3),
+                "fill_rows": int(market_fill_counts[slug]),
+                "notional_usdc": float(market_notional[slug]),
             })
     paired_markets.sort(key=lambda x: x["paired_shares"], reverse=True)
 
@@ -170,6 +206,27 @@ def build_analysis(
                 "taker_fills": values["taker_fills"],
             }
             for asset, values in sorted(asset_stats.items())
+        },
+        "by_timeframe": {
+            timeframe: {
+                "fills": values["fills"],
+                "notional_usdc": float(values["notional_usdc"]),
+                "maker_fills": values["maker_fills"],
+                "taker_fills": values["taker_fills"],
+                "maker_fill_pct": round(100 * values["maker_fills"] / values["fills"], 3)
+                    if values["fills"] else 0.0,
+            }
+            for timeframe, values in sorted(timeframe_stats.items())
+        },
+        "by_entry_price_bucket": {
+            bucket: {
+                "fills": values["fills"],
+                "shares": float(values["shares"]),
+                "notional_usdc": float(values["notional_usdc"]),
+                "maker_fills": values["maker_fills"],
+                "taker_fills": values["taker_fills"],
+            }
+            for bucket, values in sorted(price_buckets.items())
         },
         "paired_up_down_buy_markets": paired_markets,
         "activity": {
@@ -308,6 +365,8 @@ def main() -> None:
         "data_quality": result.get("data_quality"),
         "trade_summary": result.get("trade_summary"),
         "by_asset": result.get("by_asset"),
+        "by_timeframe": result.get("by_timeframe"),
+        "by_entry_price_bucket": result.get("by_entry_price_bucket"),
         "top_paired_markets": (result.get("paired_up_down_buy_markets") or [])[:30],
         "activity": result.get("activity"),
         "official_user_stats": result.get("official_user_stats"),
