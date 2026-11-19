@@ -10,8 +10,19 @@ import time
 from typing import AsyncIterator, Tuple
 
 
+RTDS_CONNECT_TIMEOUT_SEC = 12.0
 RTDS_IDLE_TIMEOUT_SEC = 8.0
 RTDS_REQUIRED_TOPIC_TIMEOUT_SEC = 8.0
+
+
+async def _await_subscription(client, specs, timeout_sec: float = RTDS_CONNECT_TIMEOUT_SEC):
+    """Bound the initial RTDS handshake so a stuck subscribe cannot block reconnects."""
+    try:
+        return await asyncio.wait_for(client.subscribe(specs), timeout=timeout_sec)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"Polymarket RTDS subscribe handshake timed out after {timeout_sec:.1f}s"
+        ) from exc
 
 
 async def _iterate_with_idle_timeout(stream: AsyncIterator, timeout_sec: float = RTDS_IDLE_TIMEOUT_SEC):
@@ -95,7 +106,8 @@ class PolymarketOracleFeed:
         ]
         client = AsyncPublicClient()
         try:
-            async with await client.subscribe(specs) as stream:
+            subscription = await _await_subscription(client, specs)
+            async with subscription as stream:
                 async for event in _iterate_with_required_topics(stream, self.assets):
                     payload = event.payload
                     symbol = str(getattr(payload, "symbol", "")).lower()
