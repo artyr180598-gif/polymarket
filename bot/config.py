@@ -151,9 +151,10 @@ class BotConfig:
         if preset not in PRESETS:
             preset = "mo_money"
 
-        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC") if a.upper() in ("BTC", "ETH", "SOL")]
-        if not assets:
-            assets = ["BTC"]
+        # This deployment is intentionally BTC-only. Ignore ENABLED_ASSETS so a
+        # stale Railway value or operator typo cannot silently enable ETH/SOL.
+        # Expand the allowlist only after those markets have separate validation.
+        assets = ["BTC"]
 
         tfs = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m") if t.lower() in ("5m", "15m")]
         if not tfs:
