@@ -208,6 +208,53 @@ def test_resolution_persists_chainlink_anchor_reconciliation(tmp_path) -> None:
 
 
 
+def test_delayed_anchor_check_updates_unverified_resolution(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "delayed-anchor-audit.db"))
+    slug = "btc-updown-5m-1795035600"
+    ledger.record_resolution(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=62_236.258,
+        final_price=62_240.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+
+    pending = ledger.unverified_resolutions("paper")
+    assert len(pending) == 1
+    assert pending[0]["slug"] == slug
+
+    ledger.record_anchor_check(
+        mode="paper",
+        slug=slug,
+        price_to_beat=62_236.258,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=62_236.262,
+        anchor_delta=0.004,
+        anchor_verified=True,
+    )
+
+    row = ledger.recent_resolutions("paper", 1)[0]
+    assert row["anchor_verified"] == 1
+    assert row["gamma_price_to_beat"] == 62_236.262
+    assert row["anchor_delta"] == 0.004
+    assert row["net_pnl"] == 3.0
+    assert ledger.unverified_resolutions("paper") == []
+    ledger.conn.close()
+
+
 def test_existing_ledger_schema_migrates_anchor_audit_columns(tmp_path) -> None:
     db_path = tmp_path / "legacy-paper.db"
     conn = sqlite3.connect(db_path)
