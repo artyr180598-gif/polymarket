@@ -1556,7 +1556,7 @@ class TradingEngine:
                         await self._try_merge(w)
                         return
 
-        if w.up_shares >= 6 and w.down_shares < w.up_shares and ask_dn is not None:
+        if w.up_shares >= 5 and w.down_shares < w.up_shares and ask_dn is not None:
             need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
@@ -1566,7 +1566,7 @@ class TradingEngine:
                     await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
-        if w.down_shares >= 6 and w.up_shares < w.down_shares and ask_up is not None:
+        if w.down_shares >= 5 and w.up_shares < w.down_shares and ask_up is not None:
             need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
@@ -1809,7 +1809,7 @@ class TradingEngine:
 
     async def _try_merge(self, w: WindowState) -> None:
         pairs = w.mergeable_pairs
-        if pairs < 5 and not (pairs >= 1 and abs(w.net_shares) < 0.5):
+        if pairs < 1.0:
             return
         if w.merge_in_flight:
             return
