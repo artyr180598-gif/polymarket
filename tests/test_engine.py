@@ -1276,3 +1276,67 @@ def test_maker_quote_keeps_queue_priority_after_twenty_seconds(monkeypatch, tmp_
 
     assert after == before
     engine.ledger.conn.close()
+
+
+def test_taker_pair_completion_accepts_standard_five_share_maker_inventory(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "five-share-completion.db"),
+    ))
+    window = WindowState(
+        slug="btc-updown-5m-five-share",
+        asset="BTC", timeframe="5m", condition_id="0x" + "1" * 64,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 100, end_ts=time.time() + 200,
+        up_shares=5.0, up_cost=2.0, up_fees=0.0,
+    )
+    engine.windows[window.slug] = window
+    opened = []
+
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+
+    async def ask_info(token):
+        return (0.50, 100.0) if token == "down-token" else (None, 0.0)
+
+    async def record_open(*args, **kwargs):
+        opened.append((args, kwargs))
+
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+    engine._open = record_open
+    monkeypatch.setattr("bot.engine.calc_taker_fee_usdc", lambda *args, **kwargs: 0.0)
+
+    asyncio.run(engine._run(window))
+
+    assert len(opened) == 1
+    assert opened[0][0][1] == "Down"
+    assert opened[0][0][3] == 5.0
+    assert opened[0][0][4] == "syn_tp"
+    engine.ledger.conn.close()
+
+
+def test_try_merge_closes_profitable_single_matched_pair_with_residual_inventory(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "single-pair-merge.db"),
+    ))
+    window = WindowState(
+        slug="btc-updown-5m-single-pair",
+        asset="BTC", timeframe="5m", condition_id="0x" + "2" * 64,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 100, end_ts=time.time() + 200,
+        up_shares=5.0, down_shares=1.0,
+        up_cost=2.0, down_cost=0.4,
+        up_fees=0.0, down_fees=0.0,
+    )
+    called = []
+
+    async def execute_merge(w):
+        called.append(w.mergeable_pairs)
+        return w.mergeable_pairs
+
+    engine._execute_merge = execute_merge
+    asyncio.run(engine._try_merge(window))
+    assert called == [1.0]
+    engine.ledger.conn.close()
