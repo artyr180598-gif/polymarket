@@ -89,7 +89,8 @@ def test_audit_calculates_maker_fill_markouts_from_future_top_of_book() -> None:
             "type": "book", "bids": [["0.35", "50"]], "asks": [["0.37", "50"]],
         }),
     ]
-    result = analyze(records)
+    # analyze() must also handle unsorted direct input, not only read_records().
+    result = analyze(list(reversed(records)))
     assert result["maker_fill_markouts"]["1s"]["mean_mid_markout_per_share"] == -0.01
     assert result["maker_fill_markouts"]["1s"]["mean_executable_bid_markout_per_share"] == -0.02
     assert result["maker_fill_markouts"]["5s"]["mean_executable_bid_markout_per_share"] == 0.02
