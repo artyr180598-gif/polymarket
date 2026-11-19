@@ -328,7 +328,7 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
     asyncio.run(controller.notify("🟢 PAPER MAKER fill BTC Up: 5 shares"))
 
     assert len(controller._pending_notifications) == 1
-    assert unavailable.calls == 2  # HTML attempt plus plain-text fallback
+    assert unavailable.calls == 1  # transient 503 must not trigger a duplicate plain-text request
     assert engine.paused is True
     assert engine._notification_channel_ready is False
 
@@ -522,3 +522,65 @@ def test_telegram_startup_fails_when_startup_message_is_not_acknowledged(monkeyp
             await controller.stop()
 
     asyncio.run(scenario())
+
+
+def test_telegram_rate_limit_honors_retry_after_without_plain_fallback():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class RateLimitedSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json):
+            self.calls.append((url, dict(json)))
+            return FakeResponse(429, {
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 7",
+                "parameters": {"retry_after": 7},
+            })
+
+    session = RateLimitedSession()
+    controller._session = session
+
+    delivered = asyncio.run(controller.send("PAPER trade notification"))
+
+    assert delivered is False
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["parse_mode"] == "HTML"
+    assert controller._notification_retry_interval == 7.0
+
+
+def test_telegram_server_error_uses_bounded_exponential_backoff():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class UnavailableSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, json):
+            self.calls += 1
+            return FakeResponse(502, {
+                "ok": False,
+                "error_code": 502,
+                "description": "Bad Gateway",
+            })
+
+    session = UnavailableSession()
+    controller._session = session
+
+    assert asyncio.run(controller.send("PAPER trade notification")) is False
+    assert session.calls == 1
+    assert controller._notification_retry_interval == 2.0
