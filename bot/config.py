@@ -95,7 +95,7 @@ class BotConfig:
     trading_mode: str = "paper"
     bankroll_usd: float = 2750.0
     strategy_preset: str = "mo_money"
-    enabled_assets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    enabled_assets: List[str] = field(default_factory=lambda: ["BTC"])
     enabled_timeframes: List[str] = field(default_factory=lambda: ["5m"])
     auto_start: bool = True
 
