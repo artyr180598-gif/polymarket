@@ -385,6 +385,12 @@ class TelegramController:
             f"Режим: <b>{mode}</b>",
             "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
             f"Chainlink RTDS: <b>{'OK' if oracle_ready else 'нет свежих данных'}</b>",
+            *[
+                f"RTDS {asset}: spot rx {data['spot']['receive_age_sec']}s / src {data['spot']['source_age_sec']}s · "
+                f"TWAP60 rx {data['twap60']['receive_age_sec']}s / src {data['twap60']['source_age_sec']}s · "
+                f"TWAP gap max {data['twap60']['max_gap_sec']}s"
+                for asset, data in (st.get("oracle_diagnostics") or {}).items()
+            ],
             f"Chainlink TWAP60 anchor: <b>{'OK' if strike_ready else 'ожидание'}</b>",
             f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
             f"Защита риска: <b>{'HOLD' if risk_halt else 'OK'}</b>",
