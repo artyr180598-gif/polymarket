@@ -443,3 +443,61 @@ def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path)
     assert engine.paused is True
     assert "Telegram delivery is not initialized" in engine._risk_halt_reason
     engine.ledger.conn.close()
+
+
+
+def test_oracle_diagnostics_report_source_age_and_observed_twap_cadence(monkeypatch, tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "oracle-diagnostics.db"),
+    )
+    engine = TradingEngine(cfg)
+    tracker = engine.trackers["BTC"]
+    tracker.cl_spot = 100_000.0
+    tracker.cl_spot_ts = 1_000.0
+    tracker.cl_recv_mono = 50.0
+    tracker.cl_twap60 = 100_001.0
+    tracker.cl_twap60_ts = 998.0
+    tracker.cl_twap_recv_mono = 48.0
+    engine._oracle_metrics["BTC"]["chainlink_twap60"].update({
+        "count": 12,
+        "last_gap_sec": 2.0,
+        "max_gap_sec": 4.0,
+        "stale_rejected": 3,
+    })
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_003.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 53.0)
+
+    diagnostics = engine._oracle_diagnostics()["BTC"]
+
+    assert diagnostics["spot"]["source_age_sec"] == 3.0
+    assert diagnostics["spot"]["receive_age_sec"] == 3.0
+    assert diagnostics["twap60"]["source_age_sec"] == 5.0
+    assert diagnostics["twap60"]["receive_age_sec"] == 5.0
+    assert diagnostics["twap60"]["event_count"] == 12
+    assert diagnostics["twap60"]["last_gap_sec"] == 2.0
+    assert diagnostics["twap60"]["max_gap_sec"] == 4.0
+    assert diagnostics["twap60"]["stale_rejected"] == 3
+    engine.ledger.conn.close()
+
+
+def test_oracle_freshness_remains_fail_closed_at_five_seconds(monkeypatch, tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "oracle-freshness.db"),
+    )
+    engine = TradingEngine(cfg)
+    tracker = engine.trackers["BTC"]
+    tracker.cl_spot = 100_000.0
+    tracker.cl_spot_ts = 1_000.0
+    tracker.cl_recv_mono = 50.0
+    tracker.cl_twap60 = 100_001.0
+    tracker.cl_twap60_ts = 1_000.0
+    tracker.cl_twap_recv_mono = 50.0
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_005.1)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 55.1)
+
+    assert engine._oracle_fresh() is False
+    engine.ledger.conn.close()
