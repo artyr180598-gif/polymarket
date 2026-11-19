@@ -1283,11 +1283,28 @@ def test_taker_pair_completion_accepts_standard_five_share_maker_inventory(monke
         enabled_assets=["BTC"], enabled_timeframes=["5m"],
         db_path=str(tmp_path / "five-share-completion.db"),
     ))
+    from types import SimpleNamespace
+
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.90)
+
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
     window = WindowState(
         slug="btc-updown-5m-five-share",
         asset="BTC", timeframe="5m", condition_id="0x" + "1" * 64,
         up_token="up-token", down_token="down-token",
-        start_ts=time.time() - 100, end_ts=time.time() + 200,
+        start_ts=now - 30, end_ts=now + 270,
+        price_to_beat=100_000.0, fee_rate=0.0,
         up_shares=5.0, up_cost=2.0, up_fees=0.0,
     )
     engine.windows[window.slug] = window
