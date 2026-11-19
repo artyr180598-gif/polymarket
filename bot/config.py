@@ -112,6 +112,7 @@ class BotConfig:
     order_clip_usd: float = 18.0
     max_window_risk_usd: float = 60.0
     max_total_exposure_usd: float = 350.0
+    max_unpaired_exposure_usd: float = 10.0
     max_daily_loss_usd: float = 95.0
     max_consecutive_losses: int = 6
 
@@ -187,6 +188,7 @@ class BotConfig:
             order_clip_usd=max(5.0, float(os.getenv("ORDER_CLIP_USD", "18"))),
             max_window_risk_usd=max(10.0, float(os.getenv("MAX_WINDOW_RISK_USD", "60"))),
             max_total_exposure_usd=max(25.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "350"))),
+            max_unpaired_exposure_usd=max(0.01, float(os.getenv("MAX_UNPAIRED_EXPOSURE_USD", "10"))),
             max_daily_loss_usd=max(10.0, float(os.getenv("MAX_DAILY_LOSS_USD", "95"))),
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "6"))),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),

@@ -445,7 +445,10 @@ class TelegramController:
         return (
             f"{state} <b>PolyBot · {mode}</b>\n"
             f"Баланс: <b>${equity:,.2f}</b> · свободно ${cash:,.2f}\n"
-            f"Результат: <b>{pnl:+.2f} $</b> · сегодня {today:+.2f} $\n"
+            f"Результат equity: <b>{pnl:+.2f} $</b> · сегодня {today:+.2f} $\n"
+            f"Реализовано: {float((st.get('stats') or {}).get('lifetime_total_net_pnl', 0) or 0):+.2f} $ · "
+            f"MTM открытых: {float(st.get('unrealized_pnl') or 0):+.2f} $"
+            + ("" if st.get("mark_to_market_complete", False) else " · оценка ожидает свежий CLOB") + "\n"
             f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.0f}%\n"
             f"Позиции: <b>{len(positions)}</b> · активные заявки {orders}\n"
             f"Данные: Chainlink {'OK' if oracle_ready else 'ожидание'} · "

@@ -156,6 +156,7 @@ class TradingEngine:
         self._market_books: Dict[str, Dict[str, Any]] = {}
         self._market_tokens_changed = asyncio.Event()
         self._market_feed_connected = False
+        self._market_feed_ever_connected = False
         self._market_feed_last_event_mono = 0.0
         self._maker_diag_last: Dict[str, float] = {}
         # Calibration remains telemetry-only until execution-aware validation passes.
@@ -895,6 +896,7 @@ class TradingEngine:
                             break
                         self._market_feed_last_event_mono = time.monotonic()
                         self._market_feed_connected = True
+                        self._market_feed_ever_connected = True
                         await self._process_market_event(event)
             except asyncio.CancelledError:
                 raise
@@ -1131,6 +1133,92 @@ class TradingEngine:
                 log.warning("strategy: %s", e)
             await asyncio.sleep(1.5)
 
+    @staticmethod
+    def _unpaired_cost(up_shares: float, down_shares: float, up_cost: float, down_cost: float, up_fees: float = 0.0, down_fees: float = 0.0) -> float:
+        """Cost basis and entry fees allocated only to unmatched shares."""
+        up = max(0.0, float(up_shares))
+        down = max(0.0, float(down_shares))
+        up_residual = max(0.0, up - min(up, down))
+        down_residual = max(0.0, down - min(up, down))
+        up_value = (float(up_cost) + float(up_fees)) * up_residual / up if up > 0 else 0.0
+        down_value = (float(down_cost) + float(down_fees)) * down_residual / down if down > 0 else 0.0
+        return max(0.0, up_value + down_value)
+
+    def _unpaired_exposure_usd(self, exclude_slug: Optional[str] = None, include_orders: bool = True) -> float:
+        """Portfolio unmatched inventory cost plus all outstanding Maker reserves."""
+        exposure = 0.0
+        for position in self.ledger.open_positions(self.cfg.trading_mode):
+            if exclude_slug and str(position["slug"]) == exclude_slug:
+                continue
+            exposure += self._unpaired_cost(
+                position["up_shares"], position["down_shares"],
+                position["up_cost"], position["down_cost"],
+                position["up_fees"], position["down_fees"],
+            )
+        if include_orders and self.executor is not None:
+            exposure += sum(max(0.0, float(order.price)) * max(0.0, float(order.remaining))
+                            for order in self.executor.get_open_orders())
+        return exposure
+    @staticmethod
+    def _bid_liquidation_value(book: Dict[str, Any], shares: float) -> float:
+        """Consume visible bid depth; any unfillable remainder is valued at zero."""
+        remaining = max(0.0, float(shares))
+        value = 0.0
+        bids = book.get("bids") or {}
+        levels = sorted(((float(p), float(q)) for p, q in bids.items() if float(q) > 0), reverse=True)
+        for price, depth in levels:
+            if remaining <= 1e-9:
+                break
+            taken = min(remaining, depth)
+            value += taken * price
+            remaining -= taken
+        return value
+    def _mark_to_market_state(self) -> Dict[str, Any]:
+        """Conservatively value open inventory using fresh CLOB bids."""
+        positions = self.ledger.open_positions(self.cfg.trading_mode)
+        if not positions:
+            return {"complete": True, "market_value": 0.0, "unrealized_pnl": 0.0,
+                    "unpaired_exposure_usd": 0.0, "reason": ""}
+        market_value = inventory_cost = open_fees = unpaired_exposure = 0.0
+        now_mono = time.monotonic()
+        for position in positions:
+            window = self.windows.get(str(position["slug"]))
+            if window is None or not window.up_token or not window.down_token:
+                return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                        "unpaired_exposure_usd": None,
+                        "reason": f"missing market tokens for {position['slug']}"}
+            up, down = float(position["up_shares"]), float(position["down_shares"])
+            up_cost, down_cost = float(position["up_cost"]), float(position["down_cost"])
+            up_fees, down_fees = float(position["up_fees"]), float(position["down_fees"])
+            paired = min(up, down)
+            up_residual, down_residual = max(0.0, up-paired), max(0.0, down-paired)
+            position_value = paired
+            for token, residual in ((window.up_token, up_residual), (window.down_token, down_residual)):
+                if residual <= 1e-6:
+                    continue
+                book = self._market_books.get(token)
+                age = now_mono - float(book.get("recv_mono", 0.0)) if book else None
+                if not book or age is None or age > 5.0:
+                    return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                            "unpaired_exposure_usd": None,
+                            "reason": f"missing or stale bid for {position['slug']}"}
+                bid_levels = book.get("bids") or {}
+                if any(not math.isfinite(float(price)) or float(price) <= 0.0 or float(price) >= 1.0 for price in bid_levels):
+                    return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                            "unpaired_exposure_usd": None, "reason": "invalid bid ladder"}
+                # Use executable visible depth rather than multiplying the whole size by top bid.
+                position_value += self._bid_liquidation_value(book, residual)
+            market_value += position_value
+            inventory_cost += up_cost + down_cost
+            open_fees += up_fees + down_fees
+            if up_residual > 1e-6 and up > 0:
+                unpaired_exposure += (up_cost + up_fees) * up_residual / up
+            if down_residual > 1e-6 and down > 0:
+                unpaired_exposure += (down_cost + down_fees) * down_residual / down
+        return {"complete": True, "market_value": market_value,
+                "unrealized_pnl": market_value-inventory_cost-open_fees,
+                "unpaired_exposure_usd": unpaired_exposure, "reason": ""}
+
     def _risk_halted(self) -> bool:
         # A confirmed RTDS-vs-Gamma mismatch is a persistent data-integrity halt.
         # It survives restarts and cannot be cleared by the ordinary resume button.
@@ -1163,6 +1251,15 @@ class TradingEngine:
         except Exception:
             self._risk_halt_reason = "Cannot read PAPER ledger PnL; trading remains halted"
             return True
+        if self._market_feed_ever_connected:
+            mtm = self._mark_to_market_state()
+            if not mtm["complete"]:
+                self._risk_halt_reason = (
+                    "Cannot conservatively mark open PAPER inventory: "
+                    + str(mtm.get("reason") or "market data unavailable")
+                )
+                return True
+            current_day_pnl += float(mtm["unrealized_pnl"])
         if current_day_pnl <= -self.cfg.max_daily_loss_usd:
             self._risk_halt_reason = (
                 f"Daily net loss limit reached: ${current_day_pnl:.2f} "
@@ -1228,6 +1325,15 @@ class TradingEngine:
         # Historical probability calibration is telemetry-only. Do not use the
         # unvalidated directional fair-value estimate to select a Maker leg.
         _ = fair_up, fair_down
+        unpaired_exposure = self._unpaired_exposure_usd()
+        if unpaired_exposure > self.cfg.max_unpaired_exposure_usd + 1e-9:
+            self._log_maker_skip(
+                window, "portfolio", "unpaired_exposure_cap",
+                exposure=round(unpaired_exposure, 4),
+                cap=self.cfg.max_unpaired_exposure_usd,
+            )
+            await self.executor.cancel_all()
+            return
         pair_max_cost = min(0.999, max(0.50, float(self.params.maker_pair_max_cost)))
         max_unpaired = min(12.0, max(5.0, float(self.params.maker_max_unpaired_shares)))
         now_mono = time.monotonic()
@@ -1407,6 +1513,15 @@ class TradingEngine:
             size = min(size, max(0.0, available_cash / quote_price))
             size = math.floor(size * 100.0) / 100.0
             cost = quote_price * size
+            projected_unpaired_with_order = self._unpaired_exposure_usd() + cost
+            if projected_unpaired_with_order > self.cfg.max_unpaired_exposure_usd + 1e-9:
+                self._log_maker_skip(
+                    window, outcome, "unpaired_exposure_cap",
+                    exposure=round(projected_unpaired_with_order, 4),
+                    cap=self.cfg.max_unpaired_exposure_usd,
+                    order_cost=round(cost, 4),
+                )
+                continue
             if (
                 size < min_size
                 or window_exposure + cost > self.cfg.max_window_risk_usd
@@ -1556,8 +1671,11 @@ class TradingEngine:
                         await self._try_merge(w)
                         return
 
-        if w.up_shares >= 6 and w.down_shares < w.up_shares and ask_dn is not None:
-            need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
+        if w.up_shares >= 4.5 and w.down_shares < w.up_shares and ask_dn is not None:
+            raw_need = min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0)
+            # CLOB minimum is 5 shares: round a near-complete partial fill up to 5,
+            # leaving at most a few cents of residual exposure, still under the portfolio cap.
+            need = 5.0 if raw_need >= 4.5 and depth_dn * 0.45 >= 5.0 else round(raw_need, 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
                 fee_up_per_share = w.up_fees / max(w.up_shares, 1e-9)
@@ -1566,8 +1684,9 @@ class TradingEngine:
                     await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
-        if w.down_shares >= 6 and w.up_shares < w.down_shares and ask_up is not None:
-            need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
+        if w.down_shares >= 4.5 and w.up_shares < w.down_shares and ask_up is not None:
+            raw_need = min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0)
+            need = 5.0 if raw_need >= 4.5 and depth_up * 0.45 >= 5.0 else round(raw_need, 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
                 fee_dn_per_share = w.down_fees / max(w.down_shares, 1e-9)
@@ -1758,6 +1877,27 @@ class TradingEngine:
             cost = price * size + fee
         if cost > available_cash + 1e-9:
             return
+        # Enforce the portfolio cap on Taker paths too; opposite-side completion
+        # reduces unmatched exposure, while a new directional leg increases it.
+        projected_up_shares = w.up_shares + (size if outcome == "Up" else 0.0)
+        projected_down_shares = w.down_shares + (size if outcome == "Down" else 0.0)
+        projected_up_cost = w.up_cost + (price * size if outcome == "Up" else 0.0)
+        projected_down_cost = w.down_cost + (price * size if outcome == "Down" else 0.0)
+        projected_up_fees = w.up_fees + (fee if outcome == "Up" else 0.0)
+        projected_down_fees = w.down_fees + (fee if outcome == "Down" else 0.0)
+        other_unpaired = self._unpaired_exposure_usd(exclude_slug=w.slug, include_orders=False)
+        pending_reserve = sum(order.price * order.remaining for order in self.executor.get_open_orders()) if self.executor is not None else 0.0
+        projected_unpaired = other_unpaired + pending_reserve + self._unpaired_cost(
+            projected_up_shares, projected_down_shares,
+            projected_up_cost, projected_down_cost, projected_up_fees, projected_down_fees,
+        )
+        if projected_unpaired > self.cfg.max_unpaired_exposure_usd + 1e-9:
+            self._log_event(
+                "WARNING",
+                f"Taker skipped: unmatched exposure ${projected_unpaired:.2f} exceeds ${self.cfg.max_unpaired_exposure_usd:.2f} cap; {w.slug}",
+                notify=False,
+            )
+            return
         fill = {
             "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
             "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
@@ -1809,7 +1949,7 @@ class TradingEngine:
 
     async def _try_merge(self, w: WindowState) -> None:
         pairs = w.mergeable_pairs
-        if pairs < 5 and not (pairs >= 1 and abs(w.net_shares) < 0.5):
+        if pairs < 1.0:
             return
         if w.merge_in_flight:
             return
@@ -2139,6 +2279,9 @@ class TradingEngine:
             inv = 0.0
             equity = 0.0
             cash = 0.0
+        mtm_state = self._mark_to_market_state()
+        if mtm_state["complete"]:
+            equity = cash + float(mtm_state["market_value"])
         reserved_orders = self.executor.get_open_orders() if self.executor is not None else []
         reserved_orders_usd = sum(order.price * order.remaining for order in reserved_orders)
         available_cash = max(0.0, cash - reserved_orders_usd)
@@ -2177,6 +2320,13 @@ class TradingEngine:
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
             "cash": round(cash, 2),
+            "mark_to_market_complete": bool(mtm_state["complete"]),
+            "market_value": round(float(mtm_state["market_value"]), 2) if mtm_state["complete"] else None,
+            "unrealized_pnl": round(float(mtm_state["unrealized_pnl"]), 2) if mtm_state["complete"] else None,
+            "unpaired_exposure_usd": round(float(mtm_state["unpaired_exposure_usd"]), 2) if mtm_state["complete"] else None,
+            "unpaired_exposure_limit_usd": round(self.cfg.max_unpaired_exposure_usd, 2),
+            "unpaired_exposure_with_orders_usd": round(self._unpaired_exposure_usd(), 2),
+            "mark_to_market_reason": str(mtm_state.get("reason") or ""),
             "available_cash": round(available_cash, 2),
             "reserved_maker_orders_usd": round(reserved_orders_usd, 2),
             "maker_orders_open": len(reserved_orders),
