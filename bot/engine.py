@@ -1170,7 +1170,14 @@ class TradingEngine:
             )
             return True
         try:
-            self.consecutive_losses = self.ledger.consecutive_net_losses(self.cfg.trading_mode)
+            loss_session_since = (
+                float(self.cfg.paper_stats_since_ts)
+                if self.cfg.trading_mode == "paper"
+                else 0.0
+            )
+            self.consecutive_losses = self.ledger.consecutive_net_losses(
+                self.cfg.trading_mode, since_ts=loss_session_since
+            )
         except Exception:
             self._risk_halt_reason = "Cannot read consecutive-loss state from SQLite"
             return True
