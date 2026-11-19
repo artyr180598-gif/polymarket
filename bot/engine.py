@@ -158,6 +158,7 @@ class TradingEngine:
         self._market_feed_connected = False
         self._market_feed_last_event_mono = 0.0
         self._maker_diag_last: Dict[str, float] = {}
+        self._anchor_reconcile_last: Dict[str, float] = {}
         self._risk_halt_active = False
         self._risk_halt_reason = ""
         # Set by the application after Telegram's delivery session initializes.
@@ -1714,9 +1715,62 @@ class TradingEngine:
                     if w.remain_sec > -3:
                         continue
                     await self._resolve(w)
+                await self._reconcile_pending_anchors()
             except Exception as e:
                 log.warning("resolve: %s", e)
             await asyncio.sleep(3)
+
+    async def _reconcile_pending_anchors(self) -> None:
+        """Retry RTDS-vs-Gamma checks after official resolution if Gamma lagged."""
+        now_mono = time.monotonic()
+        pending = self.ledger.unverified_resolutions(self.cfg.trading_mode, limit=20)
+        for row in pending:
+            slug = str(row["slug"])
+            if now_mono - self._anchor_reconcile_last.get(slug, 0.0) < 60.0:
+                continue
+            self._anchor_reconcile_last[slug] = now_mono
+            try:
+                meta = await self._gamma(slug)
+                gamma_value = (meta or {}).get("price_to_beat")
+                if gamma_value is None:
+                    continue
+                rtds_value = float(row["price_to_beat"])
+                gamma_price = float(gamma_value)
+                delta = abs(rtds_value - gamma_price)
+                verified = delta <= 0.01
+                self.ledger.record_anchor_check(
+                    mode=self.cfg.trading_mode,
+                    slug=slug,
+                    price_to_beat=rtds_value,
+                    price_to_beat_source=str(row["price_to_beat_source"] or ""),
+                    gamma_price_to_beat=gamma_price,
+                    anchor_delta=delta,
+                    anchor_verified=verified,
+                )
+                if verified:
+                    log.info(
+                        "PAPER settlement anchor reconciled · slug=%s · verified=true · delta=$%.4f",
+                        slug, delta,
+                    )
+                else:
+                    self.paused = True
+                    self._pause_reason = "risk"
+                    self._risk_halt_active = True
+                    self._risk_halt_reason = (
+                        f"Chainlink/Gamma settlement-anchor mismatch: {slug}, delta ${delta:.4f}"
+                    )
+                    if self.executor is not None:
+                        await self.executor.cancel_all()
+                    self._log_event(
+                        "ALERT",
+                        f"Поздняя сверка Chainlink/Gamma выявила несовпадение Δ ${delta:.4f} · "
+                        f"торговля поставлена на паузу · {slug}",
+                        notify=True,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Delayed settlement-anchor audit failed for %s: %s", slug, exc)
 
     async def _resolve(self, w: WindowState) -> None:
         # Preserve the closest real settlement-feed observation for diagnostics.
