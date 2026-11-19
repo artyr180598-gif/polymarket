@@ -114,6 +114,15 @@ class TradingEngine:
         self._price_ok = False
         self._oracle_connected = False
         self._oracle_last_event_ts = 0.0
+        # Runtime cadence telemetry: do not relax freshness thresholds without evidence.
+        self._oracle_metrics = {
+            asset: {
+                kind: {"count": 0, "last_gap_sec": None, "max_gap_sec": 0.0,
+                       "last_recv_mono": 0.0, "stale_rejected": 0}
+                for kind in ("chainlink_spot", "chainlink_twap60")
+            }
+            for asset in cfg.enabled_assets
+        }
         self._fill_history: List[Dict[str, Any]] = []
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
@@ -301,19 +310,51 @@ class TradingEngine:
                 f"Down {window.down_shares:.2f}",
             )
 
+    def _oracle_diagnostics(self) -> Dict[str, Any]:
+        """Expose source/receive ages and observed event cadence without guessing."""
+        now_mono = time.monotonic()
+        now_epoch = time.time()
+        result: Dict[str, Any] = {}
+        for asset, tracker in self.trackers.items():
+            metrics = self._oracle_metrics.get(asset, {})
+            asset_status: Dict[str, Any] = {}
+            for kind, source_ts, recv_mono in (
+                ("spot", tracker.cl_spot_ts, tracker.cl_recv_mono),
+                ("twap60", tracker.cl_twap60_ts, tracker.cl_twap_recv_mono),
+            ):
+                observed = metrics.get("chainlink_" + kind, {})
+                source_age = now_epoch - source_ts if source_ts else None
+                receive_age = now_mono - recv_mono if recv_mono else None
+                asset_status[kind] = {
+                    "source_age_sec": round(source_age, 3) if source_age is not None else None,
+                    "receive_age_sec": round(receive_age, 3) if receive_age is not None else None,
+                    "event_count": int(observed.get("count", 0)),
+                    "last_gap_sec": (
+                        round(float(observed["last_gap_sec"]), 3)
+                        if observed.get("last_gap_sec") is not None else None
+                    ),
+                    "max_gap_sec": round(float(observed.get("max_gap_sec", 0.0)), 3),
+                    "stale_rejected": int(observed.get("stale_rejected", 0)),
+                }
+            result[asset] = asset_status
+        return result
+
     def _oracle_fresh(self) -> bool:
         if not self.trackers:
             return False
-        now_mono = time.monotonic()
-        now_epoch = time.time()
+        diagnostics = self._oracle_diagnostics()
         return all(
             tracker.cl_spot is not None
             and tracker.cl_twap60 is not None
-            and now_mono - tracker.cl_recv_mono <= 5.0
-            and now_mono - tracker.cl_twap_recv_mono <= 5.0
-            and now_epoch - tracker.cl_spot_ts <= 5.0
-            and now_epoch - tracker.cl_twap60_ts <= 5.0
-            for tracker in self.trackers.values()
+            and diagnostics[asset]["spot"]["receive_age_sec"] is not None
+            and diagnostics[asset]["spot"]["receive_age_sec"] <= 5.0
+            and diagnostics[asset]["twap60"]["receive_age_sec"] is not None
+            and diagnostics[asset]["twap60"]["receive_age_sec"] <= 5.0
+            and diagnostics[asset]["spot"]["source_age_sec"] is not None
+            and diagnostics[asset]["spot"]["source_age_sec"] <= 5.0
+            and diagnostics[asset]["twap60"]["source_age_sec"] is not None
+            and diagnostics[asset]["twap60"]["source_age_sec"] <= 5.0
+            for asset, tracker in self.trackers.items()
         )
 
     async def _polymarket_oracle_loop(self) -> None:
@@ -332,7 +373,22 @@ class TradingEngine:
                         source_ts = ts_ms / 1000.0
                         age = time.time() - source_ts
                         if age > 5.0 or age < -2.0:
+                            metric_kind = self._oracle_metrics.get(asset, {}).get(kind)
+                            if metric_kind is not None:
+                                metric_kind["stale_rejected"] += 1
                             continue
+                        metric_kind = self._oracle_metrics.get(asset, {}).get(kind)
+                        if metric_kind is not None:
+                            recv_mono = time.monotonic()
+                            previous = float(metric_kind["last_recv_mono"] or 0.0)
+                            if previous:
+                                gap = max(0.0, recv_mono - previous)
+                                metric_kind["last_gap_sec"] = gap
+                                metric_kind["max_gap_sec"] = max(
+                                    float(metric_kind["max_gap_sec"]), gap
+                                )
+                            metric_kind["last_recv_mono"] = recv_mono
+                            metric_kind["count"] += 1
                         if kind == "chainlink_spot":
                             tracker.on_chainlink_spot(price, ts_ms)
                         elif kind == "chainlink_twap60":
@@ -1682,6 +1738,7 @@ class TradingEngine:
             "risk_halt_active": self._risk_halt_active,
             "risk_halt_reason": self._risk_halt_reason,
             "oracle_last_event_ts": self._oracle_last_event_ts,
+            "oracle_diagnostics": self._oracle_diagnostics(),
             "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
             "merge_history": self.ledger.recent_merges(self.cfg.trading_mode, 10),
             "resolve_history": self.ledger.recent_resolutions(self.cfg.trading_mode, 10),
