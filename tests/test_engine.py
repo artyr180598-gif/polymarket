@@ -188,7 +188,8 @@ def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path, caplog
     engine.executor = PaperExecutor(100.0)
     engine.cash = 100.0
     engine._market_feed_connected = True
-    caplog.set_level("INFO")
+    import logging
+    caplog.set_level(logging.INFO, logger="bot.engine")
     now = time.time()
     window = WindowState(
         slug="btc-updown-5m-missing-anchor",
@@ -213,7 +214,7 @@ def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path, caplog
     asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
 
     assert engine.executor.get_open_orders("up-token") == []
-    assert any("missing_settlement_anchor" in record.getMessage() for record in caplog.records)
+    assert "reason=missing_settlement_anchor" in caplog.text
     engine.ledger.conn.close()
 
 
