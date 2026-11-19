@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from bot.config import BotConfig
-from bot.engine import TradingEngine, WindowState, _select_closed_gamma_strike
+from bot.engine import TradingEngine, WindowState, _paper_reset_marker_path, _select_closed_gamma_strike
 
 
 def test_expired_window_reports_negative_remaining_time(monkeypatch) -> None:
@@ -854,3 +854,13 @@ def test_disabled_asset_merge_is_not_skipped_near_window_end(tmp_path) -> None:
             engine.ledger.conn.close()
 
     asyncio.run(scenario())
+
+
+
+def test_paper_reset_marker_is_unique_and_filesystem_safe() -> None:
+    first = _paper_reset_marker_path("/data/polybot.db", "fresh-paper-2026-11-19")
+    second = _paper_reset_marker_path("/data/polybot.db", "fresh-paper-2026-11-20")
+    assert first == "/data/polybot.db.paper-reset-fresh-paper-2026-11-19.done"
+    assert second != first
+    assert "/" not in _paper_reset_marker_path("/data/polybot.db", "../../unsafe/reset")
+    assert _paper_reset_marker_path("/data/polybot.db") == "/data/polybot.db.paper-reset-v2.done"
