@@ -124,15 +124,22 @@ class AssetPriceTracker:
         if self.cl_spot is not None and self.basis_ema is None and abs(ts - self.cl_spot_ts) <= 5.0:
             self.basis_ema = price - self.cl_spot
 
-    def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
-        # Use source timestamps, not rounded dictionary keys, to select the
-        # closest sample to the exact market boundary.
+    def nearest_twap_sample(self, epoch_sec: float) -> Optional[Tuple[float, float, float]]:
+        """Return (source timestamp, value, absolute distance) for diagnostics."""
         nearest = min(
             self.cl_twap_hist,
             key=lambda item: abs(item[0] - epoch_sec),
             default=None,
         )
-        if nearest is not None and abs(nearest[0] - epoch_sec) <= max_diff_sec:
+        if nearest is None:
+            return None
+        return nearest[0], nearest[1], abs(nearest[0] - epoch_sec)
+
+    def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
+        # Use source timestamps, not rounded dictionary keys, to select the
+        # closest sample to the exact market boundary.
+        nearest = self.nearest_twap_sample(epoch_sec)
+        if nearest is not None and nearest[2] <= max_diff_sec:
             return nearest[1]
         return None
 
