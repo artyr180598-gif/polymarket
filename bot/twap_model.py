@@ -144,7 +144,14 @@ class AssetPriceTracker:
         hi = MAX_SIGMA_1S.get(self.asset, 0.0006)
         return max(lo, min(hi, s))
 
-    def compute_fair_value(self, price_to_beat: float, end_ts: float) -> FairValueQuote:
+    def compute_fair_value(
+        self,
+        price_to_beat: float,
+        end_ts: float,
+        *,
+        sigma_multiplier: float = 1.0,
+        jump_weight: float = 0.12,
+    ) -> FairValueQuote:
         now = time.time()
         tau = max(0.0, end_ts - now)
         if self.cl_spot is None or price_to_beat <= 0:
@@ -161,7 +168,7 @@ class AssetPriceTracker:
             lead_bps = 10000.0 * residual / s_cl if s_cl else 0.0
             s_hat = s_cl + 0.55 * residual
 
-        sig = self.sigma_1s
+        sig = self.sigma_1s * max(0.1, min(5.0, float(sigma_multiplier)))
         if tau >= 60.0:
             mean_final = s_hat
             var = (s_cl * sig) ** 2 * (tau - 40.0)
@@ -176,7 +183,7 @@ class AssetPriceTracker:
             prob = 1.0 if mean_final >= price_to_beat else 0.0
         else:
             z = (mean_final - price_to_beat) / std
-            prob = fat_tail_cdf(z)
+            prob = fat_tail_cdf(z, jump_weight=max(0.0, min(0.8, float(jump_weight))))
 
         prob = max(0.01, min(0.99, prob))
         return FairValueQuote(
