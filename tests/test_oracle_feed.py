@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from bot.oracle_feed import (
+    _await_subscription,
     _iterate_with_idle_timeout,
     _iterate_with_required_topics,
 )
@@ -18,6 +19,24 @@ def test_official_public_rtds_specs_are_available() -> None:
     assert spot.topic == "prices.crypto.chainlink"
     assert twap.topic == "prices.crypto.chainlink.twap"
     assert twap.window_seconds == 60
+
+
+def test_rtds_subscribe_handshake_timeout_cancels_pending_connect() -> None:
+    closed = []
+
+    class HangingClient:
+        async def subscribe(self, specs):
+            try:
+                await asyncio.sleep(1.0)
+            finally:
+                closed.append(True)
+
+    async def run():
+        await _await_subscription(HangingClient(), [], timeout_sec=0.01)
+
+    with pytest.raises(RuntimeError, match="subscribe handshake timed out"):
+        asyncio.run(run())
+    assert closed == [True]
 
 
 def test_rtds_iterator_yields_events_before_idle_timeout() -> None:
