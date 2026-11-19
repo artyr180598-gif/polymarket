@@ -795,3 +795,111 @@ def test_timeframe_maker_and_taker_volume_reconcile_after_rounding(tmp_path) -> 
     row = ledger.get_timeframe_stats("paper")[0]
     assert row["maker_notional"] + row["taker_notional"] == row["total_notional"]
     assert row["total_notional"] == 0.67
+
+
+def test_stats_separate_anchor_verified_and_unverified_resolution_pnl(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "anchor-quality-stats.db"))
+    common = {
+        "mode": "paper",
+        "condition_id": "0x" + "1" * 64,
+        "asset": "BTC",
+        "timeframe": "5m",
+        "winner": "Up",
+        "price_to_beat": 100_000.0,
+        "final_price": 100_001.0,
+        "up_shares_total": 2.0,
+        "down_shares_total": 0.0,
+        "merged_pairs": 0.0,
+        "total_fees": 0.10,
+    }
+    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Up", shares=2, price=0.25, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Down", shares=2, price=0.25, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-unverified", outcome="Up", shares=2, price=0.50, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-unverified", outcome="Down", shares=2, price=0.50, fee=0.05)
+
+    ledger.record_resolution(
+        slug="btc-updown-5m-verified",
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=100_000.0,
+        anchor_delta=0.0,
+        anchor_verified=True,
+        gross_cost=1.0,
+        total_payout=2.0,
+        **common,
+    )
+    ledger.record_resolution(
+        slug="btc-updown-5m-unverified",
+        price_to_beat_source="",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+        gross_cost=2.0,
+        total_payout=1.0,
+        **common,
+    )
+
+    stats = ledger.get_stats("paper")
+    assert stats["resolved_markets"] == 2
+    assert stats["anchor_verified_markets"] == 1
+    assert stats["anchor_unverified_markets"] == 1
+    assert stats["anchor_verified_rate_pct"] == 50.0
+    assert stats["anchor_verified_realized_net_pnl"] == 0.90
+    assert stats["anchor_unverified_realized_net_pnl"] == -1.10
+    ledger.conn.close()
+
+
+def test_session_stats_split_verified_and_unverified_anchor_pnl(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "session-anchor-quality.db"))
+
+    def add_market(slug: str, price: float, verified: bool) -> None:
+        for outcome in ("Up", "Down"):
+            ledger.record_fill(
+                mode="paper",
+                slug=slug,
+                condition_id="0x" + "1" * 64,
+                asset="BTC",
+                timeframe="5m",
+                outcome=outcome,
+                role="MAKER_CLOB",
+                reason="session-anchor-test",
+                shares=2.0,
+                price=price,
+                fee=0.05,
+                fair_prob=0.5,
+                ts=250.0,
+            )
+        ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Up",
+            price_to_beat=100_000.0,
+            final_price=100_001.0,
+            price_to_beat_source=(
+                "rtds.chainlink_twap60.near_exact_window_start" if verified else ""
+            ),
+            gamma_price_to_beat=100_000.0 if verified else None,
+            anchor_delta=0.0 if verified else None,
+            anchor_verified=verified if verified else None,
+            up_shares_total=2.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=1.0 if verified else 2.0,
+            total_fees=0.10,
+            total_payout=2.0 if verified else 1.0,
+        )
+
+    add_market("session-verified", 0.25, True)
+    add_market("session-unverified", 0.50, False)
+
+    stats = ledger.get_session_stats("paper", 200.0)
+    assert stats["resolved_markets_with_anchor_audit"] == 2
+    assert stats["anchor_verified_markets"] == 1
+    assert stats["anchor_unverified_markets"] == 1
+    assert stats["anchor_verified_realized_net_pnl"] == 0.90
+    assert stats["anchor_unverified_realized_net_pnl"] == -1.10
+    ledger.conn.close()
+
+
