@@ -698,52 +698,6 @@ def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_pa
     engine.ledger.conn.close()
 
 
-def test_atomic_pair_entry_debits_engine_and_executor_cash_once(tmp_path) -> None:
-    from bot.execution import PaperExecutor
-
-    cfg = BotConfig(
-        enabled_assets=["BTC"],
-        enabled_timeframes=["5m"],
-        db_path=str(tmp_path / "pair-cash.db"),
-    )
-    engine = TradingEngine(cfg)
-    engine.executor = PaperExecutor(100.0)
-    engine.cash = 100.0
-    window = WindowState(
-        slug="btc-updown-5m-pair-cash",
-        asset="BTC",
-        timeframe="5m",
-        condition_id="0x" + "5" * 64,
-        up_token="up-token",
-        down_token="down-token",
-        start_ts=time.time(),
-        end_ts=time.time() + 300,
-        price_to_beat=100_000.0,
-    )
-    engine.windows[window.slug] = window
-
-    opened = asyncio.run(engine._open_pair(
-        window,
-        price_up=0.40,
-        price_down=0.50,
-        size=10.0,
-        fee_up=0.10,
-        fee_down=0.10,
-        fair_up=0.60,
-        fair_down=0.40,
-    ))
-
-    assert opened is True
-    expected_cash = 100.0 - (10.0 * (0.40 + 0.50) + 0.20)
-    assert engine.cash == expected_cash
-    assert engine.executor.cash == expected_cash
-    assert window.up_shares == 10.0
-    assert window.down_shares == 10.0
-    assert len([row for row in engine.ledger.recent_fills("paper", limit=10) if row["slug"] == window.slug]) == 2
-    assert len(engine.ledger.pending_telegram_notifications()) == 1
-    engine.ledger.conn.close()
-
-
 def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],
@@ -950,6 +904,69 @@ def test_directional_taker_entries_are_disabled_until_model_calibration(tmp_path
     asyncio.run(engine._run(window))
 
     assert opened == []
+    engine.ledger.conn.close()
+
+
+def test_taker_does_not_open_a_fresh_balanced_pair(tmp_path) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "taker-no-new-pair.db"),
+    ))
+    engine.params = replace(
+        engine.params,
+        enable_maker=False,
+        enable_taker=True,
+        enable_directional_taker=False,
+    )
+
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.50)
+
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-taker-no-new-pair",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "a" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 30,
+        end_ts=now + 270,
+        price_to_beat=100_000.0,
+        fee_rate=0.0,
+    )
+    engine.windows[window.slug] = window
+
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+
+    async def ask_info(token):
+        return (0.40, 100.0) if token == "up-token" else (0.50, 100.0)
+
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+
+    cash_before = engine.cash
+    asyncio.run(engine._run(window))
+
+    assert window.up_shares == 0.0
+    assert window.down_shares == 0.0
+    assert engine.cash == cash_before
+    assert engine.ledger.recent_fills("paper", limit=10) == []
     engine.ledger.conn.close()
 
 
