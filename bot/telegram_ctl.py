@@ -443,16 +443,16 @@ class TelegramController:
         orders = int(st.get("maker_orders_open", 0) or 0)
         risk_text = "HOLD" if risk_halt else "OK"
         return (
-            f"{state} <b>PolyBot · {mode}</b>\\n"
-            f"Баланс: <b>${equity:,.2f}</b> · свободно ${cash:,.2f}\\n"
-            f"Результат: <b>{pnl:+.2f} $</b> · сегодня {today:+.2f} $\\n"
-            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.0f}%\\n"
-            f"Позиции: <b>{len(positions)}</b> · активные заявки {orders}\\n"
+            f"{state} <b>PolyBot · {mode}</b>\n"
+            f"Баланс: <b>${equity:,.2f}</b> · свободно ${cash:,.2f}\n"
+            f"Результат: <b>{pnl:+.2f} $</b> · сегодня {today:+.2f} $\n"
+            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.0f}%\n"
+            f"Позиции: <b>{len(positions)}</b> · активные заявки {orders}\n"
             f"Данные: Chainlink {'OK' if oracle_ready else 'ожидание'} · "
             f"CLOB {'OK' if clob_ready else 'ожидание'} · "
-            f"TWAP60 {'OK' if strike_ready else 'ожидание'}\\n"
+            f"TWAP60 {'OK' if strike_ready else 'ожидание'}\n"
             f"Риск-защита: <b>{risk_text}</b>"
-            + (f"\\n⚠️ {st.get('risk_halt_reason')}" if risk_halt and st.get("risk_halt_reason") else "")
+            + (f"\n⚠️ {st.get('risk_halt_reason')}" if risk_halt and st.get("risk_halt_reason") else "")
         )
 
     def _fmt_pnl(self) -> str:
@@ -484,14 +484,14 @@ class TelegramController:
             net = float(session.get("realized_net_pnl", net) or 0)
             fees = float(session.get("fees", fees) or 0)
         return (
-            "💰 <b>PAPER · результат эксперимента</b>\\n"
-            f"Стартовый банк: ${bank:,.2f}\\n"
-            f"Текущий equity: <b>${equity:,.2f}</b> · cash ${cash:,.2f}\\n"
-            f"Net PnL: <b>{net:+.2f} $</b> · сегодня {today:+.2f} $\\n"
-            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.1f}%\\n"
-            f"Закрыто рынков: <b>{done}</b> · прибыльных {wins} / убыточных {losses}\\n"
-            f"Win rate: <b>{win_rate:.1f}%</b> · MERGE: {merges}\\n"
-            f"Комиссии: ${fees:.2f} · открытых рынков: {open_markets}\\n"
+            "💰 <b>PAPER · результат эксперимента</b>\n"
+            f"Стартовый банк: ${bank:,.2f}\n"
+            f"Текущий equity: <b>${equity:,.2f}</b> · cash ${cash:,.2f}\n"
+            f"Net PnL: <b>{net:+.2f} $</b> · сегодня {today:+.2f} $\n"
+            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.1f}%\n"
+            f"Закрыто рынков: <b>{done}</b> · прибыльных {wins} / убыточных {losses}\n"
+            f"Win rate: <b>{win_rate:.1f}%</b> · MERGE: {merges}\n"
+            f"Комиссии: ${fees:.2f} · открытых рынков: {open_markets}\n"
             "Все суммы виртуальные. Открытые позиции оцениваются отдельно; "
             "Maker-rebates пока не учитываются."
         )
