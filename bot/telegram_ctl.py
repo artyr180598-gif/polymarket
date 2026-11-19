@@ -422,6 +422,7 @@ class TelegramController:
         day = stats.get("today_total_net_pnl", 0)
         day_s = f"+${day:.2f}" if day >= 0 else f"-${abs(day):.2f}"
         fees = float(st.get("fees_paid", 0) or 0)
+        session = st.get("session_stats") or {}
         preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
         lines = [
             f"{state_emoji} <b>PolyBot — {state_txt}</b>",
@@ -449,6 +450,15 @@ class TelegramController:
             f"Комиссии всего: −${fees:.2f}",
             "Maker-rebates в PAPER PnL пока не моделируются.",
         ]
+        if session.get("enabled"):
+            session_pnl = float(session.get("realized_net_pnl", 0) or 0)
+            session_pnl_s = f"+${session_pnl:.2f}" if session_pnl >= 0 else f"-${abs(session_pnl):.2f}"
+            lines.extend([
+                "",
+                "🧪 <b>НОВАЯ СТРАТЕГИЯ · с отдельного старта</b>",
+                f"Исполнения: {int(session.get('total_fills', 0))} · Maker: {float(session.get('maker_fill_pct', 0)):.1f}%",
+                f"Завершено окон: {int(session.get('completed_markets', 0))} · Net PnL: <b>{session_pnl_s}</b>",
+            ])
         if risk_halt_reason:
             lines.append(f"⚠️ Причина блокировки: {risk_halt_reason}")
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
