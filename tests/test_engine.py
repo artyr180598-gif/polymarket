@@ -391,6 +391,68 @@ def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(monkeypatch,
     engine.ledger.conn.close()
 
 
+def test_unresolved_official_result_is_logged_and_not_booked(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "resolution-pending.db"),
+    ))
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 100.0)
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return {"data": []}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def get(self, url):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "bot.engine.aiohttp.ClientSession",
+        lambda **kwargs: FakeSession(),
+    )
+    window = WindowState(
+        slug="btc-updown-5m-resolution-pending",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "7" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=time.time() - 400,
+        end_ts=time.time() - 100,
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+    )
+    window.up_shares = 0.01
+    window.up_cost = 0.01
+
+    asyncio.run(engine._resolve(window))
+
+    assert window.resolved is False
+    assert window.up_shares == 0.01
+    assert ledger_rows := engine.ledger.recent_resolutions("paper", 10)
+    assert ledger_rows == []
+    assert any(
+        "PAPER resolution pending" in event and "no_resolution_rows" in event
+        for event in engine.events
+    )
+    engine.ledger.conn.close()
+
+
 def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],
