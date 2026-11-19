@@ -511,7 +511,8 @@ class TelegramController:
                         f"· <b>{row['timeframe']}</b>: fills {row['total_fills']} "
                         f"(M {row['maker_fills']}/{row['maker_fill_pct']:.1f}% · "
                         f"T {row['taker_fills']}/{taker_pct:.1f}%) · "
-                        f"объём M/T ${row['maker_notional']:.2f}/${row['taker_notional']:.2f} · "
+                        f"объём M/T ${row['maker_notional']:.2f}/${row['taker_notional']:.2f} "
+                        f"({row['maker_notional_pct']:.1f}/{100.0-row['maker_notional_pct']:.1f}%) · "
                         f"fees −${row['fees']:.2f}\n"
                         f"  закрыто {row['completed_markets']} "
                         f"(+{row['wins']}/−{row['losses']}/={row['breakeven']}) · "
@@ -519,6 +520,7 @@ class TelegramController:
                         f"  MERGE {row['merge_count']} / {row['merged_pairs']:.2f} пар · "
                         f"gross ${row['merge_gross_pnl']:+.2f} · "
                         f"открыто {row['open_markets']} рынков · "
+                        f"остаток ↑{row['open_up_shares']:.2f}/↓{row['open_down_shares']:.2f} · "
                         f"инвентарь ${row['open_inventory_cost']:.2f} · "
                         f"комиссии входа −${row['open_fees']:.2f}"
                     )
