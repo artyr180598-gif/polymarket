@@ -172,6 +172,8 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
     assert orders[0].price == 0.41
     assert orders[0].size == 12.0
     assert engine.executor.cash == 100.0 - 0.41 * 12.0
+    assert any(f"slug={window.slug}" in event for event in engine.events)
+    engine.ledger.conn.close()
 
 
 def test_maker_quotes_are_not_created_without_live_clob_feed(tmp_path) -> None:
