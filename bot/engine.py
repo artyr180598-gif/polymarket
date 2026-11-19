@@ -889,7 +889,10 @@ class TradingEngine:
         trade_side = str(event.get("side") or "") if kind == "last_trade" else ""
         raw_trade_ts = event.get("timestamp") if kind == "last_trade" else None
         try:
-            trade_ts = float(raw_trade_ts) if raw_trade_ts is not None else None
+            raw_ts = float(raw_trade_ts) if raw_trade_ts is not None else None
+            # Polymarket CLOB last_trade_price.timestamp is Unix milliseconds.
+            # PaperExecutor uses Unix seconds (time.time()); normalize units here.
+            trade_ts = raw_ts / 1000.0 if raw_ts is not None and raw_ts > 100_000_000_000 else raw_ts
         except (TypeError, ValueError):
             trade_ts = None
         fills = self.executor.on_book_and_tape(
