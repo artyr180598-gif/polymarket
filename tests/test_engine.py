@@ -501,3 +501,36 @@ def test_oracle_freshness_remains_fail_closed_at_five_seconds(monkeypatch, tmp_p
 
     assert engine._oracle_fresh() is False
     engine.ledger.conn.close()
+
+
+def test_btc_only_readiness_ignores_legacy_disabled_asset_tracker(monkeypatch, tmp_path) -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "btc-only.db"),
+    ))
+    btc = engine.trackers["BTC"]
+    btc.cl_spot = 100_000.0
+    btc.cl_spot_ts = 1_000.0
+    btc.cl_recv_mono = 50.0
+    btc.cl_twap60 = 100_001.0
+    btc.cl_twap60_ts = 1_000.0
+    btc.cl_twap_recv_mono = 50.0
+    engine.trackers["ETH"] = AssetPriceTracker("ETH")
+
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_002.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 52.0)
+
+    assert engine._oracle_fresh() is True
+    assert list(engine._oracle_diagnostics()) == ["BTC"]
+    engine.ledger.conn.close()
+
+
+def test_config_defaults_to_btc_only(monkeypatch) -> None:
+    from bot.config import BotConfig
+
+    monkeypatch.delenv("ENABLED_ASSETS", raising=False)
+    cfg = BotConfig.from_env(env_file="/nonexistent/polybot-test.env")
+    assert cfg.enabled_assets == ["BTC"]
