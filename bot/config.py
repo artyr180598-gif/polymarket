@@ -39,6 +39,9 @@ class StrategyParams:
 
     # Engine 3: Selective Taker (sniper)
     enable_taker: bool = False
+    # Directional Taker entries remain off until the fair-value model is calibrated.
+    # Profitable paired completion / MERGE paths are controlled separately.
+    enable_directional_taker: bool = False
     min_taker_net_edge_btc: float = 0.038
     min_taker_net_edge_alt: float = 0.024
     taker_min_price: float = 0.45
@@ -56,7 +59,8 @@ PRESETS: Dict[str, StrategyParams] = {
             "Maker-заявки моделируются по живому CLOB WebSocket и видимой очереди L2; "
             "частичные исполнения учитываются. Отмены и риск-лимиты работают. "
             "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются; "
-            "fair-value модель не откалибрована. Прибыльность не доказана."
+            "fair-value модель не откалибрована; направленный Taker отключён до калибровки. "
+            "Парное закрытие/арбитраж после комиссий остаётся отдельным путём. Прибыльность не доказана."
         ),
         enable_maker=True,
         enable_lockin=False,
