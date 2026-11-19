@@ -165,13 +165,23 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
         "recv_mono": time.monotonic(),
     }
 
+    engine._market_books["down-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
     asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
 
-    orders = engine.executor.get_open_orders("up-token")
-    assert len(orders) == 1
-    assert orders[0].price == 0.41
-    assert orders[0].size == 12.0
-    assert engine.executor.cash == 100.0 - 0.41 * 12.0
+    up_orders = engine.executor.get_open_orders("up-token")
+    down_orders = engine.executor.get_open_orders("down-token")
+    assert len(up_orders) == len(down_orders) == 1
+    assert up_orders[0].price == down_orders[0].price == 0.41
+    assert up_orders[0].size == down_orders[0].size == 5.0
+    assert engine.executor.cash == 100.0 - 0.41 * 10.0
     assert any(f"slug={window.slug}" in event for event in engine.events)
     engine.ledger.conn.close()
 
