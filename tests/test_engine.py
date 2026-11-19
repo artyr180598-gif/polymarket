@@ -179,9 +179,9 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
     up_orders = engine.executor.get_open_orders("up-token")
     down_orders = engine.executor.get_open_orders("down-token")
     assert len(up_orders) == len(down_orders) == 1
-    assert up_orders[0].price == down_orders[0].price == 0.41
+    assert up_orders[0].price == down_orders[0].price == 0.40
     assert up_orders[0].size == down_orders[0].size == 5.0
-    assert engine.executor.cash == 100.0 - 0.41 * 10.0
+    assert engine.executor.cash == 100.0 - 0.40 * 10.0
     assert any(f"slug={window.slug}" in event for event in engine.events)
     engine.ledger.conn.close()
 
@@ -216,8 +216,8 @@ def test_maker_pair_quotes_reject_combined_cost_above_limit(tmp_path) -> None:
         "tick_size": 0.01, "recv_mono": time.monotonic(),
     }
     engine._market_books["down-token"] = {
-        "bids": {0.57: 10.0}, "asks": {0.62: 20.0},
-        "best_bid": 0.57, "best_ask": 0.62,
+        "bids": {0.59: 10.0}, "asks": {0.64: 20.0},
+        "best_bid": 0.59, "best_ask": 0.64,
         "tick_size": 0.01, "recv_mono": time.monotonic(),
     }
 
@@ -266,13 +266,13 @@ def test_maker_pair_quotes_only_the_opposite_leg_for_unpaired_inventory(tmp_path
         "tick_size": 0.01, "recv_mono": time.monotonic(),
     }
 
-    # Existing Up cost is $0.60/share; Down at $0.38 keeps pair cost at $0.98.
+    # Existing Up cost is $0.60/share; Down at $0.37 keeps pair cost at $0.97.
     asyncio.run(engine._update_maker_quotes(window, fair_up=0.01, fair_down=0.99))
 
     assert engine.executor.get_open_orders("up-token") == []
     down_orders = engine.executor.get_open_orders("down-token")
     assert len(down_orders) == 1
-    assert down_orders[0].price == 0.38
+    assert down_orders[0].price == 0.37
     assert down_orders[0].size == 5.0
     engine.ledger.conn.close()
 
