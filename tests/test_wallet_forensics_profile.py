@@ -59,7 +59,7 @@ class WalletProfileTests(unittest.TestCase):
             "taker_only_trades": 1,
             "activity": 1,
         })
-        market = result["paired_up_down_buy_markets"][0]
+        market = result["net_up_down_inventory_markets"][0]
         self.assertEqual(market["paired_shares"], 0.0)
         self.assertEqual(market["unpaired_shares"], 7.0)
         self.assertEqual(market["one_sided_share_pct"], 100.0)
