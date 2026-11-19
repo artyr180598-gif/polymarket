@@ -69,25 +69,39 @@ def main() -> None:
         archive_to = os.getenv("POLYTICKTAPE_ARCHIVE_TO", "").strip()
         archive_key = os.getenv("POLYTICKTAPE_KEY", "").strip()
         if archive_key and archive_from and archive_to:
-            from bot.historical_data import download_and_calibrate
+            from bot.historical_data import (
+                download_and_calibrate,
+                load_cached_calibration_report,
+            )
 
             archive_dir = Path(cfg.db_path).parent / "market-data" / "polyticktape"
-
-            async def run_archive_job() -> None:
-                try:
-                    await download_and_calibrate(
-                        archive_key, str(archive_dir), archive_from, archive_to
-                    )
-                except Exception:
-                    log.exception("Poly Tick Tape archive download/calibration failed")
-
-            archive_task = asyncio.create_task(
-                run_archive_job(), name="polyticktape_archive_calibration"
+            cached_report = load_cached_calibration_report(
+                str(archive_dir), archive_from, archive_to
             )
-            log.info(
-                "Poly Tick Tape archive job scheduled for %s..%s",
-                archive_from, archive_to,
-            )
+            if cached_report is not None:
+                engine.set_shadow_calibration(cached_report)
+                log.info(
+                    "Poly Tick Tape verified calibration report loaded from cache · "
+                    "range=%s..%s · raw archive download skipped",
+                    archive_from, archive_to,
+                )
+            else:
+                async def run_archive_job() -> None:
+                    try:
+                        report = await download_and_calibrate(
+                            archive_key, str(archive_dir), archive_from, archive_to
+                        )
+                        engine.set_shadow_calibration(report)
+                    except Exception:
+                        log.exception("Poly Tick Tape archive download/calibration failed")
+
+                archive_task = asyncio.create_task(
+                    run_archive_job(), name="polyticktape_archive_calibration"
+                )
+                log.info(
+                    "Poly Tick Tape archive job scheduled for %s..%s",
+                    archive_from, archive_to,
+                )
         try:
             yield
         finally:
