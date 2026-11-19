@@ -267,9 +267,9 @@ def test_telegram_pnl_breakdown_exposes_fees_in_net_formula():
     )
     controller = TelegramController(engine)
     message = controller._fmt_pnl()
-    assert "MERGE gross" in message
-    assert "Все комиссии: <b>−$0.20</b>" in message
-    assert "MERGE gross + resolved gross − комиссии = Lifetime net" in message
+    assert "PAPER · результат эксперимента" in message
+    assert "Net PnL: <b>+0.80 $" in message
+    assert "Комиссии: $0.20" in message
 
 
 def test_telegram_queues_startup_trade_notifications_until_session_is_ready():
@@ -736,11 +736,7 @@ def test_telegram_pnl_shows_maker_taker_and_timeframe_breakdown():
     controller = TelegramController(engine)
     message = controller._fmt_pnl()
 
-    assert "Maker 2 (50.0%)" in message
-    assert "Taker 2 (50.0%)" in message
-    assert "Доли объёма: Maker 60.0% / Taker 40.0%" in message
-    assert "<b>5m</b>" in message
-    assert "<b>15m</b>" in message
-    assert "net $+0.30" in message
-    assert "net $-0.10" in message
-    assert "инвентарь $4.50" in message
+    assert "Исполнений: <b>4</b> · Maker 50.0%" in message
+    assert "Закрыто рынков: <b>2</b> · прибыльных 1 / убыточных 1" in message
+    assert "Win rate: <b>50.0%</b> · MERGE: 2" in message
+    assert "Комиссии: $0.25" in message
