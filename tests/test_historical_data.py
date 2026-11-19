@@ -12,6 +12,7 @@ from bot.historical_data import (
     _load_day,
     _norm_cdf,
     _probability,
+    _scores,
     _validate_gzip,
 )
 
@@ -72,3 +73,20 @@ def test_validate_gzip_rejects_duplicate_or_unordered_timestamps(tmp_path) -> No
             stream.write(json.dumps(row) + "\n")
     with pytest.raises(ValueError):
         _validate_gzip(path, 2, day)
+
+
+
+def test_scores_can_be_split_by_seconds_to_settlement() -> None:
+    samples = [
+        (0, 240, 1.0, 1.0, 1),
+        (0, 15, -1.0, 1.0, 0),
+        (1, 240, -1.0, 1.0, 0),
+    ]
+    all_scores = _scores(samples, {0, 1}, 1.0, 0.0)
+    early_scores = _scores(samples, {0, 1}, 1.0, 0.0, horizon=240)
+    late_scores = _scores(samples, {0, 1}, 1.0, 0.0, horizon=15)
+    assert all_scores["n"] == 3
+    assert early_scores["n"] == 2
+    assert late_scores["n"] == 1
+    assert early_scores["brier"] > 0
+    assert late_scores["brier"] > 0
