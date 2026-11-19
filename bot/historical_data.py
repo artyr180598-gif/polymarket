@@ -479,7 +479,10 @@ def load_cached_calibration_report(
         return None
     if not _is_current_calibration_report(report, start, end):
         return None
-    if report.get("source") != "Poly Tick Tape":
+    # Older verified v7 reports may omit the source label; the private cache
+    # path, exact range/version, and complete SHA-256 manifest still bind them
+    # to this archive. Reject an explicit conflicting source.
+    if report.get("source") not in (None, "Poly Tick Tape"):
         return None
     expected_days = _date_range(start, end)
     expected_keys = {(day, stream) for day in expected_days for stream in ("price", "twap60")}
