@@ -903,3 +903,52 @@ def test_session_stats_split_verified_and_unverified_anchor_pnl(tmp_path) -> Non
     ledger.conn.close()
 
 
+
+
+def test_consecutive_loss_details_include_market_and_anchor_provenance(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "loss-streak-audit.db"))
+    markets = [
+        ("older-win", 100.0, 0.50, 1.00, True),
+        ("loss-unverified", 200.0, 1.00, 0.50, False),
+        ("loss-verified", 300.0, 1.00, 0.30, True),
+    ]
+    for slug, ts, cost, payout, verified in markets:
+        _record_buy(ledger, slug=slug, outcome="Up", shares=1, price=cost, fee=0.01)
+        ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Up",
+            price_to_beat=100_000.0,
+            final_price=100_001.0,
+            price_to_beat_source=(
+                "rtds.chainlink_twap60.near_exact_window_start" if verified else ""
+            ),
+            gamma_price_to_beat=100_000.0 if verified else None,
+            anchor_delta=0.0 if verified else None,
+            anchor_verified=verified,
+            up_shares_total=1.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=cost,
+            total_fees=0.01,
+            total_payout=payout,
+        )
+        ledger.conn.execute(
+            "UPDATE resolutions SET ts = ? WHERE mode = ? AND slug = ?",
+            (ts, "paper", slug),
+        )
+    ledger.conn.commit()
+
+    details = ledger.recent_consecutive_net_loss_details("paper", limit=6)
+
+    assert ledger.consecutive_net_losses("paper") == 2
+    assert [row["slug"] for row in details] == ["loss-verified", "loss-unverified"]
+    assert details[0]["anchor_verified"] is True
+    assert details[1]["anchor_verified"] is False
+    assert details[0]["completion_type"] == "resolution"
+    assert details[0]["net_pnl"] < 0
+    ledger.conn.close()
+
