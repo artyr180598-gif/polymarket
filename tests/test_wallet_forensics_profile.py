@@ -97,5 +97,29 @@ class WalletProfileTests(unittest.TestCase):
         self.assertEqual(result["trade_summary"]["fill_cadence_seconds"]["median_inter_fill_seconds"], 10.0)
 
 
+    def test_sell_only_market_is_reported_without_division_by_zero(self) -> None:
+        sell = {
+            "transaction_hash": "0xsell-only",
+            "condition_id": "condition-4",
+            "token_id": "token-down",
+            "side": "SELL",
+            "size": "3",
+            "price": "0.70",
+            "timestamp": 1795130500,
+            "outcome": "Down",
+            "slug": "btc-updown-5m-1795130400",
+        }
+        result = build_analysis([sell], [], [], {}, {}, {
+            "all_roles_trades": 1,
+            "taker_only_trades": 1,
+            "activity": 1,
+        })
+        market = result["net_up_down_inventory_markets"][0]
+        self.assertEqual(market["down_net_shares"], -3.0)
+        self.assertTrue(market["negative_net_share_anomaly"])
+        self.assertEqual(market["paired_share_ratio"], 0.0)
+        self.assertEqual(market["one_sided_share_pct"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
