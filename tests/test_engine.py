@@ -143,8 +143,6 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
     engine.executor = PaperExecutor(100.0)
     engine.cash = 100.0
     engine._market_feed_connected = True
-    import logging
-    caplog.set_level(logging.INFO, logger="bot.engine")
     now = time.time()
     window = WindowState(
         slug="btc-updown-5m-900",
@@ -190,6 +188,8 @@ def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path, caplog
     engine.executor = PaperExecutor(100.0)
     engine.cash = 100.0
     engine._market_feed_connected = True
+    import logging
+    caplog.set_level(logging.INFO, logger="bot.engine")
     now = time.time()
     window = WindowState(
         slug="btc-updown-5m-missing-anchor",
