@@ -262,7 +262,8 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                   "fitted_sigma_multiplier": best[1], "fitted_jump_weight": best[2],
                   "fitted_brier": round(best[0], 6)},
         "holdout": {"days": len(test_indices), "default_model": base_test,
-                    "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,\n                    "constant_50_baseline": constant_test},
+                    "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
+                    "constant_50_baseline": constant_test},
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
     }
 
