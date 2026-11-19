@@ -598,14 +598,22 @@ class Ledger:
 
         fills = self.conn.execute(
             """
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            )
             SELECT COUNT(*) AS total_fills,
-                   COALESCE(SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN 1 ELSE 0 END), 0) AS maker_fills,
-                   COALESCE(SUM(notional), 0) AS notional,
-                   COALESCE(SUM(fee), 0) AS fees
-            FROM fills
-            WHERE mode = ? AND ts >= ?
+                   COALESCE(SUM(CASE WHEN upper(f.role) LIKE 'MAKER%' THEN 1 ELSE 0 END), 0) AS maker_fills,
+                   COALESCE(SUM(f.notional), 0) AS notional,
+                   COALESCE(SUM(f.fee), 0) AS fees
+            FROM fills f
+            JOIN eligible e ON e.mode = f.mode AND e.slug = f.slug
+            WHERE f.mode = ?
             """,
-            (mode, since_ts),
+            (mode, since_ts, mode),
         ).fetchone()
 
         completed = self.conn.execute(
@@ -826,6 +834,12 @@ class Ledger:
                 "open_up_shares", "open_down_shares", "open_inventory_cost", "open_fees",
             ):
                 target[key] = round(float(target[key]), 4 if key in ("fees", "open_fees") else 2)
+            # Keep the displayed Maker + Taker amounts equal to the displayed
+            # total after cent rounding; independently rounding all three can
+            # otherwise create a misleading one-cent discrepancy.
+            target["taker_notional"] = round(
+                max(0.0, float(target["total_notional"]) - float(target["maker_notional"])), 2
+            )
             result.append(target)
 
         return sorted(
