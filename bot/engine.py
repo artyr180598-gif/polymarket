@@ -1260,8 +1260,10 @@ class TradingEngine:
                 await self._cancel_window_maker_orders(window)
                 return
 
-            raw_quote = min(best_bid + tick, best_ask - tick)
-            quote_price = round(math.floor((raw_quote + 1e-12) / tick) * tick, 6)
+            # Join the existing best bid rather than improving it. This
+            # preserves maker priority honestly and avoids pushing pair cost
+            # above the lock-in ceiling just to chase queue position.
+            quote_price = round(math.floor((best_bid + 1e-12) / tick) * tick, 6)
             if (
                 quote_price < float(self.params.maker_min_price)
                 or quote_price > float(self.params.maker_max_price)
