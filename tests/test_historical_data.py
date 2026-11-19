@@ -90,3 +90,17 @@ def test_scores_can_be_split_by_seconds_to_settlement() -> None:
     assert late_scores["n"] == 1
     assert early_scores["brier"] > 0
     assert late_scores["brier"] > 0
+
+
+
+def test_holdout_acceptance_requires_both_metrics_and_no_boundary() -> None:
+    from bot.historical_data import _holdout_accepts
+
+    default = {"brier": 0.10, "logloss": 0.30}
+    better = {"brier": 0.09, "logloss": 0.29}
+    brier_only = {"brier": 0.09, "logloss": 0.31}
+    logloss_only = {"brier": 0.11, "logloss": 0.29}
+    assert _holdout_accepts(default, better) is True
+    assert _holdout_accepts(default, better, at_search_boundary=True) is False
+    assert _holdout_accepts(default, brier_only) is False
+    assert _holdout_accepts(default, logloss_only) is False
