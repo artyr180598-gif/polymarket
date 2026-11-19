@@ -28,7 +28,16 @@ DEFAULT_SIGMA_1S = 0.000095
 MIN_SIGMA_1S = 0.000040
 MAX_SIGMA_1S = 0.000450
 NAN = float("nan")
+CALIBRATION_VERSION = 7
 
+
+
+def _is_current_calibration_report(report: Any, start: str, end: str) -> bool:
+    return (
+        isinstance(report, dict)
+        and report.get("calibration_version") == CALIBRATION_VERSION
+        and report.get("range_utc") == {"from": start, "to": end}
+    )
 
 def _required_download_bytes(day_rows: list[dict[str, Any]], directory: Path) -> int:
     required = 0
@@ -481,7 +490,7 @@ async def download_and_calibrate(
         existing_report: dict[str, Any] | None = None
         try:
             candidate = json.loads(report_path.read_text(encoding="utf-8"))
-            if candidate.get("calibration_version") == 6 and candidate.get("range_utc") == {"from": start, "to": end}:
+            if _is_current_calibration_report(candidate, start, end):
                 existing_report = candidate
         except (OSError, ValueError, TypeError):
             existing_report = None
@@ -531,7 +540,7 @@ async def download_and_calibrate(
 
     report = {
         "source": "Poly Tick Tape",
-        "calibration_version": 6,
+        "calibration_version": CALIBRATION_VERSION,
         "range_utc": {"from": start, "to": end},
         "days": len(days_expected),
         "files": len(files),
