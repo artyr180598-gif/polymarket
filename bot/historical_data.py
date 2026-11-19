@@ -30,6 +30,20 @@ MAX_SIGMA_1S = 0.000450
 NAN = float("nan")
 
 
+def _required_download_bytes(day_rows: list[dict[str, Any]], directory: Path) -> int:
+    required = 0
+    for day in day_rows:
+        for stream in ("price", "twap60"):
+            metadata = day.get(stream)
+            if not metadata:
+                raise RuntimeError(f"Missing {stream} metadata for {day.get('date', 'unknown day')}")
+            target = directory / metadata["name"]
+            expected_sha = str(metadata["sha256"]).lower()
+            if not target.is_file() or _sha256(target) != expected_sha:
+                required += int(metadata["bytes"])
+    return required
+
+
 def _date_range(start: str, end: str) -> list[str]:
     first, last = date.fromisoformat(start), date.fromisoformat(end)
     if last < first or (last - first).days > 91:
@@ -430,14 +444,19 @@ async def download_and_calibrate(
         }
         trusted_manifest = bool(expected_manifest) and cached_manifest == expected_manifest
         files: list[dict[str, Any]] = []
-        total_bytes = sum(
-            int(day[stream]["bytes"])
-            for day in day_rows for stream in ("price", "twap60")
-            if day.get(stream)
-        )
+        required_download_bytes = _required_download_bytes(day_rows, directory)
+        safety_margin = 32 * 1024 * 1024 if required_download_bytes else 8 * 1024 * 1024
         free = shutil.disk_usage(directory).free
-        if free < total_bytes + 32 * 1024 * 1024:
-            raise RuntimeError(f"Insufficient free space: need about {total_bytes} bytes plus safety margin")
+        if free < required_download_bytes + safety_margin:
+            raise RuntimeError(
+                "Insufficient free space: need about "
+                f"{required_download_bytes} bytes for missing/corrupt files plus "
+                f"{safety_margin} bytes safety margin"
+            )
+        log.info(
+            "Poly Tick Tape disk preflight · required_download_bytes=%s free_bytes=%s",
+            required_download_bytes, free,
+        )
         for day in day_rows:
             for stream in ("price", "twap60"):
                 metadata = day.get(stream)
