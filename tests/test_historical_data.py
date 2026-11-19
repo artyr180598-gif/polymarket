@@ -12,6 +12,7 @@ from bot.historical_data import (
     _load_day,
     _norm_cdf,
     _probability,
+    _required_download_bytes,
     _scores,
     _validate_gzip,
 )
@@ -104,3 +105,32 @@ def test_holdout_acceptance_requires_both_metrics_and_no_boundary() -> None:
     assert _holdout_accepts(default, better, at_search_boundary=True) is False
     assert _holdout_accepts(default, brier_only) is False
     assert _holdout_accepts(default, logloss_only) is False
+
+
+
+def test_required_download_bytes_skips_valid_cached_files(tmp_path) -> None:
+    import hashlib
+
+    cached = tmp_path / "cached.gz"
+    cached.write_bytes(b"verified archive bytes")
+    digest = hashlib.sha256(cached.read_bytes()).hexdigest()
+    rows = [{"date": "2026-10-14", "price": {
+        "name": "cached.gz", "sha256": digest, "bytes": len(cached.read_bytes())
+    }, "twap60": {
+        "name": "missing.gz", "sha256": "0" * 64, "bytes": 123
+    }}]
+    assert _required_download_bytes(rows, tmp_path) == 123
+
+
+def test_required_download_bytes_counts_corrupt_cached_files(tmp_path) -> None:
+    import hashlib
+
+    cached = tmp_path / "cached.gz"
+    cached.write_bytes(b"corrupt")
+    expected = hashlib.sha256(b"valid").hexdigest()
+    rows = [{"date": "2026-10-14", "price": {
+        "name": "cached.gz", "sha256": expected, "bytes": 42
+    }, "twap60": {
+        "name": "missing.gz", "sha256": expected, "bytes": 99
+    }}]
+    assert _required_download_bytes(rows, tmp_path) == 141
