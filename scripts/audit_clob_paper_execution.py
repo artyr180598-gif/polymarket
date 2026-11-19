@@ -181,6 +181,9 @@ def _markout_summary(
 
 
 def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
+    # Keep reconstruction and bisect-based markouts deterministic for callers
+    # that pass records directly instead of using read_records().
+    records = sorted(records, key=lambda row: _num(row.get("received_ts")))
     event_counts: Counter[str] = Counter()
     trades_by_asset: dict[str, list[dict[str, Any]]] = defaultdict(list)
     order_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
