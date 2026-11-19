@@ -91,18 +91,26 @@ class TelegramController:
             logger.exception("Could not load next Telegram outbox batch")
 
     def _set_delivery_ready(self, ready: bool) -> None:
-        """Fail closed when durable trade notifications cannot be delivered."""
+        """Fail closed on delivery errors and recover only notification-caused pauses."""
         self._delivery_ready = bool(ready)
         if hasattr(self.engine, "_notification_channel_ready"):
             self.engine._notification_channel_ready = bool(ready)
         if not ready and hasattr(self.engine, "paused"):
-            self.engine.paused = True
-            executor = getattr(self.engine, "executor", None)
-            if executor is not None:
-                try:
-                    asyncio.get_running_loop().create_task(executor.cancel_all())
-                except RuntimeError:
-                    logger.exception("Could not schedule maker cancellation after Telegram delivery failure")
+            pause = getattr(self.engine, "pause", None)
+            if callable(pause):
+                pause(reason="telegram_delivery", notify=False)
+            else:
+                self.engine.paused = True
+                executor = getattr(self.engine, "executor", None)
+                if executor is not None:
+                    try:
+                        asyncio.get_running_loop().create_task(executor.cancel_all())
+                    except RuntimeError:
+                        logger.exception("Could not schedule maker cancellation after Telegram delivery failure")
+        elif ready:
+            recover = getattr(self.engine, "resume_after_notification_recovery", None)
+            if callable(recover):
+                recover()
 
     @property
     def _base(self) -> str:
