@@ -725,7 +725,6 @@ def test_session_stats_excludes_later_fills_on_markets_started_before_epoch(tmp_
     assert stats["notional"] == 9.0
     assert stats["fees"] == 0.02
     assert stats["completed_markets"] == 0
-    ledger.close()
 
 
 def test_timeframe_maker_and_taker_volume_reconcile_after_rounding(tmp_path) -> None:
@@ -749,4 +748,3 @@ def test_timeframe_maker_and_taker_volume_reconcile_after_rounding(tmp_path) -> 
     row = ledger.get_timeframe_stats("paper")[0]
     assert row["maker_notional"] + row["taker_notional"] == row["total_notional"]
     assert row["total_notional"] == 0.67
-    ledger.close()
