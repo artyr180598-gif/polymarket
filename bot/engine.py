@@ -887,6 +887,11 @@ class TradingEngine:
         trade_price = float(event["price"]) if kind == "last_trade" else None
         trade_size = float(event.get("size") or 0.0) if kind == "last_trade" else 0.0
         trade_side = str(event.get("side") or "") if kind == "last_trade" else ""
+        raw_trade_ts = event.get("timestamp") if kind == "last_trade" else None
+        try:
+            trade_ts = float(raw_trade_ts) if raw_trade_ts is not None else None
+        except (TypeError, ValueError):
+            trade_ts = None
         fills = self.executor.on_book_and_tape(
             token,
             best_bid=best_bid,
@@ -894,6 +899,7 @@ class TradingEngine:
             last_trade_price=trade_price,
             last_trade_size=trade_size,
             last_trade_side=trade_side,
+            trade_ts=trade_ts,
         )
         for fill in fills:
             await self._record_maker_fill(fill)
