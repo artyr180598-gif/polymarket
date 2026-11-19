@@ -1455,3 +1455,20 @@ def test_daily_risk_guard_includes_unrealized_loss_from_fresh_bid(tmp_path):
     assert engine._risk_halted() is True
     assert "Daily net loss limit reached" in engine._risk_halt_reason
     engine.ledger.conn.close()
+
+
+def test_unpaired_cost_counts_only_residual_inventory_and_entry_fees() -> None:
+    assert round(TradingEngine._unpaired_cost(5, 2, 3.0, 0.6, 0.05, 0.02), 2) == 1.83
+    assert TradingEngine._unpaired_cost(5, 5, 3.0, 2.0, 0.05, 0.03) == 0.0
+    assert round(TradingEngine._unpaired_cost(5, 6, 3.0, 2.4, 0.05, 0.06), 4) == 0.41
+
+
+def test_portfolio_unpaired_exposure_includes_pending_maker_reserves(tmp_path) -> None:
+    from types import SimpleNamespace
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"], db_path=str(tmp_path / "unpaired-cap.db")))
+    engine.ledger.record_fill(mode="paper", slug="btc-updown-5m-cap", condition_id="0x" + "6" * 64, asset="BTC", timeframe="5m", outcome="Up", role="MAKER", reason="test", shares=5.0, price=0.60, fee=0.05, fair_prob=0.5)
+    engine.ledger.record_fill(mode="paper", slug="btc-updown-5m-cap", condition_id="0x" + "6" * 64, asset="BTC", timeframe="5m", outcome="Down", role="MAKER", reason="test", shares=2.0, price=0.30, fee=0.02, fair_prob=0.5)
+    engine.executor = SimpleNamespace(get_open_orders=lambda: [SimpleNamespace(price=0.40, remaining=5.0)])
+    assert round(engine._unpaired_exposure_usd(), 2) == 3.83
+    assert round(engine._unpaired_exposure_usd(include_orders=False), 2) == 1.83
+    engine.ledger.conn.close()
