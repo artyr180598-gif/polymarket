@@ -42,6 +42,26 @@ def test_audit_replays_only_sell_prints_after_order_latency() -> None:
     assert order["recorded_fill"] == 2.0
 
 
+def test_audit_normalizes_exchange_millisecond_timestamps() -> None:
+    records = [
+        _record(1_700_000_000.0, "paper_order_placed", {
+            "order_id": "ms1", "asset_id": "token-up", "price": 0.40,
+            "size": 5.0, "queue_ahead": 2.0, "created_ts": 1_700_000_000.0,
+        }),
+        _record(1_700_000_000.05, "last_trade", {
+            "type": "last_trade", "asset_id": "token-up", "price": 0.40,
+            "size": 10.0, "side": "SELL", "timestamp": 1_700_000_000_050,
+        }),
+        _record(1_700_000_000.30, "last_trade", {
+            "type": "last_trade", "asset_id": "token-up", "price": 0.40,
+            "size": 5.0, "side": "SELL", "timestamp": 1_700_000_000_300,
+        }),
+    ]
+    order = analyze(records)["orders"][0]
+    assert order["eligible_sell_prints"] == 1
+    assert order["conservative_replay_fill"] == 3.0
+
+
 def test_audit_reports_empty_capture_without_inventing_orders() -> None:
     result = analyze([])
     assert result["records"] == 0
