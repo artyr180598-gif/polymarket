@@ -99,11 +99,17 @@ async def _get_json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> 
 
 
 async def _download_file(
-    session: aiohttp.ClientSession, metadata: dict[str, Any], target: Path, expected_day: str
+    session: aiohttp.ClientSession, metadata: dict[str, Any], target: Path, expected_day: str,
+    trusted_cache: bool = False,
 ) -> dict[str, Any]:
     expected_sha = str(metadata["sha256"]).lower()
     if target.exists() and _sha256(target) == expected_sha:
-        records = await asyncio.to_thread(_validate_gzip, target, int(metadata["records"]), expected_day)
+        if trusted_cache:
+            records = int(metadata["records"])
+        else:
+            records = await asyncio.to_thread(
+                _validate_gzip, target, int(metadata["records"]), expected_day
+            )
         return {"name": target.name, "bytes": target.stat().st_size, "records": records,
                 "sha256": expected_sha, "coverage": metadata.get("coverage"), "cached": True}
     payload: bytes | None = None
@@ -354,6 +360,24 @@ async def download_and_calibrate(
         day_rows = listing.get("days") or []
         if [row.get("date") for row in day_rows] != days_expected:
             raise RuntimeError("Poly Tick Tape returned an incomplete or unordered day list")
+        report_path = directory / "calibration-report.json"
+        existing_report: dict[str, Any] | None = None
+        try:
+            candidate = json.loads(report_path.read_text(encoding="utf-8"))
+            if candidate.get("range_utc") == {"from": start, "to": end}:
+                existing_report = candidate
+        except (OSError, ValueError, TypeError):
+            existing_report = None
+        expected_manifest = {
+            day[stream]["name"]: str(day[stream]["sha256"]).lower()
+            for day in day_rows for stream in ("price", "twap60")
+            if day.get(stream)
+        }
+        cached_manifest = {
+            item.get("name"): str(item.get("sha256", "")).lower()
+            for item in (existing_report or {}).get("files_manifest", [])
+        }
+        trusted_manifest = bool(expected_manifest) and cached_manifest == expected_manifest
         files: list[dict[str, Any]] = []
         total_bytes = sum(
             int(day[stream]["bytes"])
@@ -369,10 +393,20 @@ async def download_and_calibrate(
                 if not metadata:
                     raise RuntimeError(f"Missing {stream} metadata for {day['date']}")
                 target = directory / metadata["name"]
-                result = await _download_file(session, metadata, target, day["date"])
+                result = await _download_file(
+                    session, metadata, target, day["date"],
+                    trusted_cache=trusted_manifest,
+                )
                 files.append({**result, "date": day["date"], "stream": stream})
                 log.info("Poly Tick Tape verified %s (%s records, %s)", target.name,
                          result["records"], "cached" if result["cached"] else "downloaded")
+    if existing_report is not None and trusted_manifest and all(item["cached"] for item in files):
+        log.info(
+            "Poly Tick Tape archive cache verified; reusing existing calibration report for %s..%s",
+            start, end,
+        )
+        return existing_report
+
     report = {
         "source": "Poly Tick Tape",
         "range_utc": {"from": start, "to": end},
@@ -387,7 +421,6 @@ async def download_and_calibrate(
     }
     calibration = await asyncio.to_thread(_calibrate, directory, days_expected)
     report["calibration"] = calibration
-    report_path = directory / "calibration-report.json"
     temp_report = report_path.with_suffix(".json.part")
     temp_report.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     temp_report.replace(report_path)
