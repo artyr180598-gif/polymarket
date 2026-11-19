@@ -364,7 +364,7 @@ async def download_and_calibrate(
         existing_report: dict[str, Any] | None = None
         try:
             candidate = json.loads(report_path.read_text(encoding="utf-8"))
-            if candidate.get("range_utc") == {"from": start, "to": end}:
+            if candidate.get("calibration_version") == 2 and candidate.get("range_utc") == {"from": start, "to": end}:
                 existing_report = candidate
         except (OSError, ValueError, TypeError):
             existing_report = None
@@ -409,6 +409,7 @@ async def download_and_calibrate(
 
     report = {
         "source": "Poly Tick Tape",
+        "calibration_version": 2,
         "range_utc": {"from": start, "to": end},
         "days": len(days_expected),
         "files": len(files),
