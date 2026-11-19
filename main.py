@@ -75,9 +75,10 @@ def main() -> None:
 
             async def run_archive_job() -> None:
                 try:
-                    await download_and_calibrate(
+                    report = await download_and_calibrate(
                         archive_key, str(archive_dir), archive_from, archive_to
                     )
+                    engine.set_shadow_calibration(report)
                 except Exception:
                     log.exception("Poly Tick Tape archive download/calibration failed")
 
