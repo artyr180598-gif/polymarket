@@ -1517,3 +1517,36 @@ def test_mark_to_market_liquidation_uses_visible_bid_depth_and_zero_for_unfilled
     book = {"bids": {0.20: 1.0, 0.10: 1.0}}
     assert round(TradingEngine._bid_liquidation_value(book, 3.0), 2) == 0.30
     assert round(TradingEngine._bid_liquidation_value(book, 1.5), 2) == 0.25
+
+
+def test_open_blocks_taker_addition_that_exceeds_portfolio_unpaired_cap(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "taker-unpaired-cap.db"),
+        max_unpaired_exposure_usd=10.0,
+    ))
+    slug = "btc-updown-5m-taker-cap"
+    condition = "0x" + "8" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=10.0, price=0.90, fee=0.0, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+        up_shares=10.0, up_cost=9.0, up_fees=0.0,
+    )
+    engine.windows[slug] = window
+    cash_before = engine.cash
+    shares_before = window.up_shares
+
+    asyncio.run(engine._open(
+        window, "Up", 0.90, 5.0, "taker_entry", fee=0.0, fair_prob=0.5,
+    ))
+
+    assert engine.cash == cash_before
+    assert window.up_shares == shares_before
+    assert round(engine._unpaired_exposure_usd(), 2) == 9.0
+    engine.ledger.conn.close()
