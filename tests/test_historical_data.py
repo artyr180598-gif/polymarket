@@ -10,6 +10,7 @@ import pytest
 from bot.historical_data import (
     _date_range,
     _is_current_calibration_report,
+    load_cached_calibration_report,
     _fit_parameters,
     _load_day,
     _norm_cdf,
@@ -168,6 +169,65 @@ def test_fit_parameters_requires_joint_train_improvement() -> None:
     assert result["sigma_multiplier"] == 0.5
     assert result["at_search_boundary"] is True
 
+
+
+def test_load_cached_calibration_report_does_not_require_raw_files(tmp_path) -> None:
+    days = ["2026-10-14", "2026-10-15"]
+    manifest = [
+        {
+            "date": day,
+            "stream": stream,
+            "name": f"btc-{stream}-{day}.jsonl.gz",
+            "sha256": (f"{index:064x}"),
+            "records": 100,
+            "bytes": 2048,
+            "cached": True,
+        }
+        for index, (day, stream) in enumerate(
+            ((day, stream) for day in days for stream in ("price", "twap60")),
+            start=1,
+        )
+    ]
+    report = {
+        "source": "Poly Tick Tape",
+        "calibration_version": 7,
+        "range_utc": {"from": days[0], "to": days[-1]},
+        "files": 4,
+        "verified_files": 4,
+        "files_manifest": manifest,
+        "calibration": {
+            "holdout": {"by_seconds_to_settlement": {"30": {"accepted_for_shadow_research": True}}}
+        },
+    }
+    (tmp_path / "calibration-report.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+
+    loaded = load_cached_calibration_report(str(tmp_path), days[0], days[-1])
+
+    assert loaded == report
+    assert not list(tmp_path.glob("*.gz"))
+
+
+def test_load_cached_calibration_report_rejects_incomplete_manifest(tmp_path) -> None:
+    report = {
+        "source": "Poly Tick Tape",
+        "calibration_version": 7,
+        "range_utc": {"from": "2026-10-14", "to": "2026-10-14"},
+        "files": 2,
+        "verified_files": 2,
+        "files_manifest": [],
+        "calibration": {
+            "holdout": {"by_seconds_to_settlement": {"30": {"accepted_for_shadow_research": True}}}
+        },
+    }
+    (tmp_path / "calibration-report.json").write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+
+    assert load_cached_calibration_report(
+        str(tmp_path), "2026-10-14", "2026-10-14"
+    ) is None
 
 
 def test_calibration_report_cache_requires_current_algorithm_version() -> None:
