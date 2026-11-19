@@ -249,6 +249,56 @@ def _constant_scores(samples: list[tuple[int, int, float, float, int]], indices:
             "accuracy": round(correct / n, 6)}
 
 
+def _fit_parameters(
+    samples: list[tuple[int, int, float, float, int]],
+    indices: set[int],
+    sigma_values: list[float] | None = None,
+    jump_values: list[float] | None = None,
+) -> dict[str, Any]:
+    """Select only train candidates that improve both Brier and log-loss."""
+    sigma_grid = sigma_values or [step / 10.0 for step in range(4, 26)]
+    jump_grid = jump_values or [step / 50.0 for step in range(0, 41)]
+    baseline = _scores(samples, indices, 1.0, 0.12)
+    best_objective = float("inf")
+    best_sigma, best_jump = 1.0, 0.12
+    candidate_found = False
+    for sigma_mult in sigma_grid:
+        for jump_weight in jump_grid:
+            score = _scores(samples, indices, sigma_mult, jump_weight)
+            if not score["n"]:
+                continue
+            brier = float(score["brier"])
+            logloss = float(score["logloss"])
+            if brier >= float(baseline["brier"]) or logloss >= float(baseline["logloss"]):
+                continue
+            objective = 0.5 * (
+                brier / max(float(baseline["brier"]), 1e-12)
+                + logloss / max(float(baseline["logloss"]), 1e-12)
+            )
+            if objective < best_objective:
+                best_objective = objective
+                best_sigma, best_jump = sigma_mult, jump_weight
+                candidate_found = True
+    sigma_boundary = min(sigma_grid), max(sigma_grid)
+    jump_boundary = min(jump_grid), max(jump_grid)
+    at_boundary = candidate_found and (
+        best_sigma in sigma_boundary or best_jump in jump_boundary
+    )
+    fitted_train = _scores(samples, indices, best_sigma, best_jump)
+    return {
+        "sigma_multiplier": best_sigma,
+        "jump_weight": best_jump,
+        "train_objective": round(best_objective, 8) if candidate_found else None,
+        "train_brier": fitted_train["brier"],
+        "train_logloss": fitted_train["logloss"],
+        "baseline_train": baseline,
+        "candidate_found": candidate_found,
+        "at_search_boundary": at_boundary,
+        "sigma_grid": {"min": sigma_boundary[0], "max": sigma_boundary[1], "step": 0.1},
+        "jump_grid": {"min": jump_boundary[0], "max": jump_boundary[1], "step": 0.02},
+    }
+
+
 def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     """Evaluate forecasts at six horizons; chronological holdout."""
     samples: list[tuple[int, int, float, float, int]] = []
@@ -326,36 +376,28 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
     test_indices = set(range(min(21, len(days)), len(days)))
     base_train = _scores(samples, train_indices, 1.0, 0.12)
     base_test = _scores(samples, test_indices, 1.0, 0.12)
-    best = (float("inf"), 1.0, 0.12)
-    for step in range(10, 51):
-        sigma_mult = step / 20.0  # 0.50 .. 2.50
-        for jump_step in range(0, 16):
-            jump_weight = jump_step * 0.02
-            score = _scores(samples, train_indices, sigma_mult, jump_weight)
-            if score["n"] and float(score["brier"]) < best[0]:
-                best = (float(score["brier"]), sigma_mult, jump_weight)
-    calibrated_test = _scores(samples, test_indices, best[1], best[2])
+    best = _fit_parameters(samples, train_indices)
+    calibrated_test = _scores(
+        samples, test_indices, best["sigma_multiplier"], best["jump_weight"]
+    )
     baseline_test = _scores(samples, test_indices, 1.0, 0.0)
     constant_test = _constant_scores(samples, test_indices, 0.5)
     horizon_scores: dict[str, Any] = {}
     for horizon in (240, 180, 120, 60, 30, 15):
         horizon_samples = [sample for sample in samples if sample[1] == horizon]
-        horizon_best = (float("inf"), 1.0, 0.12)
-        for step in range(10, 51):
-            sigma_mult = step / 20.0
-            for jump_step in range(0, 16):
-                jump_weight = jump_step * 0.02
-                score = _scores(horizon_samples, train_indices, sigma_mult, jump_weight)
-                if score["n"] and float(score["brier"]) < horizon_best[0]:
-                    horizon_best = (float(score["brier"]), sigma_mult, jump_weight)
+        horizon_best = _fit_parameters(horizon_samples, train_indices)
         default_horizon = _scores(horizon_samples, test_indices, 1.0, 0.12)
         fitted_horizon = _scores(
-            horizon_samples, test_indices, horizon_best[1], horizon_best[2]
+            horizon_samples, test_indices,
+            horizon_best["sigma_multiplier"], horizon_best["jump_weight"],
         )
         horizon_scores[str(horizon)] = {
-            "fitted_sigma_multiplier": horizon_best[1],
-            "fitted_jump_weight": horizon_best[2],
-            "train_brier": round(horizon_best[0], 6),
+            "fitted_sigma_multiplier": horizon_best["sigma_multiplier"],
+            "fitted_jump_weight": horizon_best["jump_weight"],
+            "train_brier": horizon_best["train_brier"],
+            "train_logloss": horizon_best["train_logloss"],
+            "train_objective": horizon_best["train_objective"],
+            "candidate_found_in_train": horizon_best["candidate_found"],
             "default_model": default_horizon,
             "fitted_model": fitted_horizon,
             "zero_jump_baseline": _scores(samples, test_indices, 1.0, 0.0, horizon),
@@ -364,12 +406,13 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 float(fitted_horizon["brier"]) < float(default_horizon["brier"])
                 and float(fitted_horizon["logloss"]) < float(default_horizon["logloss"])
             ),
-            "at_search_boundary": (
-                horizon_best[1] in (0.5, 2.5) or horizon_best[2] in (0.0, 0.3)
-            ),
-            "accepted_for_shadow_research": _holdout_accepts(
-                default_horizon, fitted_horizon,
-                horizon_best[1] in (0.5, 2.5) or horizon_best[2] in (0.0, 0.3),
+            "at_search_boundary": horizon_best["at_search_boundary"],
+            "accepted_for_shadow_research": (
+                horizon_best["candidate_found"]
+                and _holdout_accepts(
+                    default_horizon, fitted_horizon,
+                    horizon_best["at_search_boundary"],
+                )
             ),
         }
     return {
@@ -377,17 +420,26 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
         "valid_settlement_rounds": valid_rounds,
         "rounds_missing_exact_twap_boundary": missing_boundary_rounds,
         "forecast_samples": len(samples),
-        "train": {"days": len(train_indices), "baseline": base_train,
-                  "fitted_sigma_multiplier": best[1], "fitted_jump_weight": best[2],
-                  "fitted_brier": round(best[0], 6)},
+        "train": {
+            "days": len(train_indices),
+            "baseline": base_train,
+            "fitted_sigma_multiplier": best["sigma_multiplier"],
+            "fitted_jump_weight": best["jump_weight"],
+            "fitted_brier": best["train_brier"],
+            "fitted_logloss": best["train_logloss"],
+            "objective": best["train_objective"],
+            "candidate_found": best["candidate_found"],
+            "at_search_boundary": best["at_search_boundary"],
+            "search_grid": {"sigma": best["sigma_grid"], "jump_weight": best["jump_grid"]},
+        },
         "holdout": {"days": len(test_indices), "default_model": base_test,
                     "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
                     "constant_50_baseline": constant_test, "by_seconds_to_settlement": horizon_scores},
         "holdout_gate": {
-            "both_brier_and_logloss_improved": (
-                float(calibrated_test["brier"]) < float(base_test["brier"])
-                and float(calibrated_test["logloss"]) < float(base_test["logloss"])
+            "both_brier_and_logloss_improved": _holdout_accepts(
+                base_test, calibrated_test, best["at_search_boundary"]
             ),
+            "candidate_found_in_train": best["candidate_found"],
             "automatic_strategy_parameter_update": False,
             "per_horizon_parameters_are_exploratory_only": True,
             "per_horizon_acceptance_requires_both_metrics_and_no_search_boundary": True,
@@ -429,7 +481,7 @@ async def download_and_calibrate(
         existing_report: dict[str, Any] | None = None
         try:
             candidate = json.loads(report_path.read_text(encoding="utf-8"))
-            if candidate.get("calibration_version") == 5 and candidate.get("range_utc") == {"from": start, "to": end}:
+            if candidate.get("calibration_version") == 6 and candidate.get("range_utc") == {"from": start, "to": end}:
                 existing_report = candidate
         except (OSError, ValueError, TypeError):
             existing_report = None
@@ -479,7 +531,7 @@ async def download_and_calibrate(
 
     report = {
         "source": "Poly Tick Tape",
-        "calibration_version": 5,
+        "calibration_version": 6,
         "range_utc": {"from": start, "to": end},
         "days": len(days_expected),
         "files": len(files),
