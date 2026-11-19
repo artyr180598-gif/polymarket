@@ -55,12 +55,12 @@ def main() -> None:
             await tg.start()
             engine._notification_channel_ready = bool(tg.enabled and tg._delivery_ready)
             if not engine._notification_channel_ready:
-                engine.pause()
+                engine.pause(reason="telegram_delivery", notify=False)
                 log.error("Telegram is not configured; PAPER trading is paused until trade notifications are available")
         except Exception:
             engine._notification_channel_ready = False
             log.exception("telegram.start failed; pausing PAPER trading")
-            engine.pause()
+            engine.pause(reason="telegram_delivery", notify=False)
         try:
             yield
         finally:
