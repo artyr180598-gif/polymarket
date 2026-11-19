@@ -160,6 +160,7 @@ class TradingEngine:
         self._maker_diag_last: Dict[str, float] = {}
         self._anchor_reconcile_last: Dict[str, float] = {}
         self._anchor_reconcile_cursor = 0
+        self._resolution_diag_last: Dict[str, float] = {}
         self._risk_halt_active = False
         self._risk_halt_reason = ""
         # Set by the application after Telegram's delivery session initializes.
@@ -1789,6 +1790,9 @@ class TradingEngine:
         # A market is resolved only by Polymarket's official resolution endpoint.
         # Never infer the winner from Coinbase/Binance spot or the bot's inventory.
         winner = None
+        resolution_reason = "no_resolution_rows"
+        response_status = None
+        rows_count = 0
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1797,31 +1801,50 @@ class TradingEngine:
                     f"?condition_id={w.condition_id}"
                 )
                 async with session.get(url) as response:
-                    if response.status == 200:
+                    response_status = response.status
+                    if response.status != 200:
+                        resolution_reason = f"http_{response.status}"
+                    else:
                         payload = await response.json()
                         rows = payload.get("data") if isinstance(payload, dict) else None
                         if isinstance(rows, dict):
                             rows = [rows]
-                        for item in rows or []:
-                            if str(item.get("status", "")).lower() != "resolved":
+                        rows = rows or []
+                        rows_count = len(rows)
+                        for item in rows:
+                            status = str(item.get("status", "")).lower()
+                            if status != "resolved":
+                                resolution_reason = f"status_{status or 'missing'}"
                                 continue
                             payouts = item.get("payouts") or []
                             if len(payouts) < 2:
+                                resolution_reason = "missing_payouts"
                                 continue
                             up_payout, down_payout = float(payouts[0]), float(payouts[1])
                             if up_payout > down_payout:
                                 winner = "Up"
                             elif down_payout > up_payout:
                                 winner = "Down"
+                            else:
+                                resolution_reason = "equal_payouts"
                             break
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("official resolution lookup failed for %s: %s", w.slug, exc)
+            resolution_reason = f"request_error_{type(exc).__name__}"
 
         if winner is None:
             # Data API can lag settlement. Keep the market pending; never book a
             # guessed winner or manufacture PnL while the authoritative result is absent.
+            now_mono = time.monotonic()
+            if now_mono - self._resolution_diag_last.get(w.slug, 0.0) >= 60.0:
+                self._resolution_diag_last[w.slug] = now_mono
+                self._log_event(
+                    "WARNING",
+                    f"PAPER resolution pending · slug={w.slug} · http={response_status} "
+                    f"rows={rows_count} · reason={resolution_reason}",
+                    notify=False,
+                )
             return
         # Once Gamma publishes the settled priceToBeat, compare it with the
         # RTDS boundary sample used for trading. A material mismatch is a data
