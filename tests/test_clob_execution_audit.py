@@ -73,6 +73,10 @@ def test_audit_reports_empty_capture_without_inventing_orders() -> None:
 
 def test_audit_calculates_maker_fill_markouts_from_future_top_of_book() -> None:
     records = [
+        _record(200.0, "paper_order_placed", {
+            "order_id": "m1", "asset_id": "token-up", "price": 0.40,
+            "size": 2.0, "queue_ahead": 0.0, "created_ts": 200.0,
+        }),
         _record(200.0, "book", {
             "type": "book", "bids": [["0.39", "100"]], "asks": [["0.41", "100"]],
         }),
