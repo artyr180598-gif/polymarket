@@ -1472,3 +1472,42 @@ def test_portfolio_unpaired_exposure_includes_pending_maker_reserves(tmp_path) -
     assert round(engine._unpaired_exposure_usd(), 2) == 3.83
     assert round(engine._unpaired_exposure_usd(include_orders=False), 2) == 1.83
     engine.ledger.conn.close()
+
+
+def test_taker_pair_completion_rounds_496_partial_fill_to_clob_minimum(tmp_path) -> None:
+    from types import SimpleNamespace
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"], db_path=str(tmp_path / "partial-completion.db")))
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.90)
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-partial-completion", asset="BTC", timeframe="5m",
+        condition_id="0x" + "7" * 64, up_token="up-token", down_token="down-token",
+        start_ts=now - 30, end_ts=now + 270, price_to_beat=100_000.0,
+        fee_rate=0.0, up_shares=4.96, up_cost=1.984, up_fees=0.0,
+    )
+    opened = []
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+    async def ask_info(token):
+        return (0.50, 100.0) if token == "down-token" else (None, 0.0)
+    async def record_open(*args, **kwargs):
+        opened.append((args, kwargs))
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+    engine._open = record_open
+    asyncio.run(engine._run(window))
+    assert len(opened) == 1
+    assert opened[0][0][1] == "Down"
+    assert opened[0][0][3] == 5.0
+    assert opened[0][0][4] == "syn_tp"
+    engine.ledger.conn.close()
