@@ -555,6 +555,7 @@ def test_telegram_rate_limit_honors_retry_after_without_plain_fallback():
     assert len(session.calls) == 1
     assert session.calls[0][1]["parse_mode"] == "HTML"
     assert controller._notification_retry_interval == 7.0
+    assert controller._notification_retry_at > 0.0
 
 
 def test_telegram_server_error_uses_bounded_exponential_backoff():
@@ -584,3 +585,38 @@ def test_telegram_server_error_uses_bounded_exponential_backoff():
     assert asyncio.run(controller.send("PAPER trade notification")) is False
     assert session.calls == 1
     assert controller._notification_retry_interval == 2.0
+
+
+def test_new_telegram_events_do_not_bypass_active_retry_after():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class RateLimitedSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, json):
+            self.calls += 1
+            return FakeResponse(429, {
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 7",
+                "parameters": {"retry_after": 7},
+            })
+
+    session = RateLimitedSession()
+    controller._session = session
+
+    async def scenario():
+        await controller.notify("first trade event")
+        await controller.notify("second trade event")
+
+    asyncio.run(scenario())
+
+    assert session.calls == 1
+    assert controller._pending_notifications == ["first trade event", "second trade event"]
