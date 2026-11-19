@@ -384,6 +384,7 @@ def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(monkeypatch,
     row = engine.ledger.recent_resolutions("paper", 1)[0]
     assert row["anchor_verified"] == 0
     assert row["anchor_delta"] == 0.02
+    assert row["net_pnl"] == 3.0
     assert engine.paused is True
     assert engine._risk_halt_active is True
     assert "Chainlink/Gamma settlement-anchor mismatch" in engine._risk_halt_reason
