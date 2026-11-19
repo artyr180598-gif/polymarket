@@ -13,15 +13,26 @@ from typing import AsyncIterator, Tuple
 RTDS_CONNECT_TIMEOUT_SEC = 12.0
 RTDS_IDLE_TIMEOUT_SEC = 8.0
 RTDS_REQUIRED_TOPIC_TIMEOUT_SEC = 8.0
+RTDS_CLOSE_TIMEOUT_SEC = 3.0
 
 
 async def _await_subscription(client, specs, timeout_sec: float = RTDS_CONNECT_TIMEOUT_SEC):
-    """Bound the initial RTDS handshake so a stuck subscribe cannot block reconnects."""
+    """Bound the SDK subscription creation call."""
     try:
         return await asyncio.wait_for(client.subscribe(specs), timeout=timeout_sec)
     except asyncio.TimeoutError as exc:
         raise RuntimeError(
-            f"Polymarket RTDS subscribe handshake timed out after {timeout_sec:.1f}s"
+            f"Polymarket RTDS subscribe call timed out after {timeout_sec:.1f}s"
+        ) from exc
+
+
+async def _enter_subscription(subscription, timeout_sec: float = RTDS_CONNECT_TIMEOUT_SEC):
+    """Bound the websocket/context-manager handshake, not just SDK object creation."""
+    try:
+        return await asyncio.wait_for(subscription.__aenter__(), timeout=timeout_sec)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"Polymarket RTDS connection handshake timed out after {timeout_sec:.1f}s"
         ) from exc
 
 
@@ -105,28 +116,39 @@ class PolymarketOracleFeed:
             CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=symbols),
         ]
         client = AsyncPublicClient()
+        subscription = None
+        entered = False
         try:
             subscription = await _await_subscription(client, specs)
-            async with subscription as stream:
-                async for event in _iterate_with_required_topics(stream, self.assets):
-                    payload = event.payload
-                    symbol = str(getattr(payload, "symbol", "")).lower()
-                    asset = symbol.split("/", 1)[0].upper()
-                    if asset not in self.assets:
-                        continue
-                    value = float(payload.value)
-                    timestamp_ms = int(payload.timestamp)
-                    if value <= 0 or timestamp_ms <= 0:
-                        continue
-                    if event.topic == "prices.crypto.chainlink":
-                        yield asset, "chainlink_spot", value, timestamp_ms
-                    elif (
-                        event.topic == "prices.crypto.chainlink.twap"
-                        and int(getattr(payload, "window_seconds", 0)) == 60
-                    ):
-                        yield asset, "chainlink_twap60", value, timestamp_ms
+            stream = await _enter_subscription(subscription)
+            entered = True
+            async for event in _iterate_with_required_topics(stream, self.assets):
+                payload = event.payload
+                symbol = str(getattr(payload, "symbol", "")).lower()
+                asset = symbol.split("/", 1)[0].upper()
+                if asset not in self.assets:
+                    continue
+                value = float(payload.value)
+                timestamp_ms = int(payload.timestamp)
+                if value <= 0 or timestamp_ms <= 0:
+                    continue
+                if event.topic == "prices.crypto.chainlink":
+                    yield asset, "chainlink_spot", value, timestamp_ms
+                elif (
+                    event.topic == "prices.crypto.chainlink.twap"
+                    and int(getattr(payload, "window_seconds", 0)) == 60
+                ):
+                    yield asset, "chainlink_twap60", value, timestamp_ms
         finally:
+            if entered and subscription is not None:
+                try:
+                    await asyncio.wait_for(
+                        subscription.__aexit__(None, None, None),
+                        timeout=RTDS_CLOSE_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    pass
             try:
-                await asyncio.wait_for(client.close(), timeout=3.0)
+                await asyncio.wait_for(client.close(), timeout=RTDS_CLOSE_TIMEOUT_SEC)
             except asyncio.TimeoutError:
                 pass
