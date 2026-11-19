@@ -303,9 +303,24 @@ class TradingEngine:
             self.paused = True
             self._pause_reason = "risk"
             self._risk_halt_active = True
+            detail = ""
+            if self._risk_halt_reason.startswith("Consecutive net-loss limit reached:"):
+                try:
+                    losses = self.ledger.recent_consecutive_net_loss_details(
+                        self.cfg.trading_mode,
+                        limit=max(1, self.cfg.max_consecutive_losses),
+                    )
+                    detail = " · recent=" + "; ".join(
+                        f"{row['slug']} net=${row['net_pnl']:+.4f} "
+                        f"anchor_verified={row['anchor_verified']} "
+                        f"completion={row['completion_type']}"
+                        for row in losses
+                    )
+                except Exception:
+                    log.exception("Could not build consecutive-loss audit details")
             self._log_event(
                 "ALERT",
-                f"Startup held by risk guard: {self._risk_halt_reason}",
+                f"Startup held by risk guard: {self._risk_halt_reason}{detail}",
                 notify=True,
             )
         self.running = True
