@@ -534,3 +534,70 @@ def test_config_defaults_to_btc_only(monkeypatch) -> None:
     monkeypatch.delenv("ENABLED_ASSETS", raising=False)
     cfg = BotConfig.from_env(env_file="/nonexistent/polybot-test.env")
     assert cfg.enabled_assets == ["BTC"]
+
+
+def test_oracle_fresh_fails_closed_when_no_assets_are_enabled(tmp_path) -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=[],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "empty-assets.db"),
+    ))
+    # Legacy inventory trackers must not make an empty trading config look ready.
+    engine.trackers["ETH"] = AssetPriceTracker("ETH")
+    assert engine._oracle_fresh() is False
+    assert engine._oracle_diagnostics() == {}
+    engine.ledger.conn.close()
+
+
+def test_disabled_asset_merge_is_not_skipped_near_window_end(tmp_path) -> None:
+    class FakeExecutor:
+        def __init__(self):
+            self.canceled = []
+
+        async def cancel_all(self, tokens=None):
+            self.canceled.append(tokens)
+            return 0
+
+    async def scenario():
+        engine = TradingEngine(BotConfig(
+            enabled_assets=["BTC"],
+            enabled_timeframes=["5m"],
+            db_path=str(tmp_path / "disabled-merge.db"),
+        ))
+        engine.running = True
+        engine.paused = False
+        engine.executor = FakeExecutor()
+        window = WindowState(
+            slug="eth-updown-5m-disabled",
+            asset="ETH",
+            timeframe="5m",
+            condition_id="0x" + "6" * 64,
+            up_token="eth-up",
+            down_token="eth-down",
+            start_ts=time.time() - 295,
+            end_ts=time.time() + 5,
+        )
+        engine.windows[window.slug] = window
+        merged = asyncio.Event()
+        engine._risk_halted = lambda: False
+
+        async def record_merge(_window):
+            merged.set()
+
+        engine._try_merge = record_merge
+        task = asyncio.create_task(engine._strategy_loop())
+        try:
+            await asyncio.wait_for(merged.wait(), timeout=0.5)
+            assert engine.executor.canceled
+        finally:
+            engine.running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            engine.ledger.conn.close()
+
+    asyncio.run(scenario())
