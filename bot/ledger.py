@@ -760,6 +760,66 @@ class Ledger:
             "day_net_pnl": float(stats.get("today_total_net_pnl", 0.0)),
         }
 
+
+    def reset_paper_history(self, mode: str = "paper") -> Dict[str, Any]:
+        """Back up the SQLite ledger, then clear one simulated account atomically.
+
+        The backup is a durable sibling file on the same Railway volume. This
+        operation is intended only for an explicit PAPER experiment reset.
+        """
+        if str(mode).lower() != "paper":
+            raise ValueError("Only the PAPER ledger can be reset")
+
+        backup_path = f"{self.db_path}.pre-reset-{time.time_ns()}.sqlite3"
+        backup = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(backup)
+            integrity = backup.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise RuntimeError("Pre-reset backup failed SQLite integrity_check")
+            backup.commit()
+        except Exception:
+            backup.close()
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                pass
+            raise
+        else:
+            backup.close()
+
+        tables = ("fills", "merges", "resolutions", "anchor_checks", "equity_points")
+        deleted: Dict[str, int] = {}
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            for table in tables:
+                count = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE mode = ?", (mode,)
+                ).fetchone()[0]
+                deleted[table] = int(count)
+                self.conn.execute(f"DELETE FROM {table} WHERE mode = ?", (mode,))
+            deleted["telegram_outbox"] = int(
+                self.conn.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0]
+            )
+            self.conn.execute("DELETE FROM telegram_outbox")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        remaining = {
+            table: int(self.conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE mode = ?", (mode,)
+            ).fetchone()[0])
+            for table in tables
+        }
+        remaining["telegram_outbox"] = int(
+            self.conn.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0]
+        )
+        if any(remaining.values()) or self.open_positions(mode):
+            raise RuntimeError(f"PAPER reset verification failed: {remaining}")
+        return {"backup_path": backup_path, "deleted": deleted, "remaining": remaining}
+
     def fees_for_market(self, mode: str, slug: str) -> float:
         row = self.conn.execute(
             "SELECT COALESCE(SUM(fee), 0) AS fees FROM fills WHERE mode = ? AND slug = ?",
