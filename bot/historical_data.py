@@ -99,11 +99,17 @@ async def _get_json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> 
 
 
 async def _download_file(
-    session: aiohttp.ClientSession, metadata: dict[str, Any], target: Path, expected_day: str
+    session: aiohttp.ClientSession, metadata: dict[str, Any], target: Path, expected_day: str,
+    trusted_cache: bool = False,
 ) -> dict[str, Any]:
     expected_sha = str(metadata["sha256"]).lower()
     if target.exists() and _sha256(target) == expected_sha:
-        records = await asyncio.to_thread(_validate_gzip, target, int(metadata["records"]), expected_day)
+        if trusted_cache:
+            records = int(metadata["records"])
+        else:
+            records = await asyncio.to_thread(
+                _validate_gzip, target, int(metadata["records"]), expected_day
+            )
         return {"name": target.name, "bytes": target.stat().st_size, "records": records,
                 "sha256": expected_sha, "coverage": metadata.get("coverage"), "cached": True}
     payload: bytes | None = None
@@ -175,13 +181,17 @@ def _probability(delta: float, std: float, sigma_mult: float, jump_weight: float
     return max(0.01, min(0.99, p))
 
 
-def _scores(samples: list[tuple[int, float, float, int]], indices: set[int],
-            sigma_mult: float, jump_weight: float) -> dict[str, float | int]:
-    selected = [s for s in samples if s[0] in indices]
+def _scores(samples: list[tuple[int, int, float, float, int]], indices: set[int],
+            sigma_mult: float, jump_weight: float, horizon: int | None = None
+            ) -> dict[str, float | int]:
+    selected = [
+        sample for sample in samples
+        if sample[0] in indices and (horizon is None or sample[1] == horizon)
+    ]
     if not selected:
         return {"n": 0, "brier": float("nan"), "logloss": float("nan"), "accuracy": float("nan")}
     brier = logloss = correct = 0.0
-    for _, delta, std, outcome in selected:
+    for _, _, delta, std, outcome in selected:
         p = _probability(delta, std, sigma_mult, jump_weight)
         y = float(outcome)
         brier += (p - y) ** 2
@@ -192,14 +202,18 @@ def _scores(samples: list[tuple[int, float, float, int]], indices: set[int],
             "accuracy": round(correct / n, 6)}
 
 
-def _constant_scores(samples: list[tuple[int, float, float, int]], indices: set[int],
-                    probability: float = 0.5) -> dict[str, float | int]:
-    selected = [sample for sample in samples if sample[0] in indices]
+def _constant_scores(samples: list[tuple[int, int, float, float, int]], indices: set[int],
+                    probability: float = 0.5, horizon: int | None = None
+                    ) -> dict[str, float | int]:
+    selected = [
+        sample for sample in samples
+        if sample[0] in indices and (horizon is None or sample[1] == horizon)
+    ]
     if not selected:
         return {"n": 0, "brier": float("nan"), "logloss": float("nan"), "accuracy": float("nan")}
     p = max(0.01, min(0.99, probability))
     brier = logloss = correct = 0.0
-    for _, _, _, outcome in selected:
+    for _, _, _, _, outcome in selected:
         y = float(outcome)
         brier += (p - y) ** 2
         logloss -= y * math.log(p) + (1.0 - y) * math.log(1.0 - p)
@@ -210,9 +224,8 @@ def _constant_scores(samples: list[tuple[int, float, float, int]], indices: set[
 
 
 def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
-    """Evaluate forecasts at 60s, 30s and 15s to settlement; chronological holdout."""
-    samples: list[tuple[int, float, float, int]] = []
-    samples_by_horizon: dict[int, list[tuple[int, float, float, int]]] = {60: [], 30: [], 15: []}
+    """Evaluate forecasts at six horizons; chronological holdout."""
+    samples: list[tuple[int, int, float, float, int]] = []
     valid_rounds = missing_boundary_rounds = 0
     var_fast = var_slow = DEFAULT_SIGMA_1S ** 2
     last_price: float | None = None
@@ -257,7 +270,7 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 last_price, last_global_ts = current, global_ts
 
             offset = sec % 300
-            if offset not in (240, 270, 285):
+            if offset not in (60, 120, 180, 240, 270, 285):
                 continue
             start_sec = sec - offset
             outcome = labels.get(start_sec)
@@ -281,66 +294,34 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 mean_final = weight * current_twap + (1.0 - weight) * current
                 variance = (current * sigma) ** 2 * max((tau ** 3) / 10800.0, 1e-12)
             std = math.sqrt(max(variance, 1e-12))
-            sample = (day_index, mean_final - strike, std, outcome)
-            samples.append(sample)
-            samples_by_horizon[int(tau)].append(sample)
+            samples.append((day_index, int(tau), mean_final - strike, std, outcome))
 
     train_indices = set(range(0, min(21, len(days))))
     test_indices = set(range(min(21, len(days)), len(days)))
     base_train = _scores(samples, train_indices, 1.0, 0.12)
     base_test = _scores(samples, test_indices, 1.0, 0.12)
     best = (float("inf"), 1.0, 0.12)
-    for step in range(5, 51):
-        sigma_mult = step / 20.0  # 0.25 .. 2.50
-        for jump_step in range(0, 26):
-            jump_weight = jump_step * 0.02  # 0.00 .. 0.50
+    for step in range(10, 51):
+        sigma_mult = step / 20.0  # 0.50 .. 2.50
+        for jump_step in range(0, 16):
+            jump_weight = jump_step * 0.02
             score = _scores(samples, train_indices, sigma_mult, jump_weight)
             if score["n"] and float(score["brier"]) < best[0]:
                 best = (float(score["brier"]), sigma_mult, jump_weight)
     calibrated_test = _scores(samples, test_indices, best[1], best[2])
     baseline_test = _scores(samples, test_indices, 1.0, 0.0)
     constant_test = _constant_scores(samples, test_indices, 0.5)
-
-    horizon_reports: dict[str, Any] = {}
-    for horizon, horizon_samples in samples_by_horizon.items():
-        h_default_train = _scores(horizon_samples, train_indices, 1.0, 0.12)
-        h_default_test = _scores(horizon_samples, test_indices, 1.0, 0.12)
-        h_constant_test = _constant_scores(horizon_samples, test_indices, 0.5)
-        best_brier = (float("inf"), 1.0, 0.12)
-        best_logloss = (float("inf"), 1.0, 0.12)
-        for sigma_step in range(5, 51):
-            sigma_mult = sigma_step / 20.0
-            for jump_step in range(0, 26):
-                jump_weight = jump_step * 0.02
-                score = _scores(horizon_samples, train_indices, sigma_mult, jump_weight)
-                if score["n"]:
-                    if float(score["brier"]) < best_brier[0]:
-                        best_brier = (float(score["brier"]), sigma_mult, jump_weight)
-                    if float(score["logloss"]) < best_logloss[0]:
-                        best_logloss = (float(score["logloss"]), sigma_mult, jump_weight)
-        brier_test = _scores(horizon_samples, test_indices, best_brier[1], best_brier[2])
-        logloss_test = _scores(horizon_samples, test_indices, best_logloss[1], best_logloss[2])
-        horizon_reports[f"{horizon}s"] = {
-            "train_default": h_default_train,
-            "holdout_default": h_default_test,
-            "holdout_constant_50": h_constant_test,
-            "fit_brier": {
-                "sigma_multiplier": best_brier[1],
-                "jump_weight": best_brier[2],
-                "train_brier": round(best_brier[0], 6),
-                "holdout": brier_test,
-                "at_search_boundary": best_brier[1] in (0.25, 2.5) or best_brier[2] in (0.0, 0.5),
-            },
-            "fit_logloss": {
-                "sigma_multiplier": best_logloss[1],
-                "jump_weight": best_logloss[2],
-                "train_logloss": round(best_logloss[0], 6),
-                "holdout": logloss_test,
-                "at_search_boundary": best_logloss[1] in (0.25, 2.5) or best_logloss[2] in (0.0, 0.5),
-            },
+    horizon_scores = {
+        str(horizon): {
+            "default_model": _scores(samples, test_indices, 1.0, 0.12, horizon),
+            "calibrated_model": _scores(samples, test_indices, best[1], best[2], horizon),
+            "zero_jump_baseline": _scores(samples, test_indices, 1.0, 0.0, horizon),
+            "constant_50_baseline": _constant_scores(samples, test_indices, 0.5, horizon),
         }
+        for horizon in (240, 180, 120, 60, 30, 15)
+    }
     return {
-        "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 60s, 30s, 15s",
+        "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 240s, 180s, 120s, 60s, 30s, 15s",
         "valid_settlement_rounds": valid_rounds,
         "rounds_missing_exact_twap_boundary": missing_boundary_rounds,
         "forecast_samples": len(samples),
@@ -349,10 +330,16 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                   "fitted_brier": round(best[0], 6)},
         "holdout": {"days": len(test_indices), "default_model": base_test,
                     "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
-                    "constant_50_baseline": constant_test},
-        "by_horizon": horizon_reports,
+                    "constant_50_baseline": constant_test, "by_seconds_to_settlement": horizon_scores},
+        "holdout_gate": {
+            "both_brier_and_logloss_improved": (
+                float(calibrated_test["brier"]) < float(base_test["brier"])
+                and float(calibrated_test["logloss"]) < float(base_test["logloss"])
+            ),
+            "automatic_strategy_parameter_update": False,
+        },
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
-        "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate. Do not apply parameters if Brier and log-loss disagree or the optimum hits a grid boundary."
+        "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
     }
 
 
@@ -380,6 +367,24 @@ async def download_and_calibrate(
         day_rows = listing.get("days") or []
         if [row.get("date") for row in day_rows] != days_expected:
             raise RuntimeError("Poly Tick Tape returned an incomplete or unordered day list")
+        report_path = directory / "calibration-report.json"
+        existing_report: dict[str, Any] | None = None
+        try:
+            candidate = json.loads(report_path.read_text(encoding="utf-8"))
+            if candidate.get("calibration_version") == 2 and candidate.get("range_utc") == {"from": start, "to": end}:
+                existing_report = candidate
+        except (OSError, ValueError, TypeError):
+            existing_report = None
+        expected_manifest = {
+            day[stream]["name"]: str(day[stream]["sha256"]).lower()
+            for day in day_rows for stream in ("price", "twap60")
+            if day.get(stream)
+        }
+        cached_manifest = {
+            item.get("name"): str(item.get("sha256", "")).lower()
+            for item in (existing_report or {}).get("files_manifest", [])
+        }
+        trusted_manifest = bool(expected_manifest) and cached_manifest == expected_manifest
         files: list[dict[str, Any]] = []
         total_bytes = sum(
             int(day[stream]["bytes"])
@@ -395,12 +400,23 @@ async def download_and_calibrate(
                 if not metadata:
                     raise RuntimeError(f"Missing {stream} metadata for {day['date']}")
                 target = directory / metadata["name"]
-                result = await _download_file(session, metadata, target, day["date"])
+                result = await _download_file(
+                    session, metadata, target, day["date"],
+                    trusted_cache=trusted_manifest,
+                )
                 files.append({**result, "date": day["date"], "stream": stream})
                 log.info("Poly Tick Tape verified %s (%s records, %s)", target.name,
                          result["records"], "cached" if result["cached"] else "downloaded")
+    if existing_report is not None and trusted_manifest and all(item["cached"] for item in files):
+        log.info(
+            "Poly Tick Tape archive cache verified; reusing existing calibration report for %s..%s",
+            start, end,
+        )
+        return existing_report
+
     report = {
         "source": "Poly Tick Tape",
+        "calibration_version": 2,
         "range_utc": {"from": start, "to": end},
         "days": len(days_expected),
         "files": len(files),
@@ -413,7 +429,6 @@ async def download_and_calibrate(
     }
     calibration = await asyncio.to_thread(_calibrate, directory, days_expected)
     report["calibration"] = calibration
-    report_path = directory / "calibration-report.json"
     temp_report = report_path.with_suffix(".json.part")
     temp_report.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     temp_report.replace(report_path)
