@@ -1583,8 +1583,14 @@ class TradingEngine:
             await self._cancel_window_maker_orders(w)
             return
         if w.price_to_beat is None:
-            self._log_maker_skip(w, "anchor", "missing_settlement_anchor",
-                                 anchor_source=w.price_to_beat_source or "none")
+            nearest_twap = tr.nearest_twap_sample(w.start_ts)
+            self._log_maker_skip(
+                w, "anchor", "missing_settlement_anchor",
+                anchor_source=w.price_to_beat_source or "none",
+                nearest_twap_ts=round(nearest_twap[0], 3) if nearest_twap else None,
+                nearest_twap_delta_sec=round(nearest_twap[2], 3) if nearest_twap else None,
+                twap_history_samples=len(tr.cl_twap_hist),
+            )
             await self._cancel_window_maker_orders(w)
             return
         try:
