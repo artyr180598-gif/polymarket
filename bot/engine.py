@@ -1292,12 +1292,12 @@ class TradingEngine:
             }
 
         imbalance = window.up_shares - window.down_shares
-        if imbalance > 0.01:
+        if imbalance > 1e-6:
             avg_up_cost = (window.up_cost + window.up_fees) / max(window.up_shares, 1e-9)
             pair_cost = avg_up_cost + candidates["Down"]["quote_price"]
             allowed_outcomes = {"Down"}
             pair_gate = "unpaired_up"
-        elif imbalance < -0.01:
+        elif imbalance < -1e-6:
             avg_down_cost = (window.down_cost + window.down_fees) / max(window.down_shares, 1e-9)
             pair_cost = avg_down_cost + candidates["Up"]["quote_price"]
             allowed_outcomes = {"Up"}
@@ -1335,13 +1335,13 @@ class TradingEngine:
             existing = self.executor.get_open_orders(token)
             if existing:
                 order = existing[0]
-                if imbalance > 0.01 and outcome == "Down":
+                if imbalance > 1e-6 and outcome == "Down":
                     existing_pair_cost = (
                         (window.up_cost + window.up_fees)
                         / max(window.up_shares, 1e-9)
                         + order.price
                     )
-                elif imbalance < -0.01 and outcome == "Up":
+                elif imbalance < -1e-6 and outcome == "Up":
                     existing_pair_cost = (
                         (window.down_cost + window.down_fees)
                         / max(window.down_shares, 1e-9)
