@@ -1550,3 +1550,36 @@ def test_open_blocks_taker_addition_that_exceeds_portfolio_unpaired_cap(tmp_path
     assert window.up_shares == shares_before
     assert round(engine._unpaired_exposure_usd(), 2) == 9.0
     engine.ledger.conn.close()
+
+
+
+def test_maker_quotes_respect_projected_portfolio_unpaired_cap(tmp_path, monkeypatch) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "maker-unpaired-cap.db"),
+        max_unpaired_exposure_usd=10.0,
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-maker-cap", asset="BTC", timeframe="5m",
+        condition_id="0x" + "9" * 64, up_token="up-token", down_token="down-token",
+        start_ts=now - 30, end_ts=now + 270, price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    for token in ("up-token", "down-token"):
+        engine._market_books[token] = {
+            "bids": {0.40: 10.0}, "asks": {0.45: 20.0},
+            "best_bid": 0.40, "best_ask": 0.45,
+            "tick_size": 0.01, "recv_mono": time.monotonic(),
+        }
+    monkeypatch.setattr(engine, "_unpaired_exposure_usd", lambda **_kwargs: 9.0)
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+
+    assert engine.executor.get_open_orders() == []
+    engine.ledger.conn.close()
