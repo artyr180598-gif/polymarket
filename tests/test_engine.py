@@ -174,7 +174,7 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
         "recv_mono": time.monotonic(),
     }
 
-    asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.99, fair_down=0.01))
 
     up_orders = engine.executor.get_open_orders("up-token")
     down_orders = engine.executor.get_open_orders("down-token")
