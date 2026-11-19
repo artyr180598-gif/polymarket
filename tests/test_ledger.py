@@ -590,3 +590,41 @@ def test_atomic_pair_and_outbox_roll_back_on_event_key_collision(tmp_path) -> No
     assert ledger.recent_fills("paper", 5) == []
     assert ledger.pending_telegram_notifications()[0]["message"] == "original event"
     ledger.conn.close()
+
+
+def test_paper_reset_backs_up_then_clears_all_paper_history_and_positions(tmp_path) -> None:
+    db_path = str(tmp_path / "paper-reset.db")
+    ledger = Ledger(db_path)
+    slug = "btc-updown-5m-1795035600"
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.40, fee=0.10)
+    ledger.record_anchor_check(
+        mode="paper", slug=slug, price_to_beat=100000.0,
+        price_to_beat_source="rtds", gamma_price_to_beat=None,
+        anchor_delta=None, anchor_verified=None,
+    )
+    ledger.enqueue_telegram_notification("old trade", "old-trade-event")
+    ledger.conn.execute(
+        "INSERT INTO equity_points (ts, mode, equity, cash, realized_net_pnl, fees_paid) "
+        "VALUES (?, 'paper', 100, 90, 0, 0.1)", (time.time(),)
+    )
+    ledger.conn.commit()
+
+    result = ledger.reset_paper_history("paper")
+
+    assert result["deleted"]["fills"] == 1
+    assert result["deleted"]["anchor_checks"] == 1
+    assert result["deleted"]["equity_points"] == 1
+    assert all(value == 0 for value in result["remaining"].values())
+    assert ledger.open_positions("paper") == []
+    state = ledger.portfolio_state("paper", 2750.0)
+    assert state["cash"] == 2750.0
+    assert state["inventory_cost"] == 0.0
+    assert state["equity"] == 2750.0
+
+    backup = sqlite3.connect(result["backup_path"])
+    assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert backup.execute("SELECT COUNT(*) FROM fills WHERE mode='paper'").fetchone()[0] == 1
+    assert backup.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0] == 1
+    backup.close()
+    ledger.conn.close()
+
