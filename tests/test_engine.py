@@ -862,5 +862,6 @@ def test_paper_reset_marker_is_unique_and_filesystem_safe() -> None:
     second = _paper_reset_marker_path("/data/polybot.db", "fresh-paper-2026-11-20")
     assert first == "/data/polybot.db.paper-reset-fresh-paper-2026-11-19.done"
     assert second != first
-    assert "/" not in _paper_reset_marker_path("/data/polybot.db", "../../unsafe/reset")
+    unsafe_marker = _paper_reset_marker_path("/data/polybot.db", "../../unsafe/reset")
+    assert "/" not in unsafe_marker.rsplit(".paper-reset-", 1)[1]
     assert _paper_reset_marker_path("/data/polybot.db") == "/data/polybot.db.paper-reset-v2.done"
