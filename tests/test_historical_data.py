@@ -56,3 +56,19 @@ def test_validate_gzip_checks_expected_day_and_record_count(tmp_path) -> None:
     assert _validate_gzip(path, 1, day) == 1
     with pytest.raises(ValueError):
         _validate_gzip(path, 2, day)
+
+
+
+def test_validate_gzip_rejects_duplicate_or_unordered_timestamps(tmp_path) -> None:
+    day = "2026-10-14"
+    start = int(datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp())
+    path = tmp_path / f"btc-price-{day}.jsonl.gz"
+    rows = [
+        {"ts": start + 1, "p": "109876.12", "v": 109876.12},
+        {"ts": start + 1, "p": "109876.13", "v": 109876.13},
+    ]
+    with gzip.open(path, "wt", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + "\\n")
+    with pytest.raises(ValueError):
+        _validate_gzip(path, 2, day)
