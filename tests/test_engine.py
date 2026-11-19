@@ -444,8 +444,7 @@ def test_unresolved_official_result_is_logged_and_not_booked(monkeypatch, tmp_pa
 
     assert window.resolved is False
     assert window.up_shares == 0.01
-    assert ledger_rows := engine.ledger.recent_resolutions("paper", 10)
-    assert ledger_rows == []
+    assert engine.ledger.recent_resolutions("paper", 10) == []
     assert any(
         "PAPER resolution pending" in event and "no_resolution_rows" in event
         for event in engine.events
