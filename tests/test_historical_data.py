@@ -69,6 +69,6 @@ def test_validate_gzip_rejects_duplicate_or_unordered_timestamps(tmp_path) -> No
     ]
     with gzip.open(path, "wt", encoding="utf-8") as stream:
         for row in rows:
-            stream.write(json.dumps(row) + "\\n")
+            stream.write(json.dumps(row) + "\n")
     with pytest.raises(ValueError):
         _validate_gzip(path, 2, day)
