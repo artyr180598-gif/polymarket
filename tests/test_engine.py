@@ -1511,3 +1511,9 @@ def test_taker_pair_completion_rounds_496_partial_fill_to_clob_minimum(tmp_path)
     assert opened[0][0][3] == 5.0
     assert opened[0][0][4] == "syn_tp"
     engine.ledger.conn.close()
+
+
+def test_mark_to_market_liquidation_uses_visible_bid_depth_and_zero_for_unfilled_size() -> None:
+    book = {"bids": {0.20: 1.0, 0.10: 1.0}}
+    assert round(TradingEngine._bid_liquidation_value(book, 3.0), 2) == 0.30
+    assert round(TradingEngine._bid_liquidation_value(book, 1.5), 2) == 0.25
