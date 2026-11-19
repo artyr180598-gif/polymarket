@@ -74,12 +74,28 @@ def _validate_gzip(path: Path, expected_records: int, expected_day: str) -> int:
 
 
 async def _get_json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> dict[str, Any]:
-    async with session.get(url, **kwargs) as response:
-        body = await response.json(content_type=None)
-        if response.status >= 400:
-            detail = body.get("error", body) if isinstance(body, dict) else body
-            raise RuntimeError(f"Poly Tick Tape HTTP {response.status}: {detail}")
-        return body
+    for attempt in range(3):
+        try:
+            async with session.get(url, **kwargs) as response:
+                body = await response.json(content_type=None)
+                if response.status == 429 or response.status >= 500:
+                    if attempt < 2:
+                        retry_after = response.headers.get("Retry-After", "")
+                        try:
+                            delay = max(1.0, min(30.0, float(retry_after)))
+                        except (TypeError, ValueError):
+                            delay = float(2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                if response.status >= 400:
+                    detail = body.get("error", body) if isinstance(body, dict) else body
+                    raise RuntimeError(f"Poly Tick Tape HTTP {response.status}: {detail}")
+                return body
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt >= 2:
+                raise
+            await asyncio.sleep(float(2 ** attempt))
+    raise RuntimeError("Poly Tick Tape request failed after retries")
 
 
 async def _download_file(
@@ -90,11 +106,32 @@ async def _download_file(
         records = await asyncio.to_thread(_validate_gzip, target, int(metadata["records"]), expected_day)
         return {"name": target.name, "bytes": target.stat().st_size, "records": records,
                 "sha256": expected_sha, "coverage": metadata.get("coverage"), "cached": True}
-    async with session.get(str(metadata["url"]), allow_redirects=True) as response:
-        if response.status >= 400:
-            body = await response.text()
-            raise RuntimeError(f"Download {target.name} failed: HTTP {response.status}: {body[:300]}")
-        payload = await response.read()
+    payload: bytes | None = None
+    for attempt in range(3):
+        try:
+            async with session.get(str(metadata["url"]), allow_redirects=True) as response:
+                if response.status == 429 or response.status >= 500:
+                    if attempt < 2:
+                        retry_after = response.headers.get("Retry-After", "")
+                        try:
+                            delay = max(1.0, min(30.0, float(retry_after)))
+                        except (TypeError, ValueError):
+                            delay = float(2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                if response.status >= 400:
+                    body = await response.text()
+                    raise RuntimeError(
+                        f"Download {target.name} failed: HTTP {response.status}: {body[:300]}"
+                    )
+                payload = await response.read()
+                break
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt >= 2:
+                raise
+            await asyncio.sleep(float(2 ** attempt))
+    if payload is None:
+        raise RuntimeError(f"Download {target.name} failed after retries")
     actual_sha = hashlib.sha256(payload).hexdigest()
     if actual_sha != expected_sha:
         raise ValueError(f"SHA-256 mismatch for {target.name}: {actual_sha} != {expected_sha}")
