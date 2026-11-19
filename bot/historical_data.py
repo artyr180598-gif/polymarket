@@ -47,7 +47,6 @@ def _sha256(path: Path) -> str:
 
 def _validate_gzip(path: Path, expected_records: int, expected_day: str) -> int:
     count = 0
-    day_start = int(date.fromisoformat(expected_day).strftime("%s")) if os.name != "nt" else None
     # UTC timestamp validation is performed using the date ordinal, avoiding local timezone assumptions.
     from datetime import datetime, timezone
     utc_start = int(datetime.fromisoformat(expected_day).replace(tzinfo=timezone.utc).timestamp())
@@ -77,11 +76,11 @@ async def _get_json(session: aiohttp.ClientSession, url: str, **kwargs: Any) -> 
 
 
 async def _download_file(
-    session: aiohttp.ClientSession, metadata: dict[str, Any], target: Path
+    session: aiohttp.ClientSession, metadata: dict[str, Any], target: Path, expected_day: str
 ) -> dict[str, Any]:
     expected_sha = str(metadata["sha256"]).lower()
     if target.exists() and _sha256(target) == expected_sha:
-        records = _validate_gzip(target, int(metadata["records"]), target.name.split("-")[-1][:10])
+        records = await asyncio.to_thread(_validate_gzip, target, int(metadata["records"]), expected_day)
         return {"name": target.name, "bytes": target.stat().st_size, "records": records,
                 "sha256": expected_sha, "cached": True}
     async with session.get(str(metadata["url"]), allow_redirects=True) as response:
@@ -96,7 +95,7 @@ async def _download_file(
     temporary = target.with_suffix(target.suffix + ".part")
     temporary.write_bytes(payload)
     try:
-        records = _validate_gzip(temporary, int(metadata["records"]), target.name.split("-")[-1][:10])
+        records = await asyncio.to_thread(_validate_gzip, temporary, int(metadata["records"]), expected_day)
         temporary.replace(target)
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -292,7 +291,7 @@ async def download_and_calibrate(
                 if not metadata:
                     raise RuntimeError(f"Missing {stream} metadata for {day['date']}")
                 target = directory / metadata["name"]
-                result = await _download_file(session, metadata, target)
+                result = await _download_file(session, metadata, target, day["date"])
                 files.append({**result, "date": day["date"], "stream": stream})
                 log.info("Poly Tick Tape verified %s (%s records, %s)", target.name,
                          result["records"], "cached" if result["cached"] else "downloaded")
