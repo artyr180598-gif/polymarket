@@ -5,6 +5,7 @@ import pytest
 
 from bot.oracle_feed import (
     _await_subscription,
+    _enter_subscription,
     _iterate_with_idle_timeout,
     _iterate_with_required_topics,
 )
@@ -21,7 +22,7 @@ def test_official_public_rtds_specs_are_available() -> None:
     assert twap.window_seconds == 60
 
 
-def test_rtds_subscribe_handshake_timeout_cancels_pending_connect() -> None:
+def test_rtds_subscribe_call_timeout_cancels_pending_connect() -> None:
     closed = []
 
     class HangingClient:
@@ -34,7 +35,28 @@ def test_rtds_subscribe_handshake_timeout_cancels_pending_connect() -> None:
     async def run():
         await _await_subscription(HangingClient(), [], timeout_sec=0.01)
 
-    with pytest.raises(RuntimeError, match="subscribe handshake timed out"):
+    with pytest.raises(RuntimeError, match="subscribe call timed out"):
+        asyncio.run(run())
+    assert closed == [True]
+
+
+def test_rtds_context_enter_timeout_cancels_websocket_handshake() -> None:
+    closed = []
+
+    class HangingSubscription:
+        async def __aenter__(self):
+            try:
+                await asyncio.sleep(1.0)
+            finally:
+                closed.append(True)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def run():
+        await _enter_subscription(HangingSubscription(), timeout_sec=0.01)
+
+    with pytest.raises(RuntimeError, match="connection handshake timed out"):
         asyncio.run(run())
     assert closed == [True]
 
