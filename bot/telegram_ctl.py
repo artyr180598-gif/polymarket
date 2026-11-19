@@ -218,26 +218,50 @@ class TelegramController:
                 result = await r.json(content_type=None)
                 if r.status != 200 or not result.get("ok", False):
                     logger.warning("sendMessage rejected: status=%s response=%s", r.status, str(result)[:180])
-                    # Telegram's HTML parser rejects unescaped '<', '&', and
-                    # unsupported tags in dynamic market/error text. Retry as
-                    # genuinely plain text, stripping markup rather than only
-                    # the handful of tags used by our templates.
-                    plain = re.sub(r"</?[^>]+>", "", clean)
-                    payload["text"] = plain[:4090]
-                    payload.pop("parse_mode", None)
-                    async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
-                        result2 = await r2.json(content_type=None)
-                        if r2.status != 200 or not result2.get("ok", False):
-                            logger.warning(
-                                "sendMessage plain rejected: status=%s response=%s",
-                                r2.status, str(result2)[:180],
-                            )
-                            return False
-                        return True
+                    description = str(result.get("description") or "").lower()
+                    # Only retry as plain text for Telegram's explicit HTML
+                    # entity parser error. Retrying 429/5xx as plain text doubles
+                    # requests during an outage and can worsen rate limiting.
+                    if r.status == 400 and "parse entities" in description:
+                        plain = re.sub(r"</?[^>]+>", "", clean)
+                        payload["text"] = plain[:4090]
+                        payload.pop("parse_mode", None)
+                        async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
+                            result2 = await r2.json(content_type=None)
+                            if r2.status != 200 or not result2.get("ok", False):
+                                logger.warning(
+                                    "sendMessage plain rejected: status=%s response=%s",
+                                    r2.status, str(result2)[:180],
+                                )
+                                self._set_notification_retry_delay(r2.status, result2)
+                                return False
+                            self._notification_retry_interval = 1.0
+                            return True
+                    self._set_notification_retry_delay(r.status, result)
+                    return False
+                self._notification_retry_interval = 1.0
                 return True
         except Exception as e:
             logger.warning("Telegram send failed: %s", e)
             return False
+
+    def _set_notification_retry_delay(self, status: int, result: Dict[str, Any]) -> None:
+        """Back off on Telegram rate limits and transient API failures."""
+        if status == 429:
+            parameters = result.get("parameters") or {}
+            try:
+                delay = float(parameters.get("retry_after", 5))
+            except (TypeError, ValueError):
+                delay = 5.0
+            self._notification_retry_interval = max(1.0, min(60.0, delay))
+        elif status >= 500:
+            self._notification_retry_interval = min(
+                30.0, max(2.0, self._notification_retry_interval * 2.0)
+            )
+        elif status >= 400:
+            # Keep the event queued and fail closed; avoid hammering a persistent
+            # request/configuration error once per second.
+            self._notification_retry_interval = max(30.0, self._notification_retry_interval)
 
     async def notify(self, text: str, event_key: Optional[str] = None) -> None:
         msg = (text or "").strip()
