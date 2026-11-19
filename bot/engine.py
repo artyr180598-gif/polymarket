@@ -156,6 +156,7 @@ class TradingEngine:
         self._market_books: Dict[str, Dict[str, Any]] = {}
         self._market_tokens_changed = asyncio.Event()
         self._market_feed_connected = False
+        self._market_feed_ever_connected = False
         self._market_feed_last_event_mono = 0.0
         self._maker_diag_last: Dict[str, float] = {}
         # Calibration remains telemetry-only until execution-aware validation passes.
@@ -895,6 +896,7 @@ class TradingEngine:
                             break
                         self._market_feed_last_event_mono = time.monotonic()
                         self._market_feed_connected = True
+                        self._market_feed_ever_connected = True
                         await self._process_market_event(event)
             except asyncio.CancelledError:
                 raise
@@ -1131,6 +1133,55 @@ class TradingEngine:
                 log.warning("strategy: %s", e)
             await asyncio.sleep(1.5)
 
+    def _mark_to_market_state(self) -> Dict[str, Any]:
+        """Conservatively value open inventory using fresh CLOB bids."""
+        positions = self.ledger.open_positions(self.cfg.trading_mode)
+        if not positions:
+            return {"complete": True, "market_value": 0.0, "unrealized_pnl": 0.0,
+                    "unpaired_exposure_usd": 0.0, "reason": ""}
+        if not self._market_feed_connected:
+            return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                    "unpaired_exposure_usd": None, "reason": "CLOB feed disconnected"}
+        market_value = inventory_cost = open_fees = unpaired_exposure = 0.0
+        now_mono = time.monotonic()
+        for position in positions:
+            window = self.windows.get(str(position["slug"]))
+            if window is None or not window.up_token or not window.down_token:
+                return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                        "unpaired_exposure_usd": None,
+                        "reason": f"missing market tokens for {position['slug']}"}
+            up, down = float(position["up_shares"]), float(position["down_shares"])
+            up_cost, down_cost = float(position["up_cost"]), float(position["down_cost"])
+            up_fees, down_fees = float(position["up_fees"]), float(position["down_fees"])
+            paired = min(up, down)
+            up_residual, down_residual = max(0.0, up-paired), max(0.0, down-paired)
+            position_value = paired
+            for token, residual in ((window.up_token, up_residual), (window.down_token, down_residual)):
+                if residual <= 1e-6:
+                    continue
+                book = self._market_books.get(token)
+                age = now_mono - float(book.get("recv_mono", 0.0)) if book else None
+                if not book or age is None or age > 5.0:
+                    return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                            "unpaired_exposure_usd": None,
+                            "reason": f"missing or stale bid for {position['slug']}"}
+                bid, _ = self._book_best(book)
+                if not math.isfinite(bid) or bid <= 0.0 or bid >= 1.0:
+                    return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                            "unpaired_exposure_usd": None,
+                            "reason": f"invalid best bid for {position['slug']}"}
+                position_value += residual * bid
+            market_value += position_value
+            inventory_cost += up_cost + down_cost
+            open_fees += up_fees + down_fees
+            if up_residual > 1e-6 and up > 0:
+                unpaired_exposure += (up_cost + up_fees) * up_residual / up
+            if down_residual > 1e-6 and down > 0:
+                unpaired_exposure += (down_cost + down_fees) * down_residual / down
+        return {"complete": True, "market_value": market_value,
+                "unrealized_pnl": market_value-inventory_cost-open_fees,
+                "unpaired_exposure_usd": unpaired_exposure, "reason": ""}
+
     def _risk_halted(self) -> bool:
         # A confirmed RTDS-vs-Gamma mismatch is a persistent data-integrity halt.
         # It survives restarts and cannot be cleared by the ordinary resume button.
@@ -1163,6 +1214,15 @@ class TradingEngine:
         except Exception:
             self._risk_halt_reason = "Cannot read PAPER ledger PnL; trading remains halted"
             return True
+        if self._market_feed_ever_connected:
+            mtm = self._mark_to_market_state()
+            if not mtm["complete"]:
+                self._risk_halt_reason = (
+                    "Cannot conservatively mark open PAPER inventory: "
+                    + str(mtm.get("reason") or "market data unavailable")
+                )
+                return True
+            current_day_pnl += float(mtm["unrealized_pnl"])
         if current_day_pnl <= -self.cfg.max_daily_loss_usd:
             self._risk_halt_reason = (
                 f"Daily net loss limit reached: ${current_day_pnl:.2f} "
@@ -2139,6 +2199,9 @@ class TradingEngine:
             inv = 0.0
             equity = 0.0
             cash = 0.0
+        mtm_state = self._mark_to_market_state()
+        if mtm_state["complete"]:
+            equity = cash + float(mtm_state["market_value"])
         reserved_orders = self.executor.get_open_orders() if self.executor is not None else []
         reserved_orders_usd = sum(order.price * order.remaining for order in reserved_orders)
         available_cash = max(0.0, cash - reserved_orders_usd)
@@ -2177,6 +2240,11 @@ class TradingEngine:
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
             "cash": round(cash, 2),
+            "mark_to_market_complete": bool(mtm_state["complete"]),
+            "market_value": round(float(mtm_state["market_value"]), 2) if mtm_state["complete"] else None,
+            "unrealized_pnl": round(float(mtm_state["unrealized_pnl"]), 2) if mtm_state["complete"] else None,
+            "unpaired_exposure_usd": round(float(mtm_state["unpaired_exposure_usd"]), 2) if mtm_state["complete"] else None,
+            "mark_to_market_reason": str(mtm_state.get("reason") or ""),
             "available_cash": round(available_cash, 2),
             "reserved_maker_orders_usd": round(reserved_orders_usd, 2),
             "maker_orders_open": len(reserved_orders),
