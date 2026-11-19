@@ -50,16 +50,23 @@ def _validate_gzip(path: Path, expected_records: int, expected_day: str) -> int:
     # UTC timestamp validation is performed using the date ordinal, avoiding local timezone assumptions.
     from datetime import datetime, timezone
     utc_start = int(datetime.fromisoformat(expected_day).replace(tzinfo=timezone.utc).timestamp())
+    last_ts = -1
     with gzip.open(path, "rt", encoding="utf-8") as stream:
         for line in stream:
             row = json.loads(line)
             ts = int(row["ts"])
             if not isinstance(row.get("p"), str) or not row["p"]:
                 raise ValueError(f"Invalid exact-price field in {path.name}")
+            exact_price = Decimal(row["p"])
+            if not exact_price.is_finite() or exact_price <= 0:
+                raise ValueError(f"Invalid exact price in {path.name}")
             if ts < utc_start or ts >= utc_start + SECONDS_PER_DAY:
                 raise ValueError(f"Out-of-day timestamp in {path.name}: {ts}")
+            if ts <= last_ts:
+                raise ValueError(f"Unordered or duplicate timestamp in {path.name}: {ts}")
             if not math.isfinite(float(row.get("v", row["p"]))):
                 raise ValueError(f"Invalid numeric price in {path.name}")
+            last_ts = ts
             count += 1
     if count != int(expected_records):
         raise ValueError(f"Record count mismatch for {path.name}: {count} != {expected_records}")
@@ -82,7 +89,7 @@ async def _download_file(
     if target.exists() and _sha256(target) == expected_sha:
         records = await asyncio.to_thread(_validate_gzip, target, int(metadata["records"]), expected_day)
         return {"name": target.name, "bytes": target.stat().st_size, "records": records,
-                "sha256": expected_sha, "cached": True}
+                "sha256": expected_sha, "coverage": metadata.get("coverage"), "cached": True}
     async with session.get(str(metadata["url"]), allow_redirects=True) as response:
         if response.status >= 400:
             body = await response.text()
@@ -101,7 +108,7 @@ async def _download_file(
         temporary.unlink(missing_ok=True)
         raise
     return {"name": target.name, "bytes": len(payload), "records": records,
-            "sha256": actual_sha, "cached": False}
+            "sha256": actual_sha, "coverage": metadata.get("coverage"), "cached": False}
 
 
 def _load_day(path: Path) -> tuple[array, dict[int, Decimal]]:
