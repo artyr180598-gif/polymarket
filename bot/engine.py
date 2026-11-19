@@ -281,11 +281,15 @@ class TradingEngine:
             if duration <= 0:
                 log.error("Unsupported restored timeframe in slug: %s", slug)
                 continue
+            asset = str(position["asset"]).upper()
+            # Preserve trackers for legacy inventory in disabled assets so status,
+            # settlement and risk-reducing MERGE remain safe after BTC-only switch.
+            self.trackers.setdefault(asset, AssetPriceTracker(asset))
             meta = await self._gamma(slug)
             condition_id = str((meta or {}).get("condition_id") or position["condition_id"])
             window = WindowState(
                 slug=slug,
-                asset=str(position["asset"]),
+                asset=asset,
                 timeframe=timeframe,
                 condition_id=condition_id,
                 up_token=str((meta or {}).get("up_token") or ""),
@@ -315,7 +319,8 @@ class TradingEngine:
         now_mono = time.monotonic()
         now_epoch = time.time()
         result: Dict[str, Any] = {}
-        for asset, tracker in self.trackers.items():
+        for asset in self.cfg.enabled_assets:
+            tracker = self.trackers[asset]
             metrics = self._oracle_metrics.get(asset, {})
             asset_status: Dict[str, Any] = {}
             for kind, source_ts, recv_mono in (
@@ -354,7 +359,8 @@ class TradingEngine:
             and diagnostics[asset]["spot"]["source_age_sec"] <= 5.0
             and diagnostics[asset]["twap60"]["source_age_sec"] is not None
             and diagnostics[asset]["twap60"]["source_age_sec"] <= 5.0
-            for asset, tracker in self.trackers.items()
+            for asset in self.cfg.enabled_assets
+            for tracker in (self.trackers[asset],)
         )
 
     async def _polymarket_oracle_loop(self) -> None:
@@ -912,6 +918,12 @@ class TradingEngine:
                         for w in list(self.windows.values()):
                             if w.resolved or w.remain_sec < 15:
                                 await self._cancel_window_maker_orders(w)
+                                continue
+                            if w.asset not in self.cfg.enabled_assets:
+                                # Disabled assets are management-only: no new entries,
+                                # but retain risk-reducing MERGE and official settlement.
+                                await self._cancel_window_maker_orders(w)
+                                await self._try_merge(w)
                                 continue
                             await self._run(w)
                             await self._try_merge(w)
@@ -1727,7 +1739,7 @@ class TradingEngine:
             "assets": self.cfg.enabled_assets,
             "streams_ok": self._oracle_fresh(),
             "oracle_connected": self._oracle_fresh(),
-            "model_ready": all(t._vol_samples >= 60 for t in self.trackers.values()),
+            "model_ready": all(self.trackers[a]._vol_samples >= 60 for a in self.cfg.enabled_assets),
             "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
             "strike_source": "RTDS Chainlink TWAP60 within 0.5s of window start; Gamma priceToBeat only after close; crypto-price.openPrice is diagnostic only",
             "clob_feed_connected": self._market_feed_connected,
