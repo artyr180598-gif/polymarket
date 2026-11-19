@@ -24,6 +24,9 @@ class StrategyParams:
     maker_min_price: float = 0.03
     maker_max_price: float = 0.95
     maker_start_sec: float = 6.0
+    # Maker entries are pair-first; unmatched inventory is deliberately small.
+    maker_pair_max_cost: float = 0.985
+    maker_max_unpaired_shares: float = 5.0
     take_profit_edge: float = 0.015
     stop_loss_drop: float = 0.12
     stop_loss_min_remain_sec: float = 30.0
@@ -56,16 +59,18 @@ PRESETS: Dict[str, StrategyParams] = {
         title_ru="PAPER-прототип по mo-money (Maker + Taker)",
         description_ru=(
             "PAPER-исследовательский прототип по публичной истории кошелька, не точная копия. "
-            "Maker-заявки моделируются по живому CLOB WebSocket и видимой очереди L2; "
-            "частичные исполнения учитываются. Отмены и риск-лимиты работают. "
-            "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются; "
-            "fair-value модель не откалибрована; направленный Taker отключён до калибровки. "
-            "Парное закрытие/арбитраж после комиссий остаётся отдельным путём. Прибыльность не доказана."
+            "Maker-заявки парные: суммарная цена пары ограничена, а незакрытый перекос ограничен 5 акциями; "
+            "частичные исполнения учитываются по live CLOB tape и видимой очереди L2. "
+            "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются. "
+            "Направленный fair-value Maker/Taker вход отключён; остаются парные Maker-котировки, "
+            "выгодное парное завершение и MERGE. Прибыльность не доказана."
         ),
         enable_maker=True,
         enable_lockin=False,
         enable_taker=True,
         min_maker_edge=0.024,
+        maker_pair_max_cost=0.985,
+        maker_max_unpaired_shares=5.0,
         min_taker_net_edge_btc=0.040,
         min_taker_net_edge_alt=0.026,
     ),
