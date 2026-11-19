@@ -98,6 +98,44 @@ class CLOBRecorder:
         }
         return self._enqueue_record(record, received_ts)
 
+    def enqueue_oracle_event(
+        self,
+        asset: str,
+        kind: str,
+        price: float,
+        timestamp_ms: int,
+        *,
+        accepted: bool,
+        age_sec: float,
+    ) -> bool:
+        if self.stopping or asset.upper() != "BTC":
+            return False
+        if kind not in {"chainlink_spot", "chainlink_twap60"}:
+            return False
+        received_ts = time.time()
+        record = {
+            "received_ts": received_ts,
+            "received_mono": time.monotonic(),
+            "exchange_ts": timestamp_ms / 1000.0,
+            "asset": "BTC",
+            "timeframe": "oracle",
+            "slug": "",
+            "condition_id": "",
+            "window_start_ts": None,
+            "window_end_ts": None,
+            "asset_id": "",
+            "event_type": f"oracle_{kind}",
+            "payload": {
+                "asset": "BTC",
+                "kind": kind,
+                "price": float(price),
+                "timestamp_ms": int(timestamp_ms),
+                "accepted": bool(accepted),
+                "age_sec": float(age_sec),
+            },
+        }
+        return self._enqueue_record(record, received_ts)
+
     def _enqueue_record(self, record: dict[str, Any], received_ts: float) -> bool:
         try:
             line = json.dumps(record, separators=(",", ":"), allow_nan=False)
