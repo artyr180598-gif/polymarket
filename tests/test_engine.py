@@ -143,6 +143,7 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
     engine.executor = PaperExecutor(100.0)
     engine.cash = 100.0
     engine._market_feed_connected = True
+    caplog.set_level("INFO")
     now = time.time()
     window = WindowState(
         slug="btc-updown-5m-900",
@@ -176,7 +177,7 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
     engine.ledger.conn.close()
 
 
-def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path) -> None:
+def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path, caplog) -> None:
     from bot.execution import PaperExecutor
 
     cfg = BotConfig(
@@ -212,7 +213,7 @@ def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path) -> Non
     asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
 
     assert engine.executor.get_open_orders("up-token") == []
-    assert any("missing_settlement_anchor" in event for event in engine.events)
+    assert any("missing_settlement_anchor" in record.getMessage() for record in caplog.records)
     engine.ledger.conn.close()
 
 
@@ -425,7 +426,7 @@ def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(monkeypatch,
 
     row = engine.ledger.recent_resolutions("paper", 1)[0]
     assert row["anchor_verified"] == 0
-    assert row["anchor_delta"] == 0.02
+    assert row["anchor_delta"] == pytest.approx(0.02, abs=1e-9)
     assert row["net_pnl"] == 3.0
     assert engine.paused is True
     assert engine._risk_halt_active is True
