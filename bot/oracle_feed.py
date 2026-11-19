@@ -9,6 +9,24 @@ import asyncio
 from typing import AsyncIterator, Tuple
 
 
+RTDS_IDLE_TIMEOUT_SEC = 8.0
+
+
+async def _iterate_with_idle_timeout(stream: AsyncIterator, timeout_sec: float = RTDS_IDLE_TIMEOUT_SEC):
+    """Yield RTDS events, failing closed when an open socket stops delivering data."""
+    iterator = stream.__aiter__()
+    while True:
+        try:
+            event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout_sec)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"Polymarket RTDS stream idle for more than {timeout_sec:.1f}s"
+            ) from exc
+        yield event
+
+
 class PolymarketOracleFeed:
     def __init__(self, assets: list[str]) -> None:
         self.assets = [a.upper() for a in assets]
@@ -28,7 +46,7 @@ class PolymarketOracleFeed:
         client = AsyncPublicClient()
         try:
             async with await client.subscribe(specs) as stream:
-                async for event in stream:
+                async for event in _iterate_with_idle_timeout(stream):
                     payload = event.payload
                     symbol = str(getattr(payload, "symbol", "")).lower()
                     asset = symbol.split("/", 1)[0].upper()
