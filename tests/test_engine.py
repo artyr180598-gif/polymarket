@@ -1409,3 +1409,32 @@ def test_mark_to_market_fails_closed_when_residual_book_is_stale(tmp_path):
     assert state["complete"] is False
     assert "stale" in state["reason"]
     engine.ledger.conn.close()
+
+
+def test_daily_risk_guard_includes_unrealized_loss_from_fresh_bid(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "mtm-risk-halt.db"), max_daily_loss_usd=10.0,
+    ))
+    slug = "btc-updown-5m-mtm-risk"
+    condition = "0x" + "5" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=20.0, price=0.80, fee=0.10, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+    )
+    engine.windows[slug] = window
+    engine._market_feed_connected = True
+    engine._market_feed_ever_connected = True
+    engine._market_books = {
+        "up-token": {"bids": {0.10: 100.0}, "asks": {0.11: 100.0},
+                     "recv_mono": time.monotonic()},
+    }
+    assert engine._risk_halted() is True
+    assert "Daily net loss limit reached" in engine._risk_halt_reason
+    engine.ledger.conn.close()
