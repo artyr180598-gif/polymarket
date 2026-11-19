@@ -605,7 +605,7 @@ def test_paper_reset_backs_up_then_clears_all_paper_history_and_positions(tmp_pa
     ledger.enqueue_telegram_notification("old trade", "old-trade-event")
     ledger.conn.execute(
         "INSERT INTO equity_points (ts, mode, equity, cash, realized_net_pnl, fees_paid) "
-        "VALUES (?, 'paper', 100, 90, 0, 0.1)", (time.time(),)
+        "VALUES (?, 'paper', 100, 90, 0, 0.1)", (1.0,)
     )
     ledger.conn.commit()
 
