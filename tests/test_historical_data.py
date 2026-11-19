@@ -171,7 +171,7 @@ def test_fit_parameters_requires_joint_train_improvement() -> None:
 
 
 
-def test_load_cached_calibration_report_does_not_require_raw_files(tmp_path) -> None:
+def test_load_cached_calibration_report_accepts_legacy_report_without_source(tmp_path) -> None:
     days = ["2026-10-14", "2026-10-15"]
     manifest = [
         {
@@ -189,7 +189,6 @@ def test_load_cached_calibration_report_does_not_require_raw_files(tmp_path) -> 
         )
     ]
     report = {
-        "source": "Poly Tick Tape",
         "calibration_version": 7,
         "range_utc": {"from": days[0], "to": days[-1]},
         "files": 4,
