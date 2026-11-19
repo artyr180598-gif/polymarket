@@ -452,6 +452,16 @@ class Ledger:
             """
             SELECT
                 COUNT(*) AS resolved_mkts,
+                COALESCE(SUM(CASE WHEN r.anchor_verified = 1 THEN 1 ELSE 0 END), 0) AS anchor_verified_mkts,
+                COALESCE(SUM(CASE WHEN COALESCE(r.anchor_verified, 0) != 1 THEN 1 ELSE 0 END), 0) AS anchor_unverified_mkts,
+                COALESCE(SUM(CASE
+                    WHEN r.anchor_verified = 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS anchor_verified_net_pnl,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(r.anchor_verified, 0) != 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS anchor_unverified_net_pnl,
                 COALESCE(SUM(CASE
                     WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) > 0.000001
                     THEN 1 ELSE 0 END), 0) AS win_mkts,
@@ -547,6 +557,15 @@ class Ledger:
             "total_fees": round(float(f_row["total_fees"]), 4),
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
+            # Keep settlement-anchor quality visible beside aggregate PnL.
+            # NULL means no independent RTDS-vs-Gamma verification was available.
+            "anchor_verified_markets": int(r_row["anchor_verified_mkts"]),
+            "anchor_unverified_markets": int(r_row["anchor_unverified_mkts"]),
+            "anchor_verified_rate_pct": round(
+                100.0 * r_row["anchor_verified_mkts"] / resolved_mkts, 1
+            ) if resolved_mkts else 0.0,
+            "anchor_verified_realized_net_pnl": round(float(r_row["anchor_verified_net_pnl"]), 2),
+            "anchor_unverified_realized_net_pnl": round(float(r_row["anchor_unverified_net_pnl"]), 2),
             "win_markets": int(r_row["win_mkts"]),
             "loss_markets": int(r_row["loss_mkts"]),
             "breakeven_markets": int(r_row["breakeven_mkts"]),
