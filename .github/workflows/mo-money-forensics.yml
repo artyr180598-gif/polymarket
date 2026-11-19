@@ -1,6 +1,9 @@
 name: mo-money wallet forensics
 
 on:
+  pull_request:
+    branches:
+      - fix/btc-only-rtds-telegram-backoff-final
   push:
     branches:
       - research/run-mo-money-forensics
