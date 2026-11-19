@@ -780,10 +780,9 @@ class Ledger:
 
         for row in fill_rows:
             target = bucket(row["timeframe"])
-            for key in (
-                "total_fills", "maker_fills", "taker_fills",
-                "maker_notional", "taker_notional", "total_notional", "fees",
-            ):
+            for key in ("total_fills", "maker_fills", "taker_fills"):
+                target[key] = int(row[key] or 0)
+            for key in ("maker_notional", "taker_notional", "total_notional", "fees"):
                 target[key] = float(row[key] or 0)
         for row in completed_rows:
             target = bucket(row["timeframe"])
