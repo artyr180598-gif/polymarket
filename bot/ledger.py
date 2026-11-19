@@ -581,6 +581,92 @@ class Ledger:
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
         }
 
+    def get_session_stats(self, mode: str, since_ts: float) -> Dict[str, Any]:
+        """Stats for markets opened entirely after the current PAPER strategy epoch.
+
+        Historical fills and inherited inventory remain in the accounting ledger,
+        but are excluded from this clean experiment view.
+        """
+        since_ts = max(0.0, float(since_ts))
+        if since_ts <= 0:
+            return {"enabled": False, "reason": "PAPER_STATS_SINCE_TS is not configured"}
+
+        fills = self.conn.execute(
+            """
+            SELECT COUNT(*) AS total_fills,
+                   COALESCE(SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN 1 ELSE 0 END), 0) AS maker_fills,
+                   COALESCE(SUM(notional), 0) AS notional,
+                   COALESCE(SUM(fee), 0) AS fees
+            FROM fills
+            WHERE mode = ? AND ts >= ?
+            """,
+            (mode, since_ts),
+        ).fetchone()
+
+        completed = self.conn.execute(
+            """
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            ),
+            fill_stats AS (
+                SELECT f.mode, f.slug, SUM(f.fee) AS fees,
+                       SUM(CASE WHEN lower(f.outcome) IN ('up','yes') THEN f.shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(f.outcome) IN ('down','no') THEN f.shares ELSE 0 END) AS down_shares
+                FROM fills f JOIN eligible e ON e.mode=f.mode AND e.slug=f.slug
+                GROUP BY f.mode, f.slug
+            ),
+            merge_stats AS (
+                SELECT m.mode, m.slug, SUM(m.pairs) AS pairs,
+                       SUM(m.locked_pnl) AS pnl, MAX(m.ts) AS last_ts
+                FROM merges m JOIN eligible e ON e.mode=m.mode AND e.slug=m.slug
+                GROUP BY m.mode, m.slug
+            ),
+            finished AS (
+                SELECT r.mode, r.slug, r.ts,
+                       r.gross_pnl + COALESCE(m.pnl,0) - COALESCE(f.fees,0) AS net_pnl
+                FROM resolutions r JOIN eligible e ON e.mode=r.mode AND e.slug=r.slug
+                LEFT JOIN merge_stats m ON m.mode=r.mode AND m.slug=r.slug
+                LEFT JOIN fill_stats f ON f.mode=r.mode AND f.slug=r.slug
+                UNION ALL
+                SELECT m.mode, m.slug, m.last_ts,
+                       m.pnl - COALESCE(f.fees,0) AS net_pnl
+                FROM merge_stats m JOIN fill_stats f ON f.mode=m.mode AND f.slug=m.slug
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM resolutions r WHERE r.mode=m.mode AND r.slug=m.slug
+                )
+                  AND ABS(f.up_shares-m.pairs) <= 0.0001
+                  AND ABS(f.down_shares-m.pairs) <= 0.0001
+            )
+            SELECT COUNT(*) AS completed,
+                   COALESCE(SUM(CASE WHEN net_pnl > 0.000001 THEN 1 ELSE 0 END),0) AS wins,
+                   COALESCE(SUM(CASE WHEN net_pnl < -0.000001 THEN 1 ELSE 0 END),0) AS losses,
+                   COALESCE(SUM(net_pnl),0) AS net_pnl
+            FROM finished WHERE mode = ?
+            """,
+            (mode, since_ts, mode),
+        ).fetchone()
+
+        total = int(fills["total_fills"] or 0)
+        maker = int(fills["maker_fills"] or 0)
+        return {
+            "enabled": True,
+            "since_ts": since_ts,
+            "total_fills": total,
+            "maker_fills": maker,
+            "maker_fill_pct": round(100.0 * maker / total, 1) if total else 0.0,
+            "notional": round(float(fills["notional"] or 0.0), 2),
+            "fees": round(float(fills["fees"] or 0.0), 4),
+            "completed_markets": int(completed["completed"] or 0),
+            "winning_markets": int(completed["wins"] or 0),
+            "losing_markets": int(completed["losses"] or 0),
+            "realized_net_pnl": round(float(completed["net_pnl"] or 0.0), 2),
+            "pnl_scope": "only markets whose first fill is at/after session start; open markets excluded",
+        }
+
     def open_positions(self, mode: str) -> List[Dict[str, Any]]:
         """Rebuild residual PAPER inventory from persisted fills, merges and resolutions."""
         rows = self.conn.execute(
