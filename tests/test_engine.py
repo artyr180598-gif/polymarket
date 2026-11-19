@@ -342,7 +342,7 @@ def test_resume_refuses_to_bypass_daily_loss_limit(tmp_path) -> None:
 
 
 
-def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(tmp_path) -> None:
+def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(monkeypatch, tmp_path) -> None:
     from bot.execution import PaperExecutor
 
     engine = TradingEngine(BotConfig(
@@ -351,6 +351,7 @@ def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(tmp_path) ->
         db_path=str(tmp_path / "delayed-anchor-mismatch.db"),
     ))
     engine.executor = PaperExecutor(100.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 100.0)
     slug = "btc-updown-5m-delayed-anchor"
     engine.ledger.record_resolution(
         mode="paper",
