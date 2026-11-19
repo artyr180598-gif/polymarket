@@ -1684,6 +1684,13 @@ class TradingEngine:
         except Exception:
             stats = {}
         try:
+            session_stats = self.ledger.get_session_stats(
+                self.cfg.trading_mode, self.cfg.paper_stats_since_ts
+            )
+        except Exception as exc:
+            log.error("Unable to calculate clean PAPER session stats: %s", exc)
+            session_stats = {"enabled": False, "reason": "session stats unavailable"}
+        try:
             portfolio = self.ledger.portfolio_state(self.cfg.trading_mode, self.cfg.bankroll_usd)
             inv = float(portfolio["inventory_cost"])
             equity = float(portfolio["equity"])
@@ -1743,6 +1750,7 @@ class TradingEngine:
             "fees_paid": round(self.fees_paid, 4),
             "total_exposure": round(inv, 2),
             "stats": stats,
+            "session_stats": session_stats,
             "windows": windows,
             "events": self.events[-40:],
             "fee_regime": fee_regime_label(),
