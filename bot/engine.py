@@ -93,6 +93,16 @@ def _select_closed_gamma_strike(event: dict[str, Any]) -> tuple[Optional[float],
     return None, ""
 
 
+def _paper_reset_marker_path(db_path: str, reset_id: str = "") -> str:
+    """Return a stable, filesystem-safe marker for one explicitly named PAPER reset."""
+    import re
+
+    key = re.sub(r"[^A-Za-z0-9._-]+", "-", str(reset_id or "").strip())[:64].strip(".-_")
+    if not key:
+        key = "v2"
+    return f"{db_path}.paper-reset-{key}.done"
+
+
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
@@ -174,8 +184,9 @@ class TradingEngine:
                 "merge confirmation are not implemented. Use paper mode only."
             )
         self.executor = PaperExecutor(self.cfg.bankroll_usd)
-        if self.cfg.paper_reset_once:
-            marker_path = f"{self.cfg.db_path}.paper-reset-v1.done"
+        reset_id = str(getattr(self.cfg, "paper_reset_id", "") or "").strip()
+        if self.cfg.paper_reset_once or reset_id:
+            marker_path = _paper_reset_marker_path(self.cfg.db_path, reset_id)
             if not os.path.exists(marker_path):
                 if self.cfg.trading_mode != "paper":
                     raise RuntimeError("PAPER ledger reset requested outside PAPER mode")
