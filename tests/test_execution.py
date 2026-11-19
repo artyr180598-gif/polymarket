@@ -214,6 +214,27 @@ def test_maker_fill_rejects_trade_printed_before_order_was_live(monkeypatch) -> 
     assert executor.positions == {}
 
 
+
+def test_maker_fill_requires_exchange_timestamp(monkeypatch) -> None:
+    executor = PaperExecutor(100.0)
+    executor._latency_sec = 0.0
+    monkeypatch.setattr("bot.execution.time.time", lambda: 100.0)
+    order_id = asyncio.run(executor.place_post_only_buy(
+        "token-up", 0.40, 10.0,
+        best_bid=0.39, best_ask=0.42,
+        bid_size_at_or_better=0.0,
+    ))
+    assert order_id is not None
+    fills = executor.on_book_and_tape(
+        "token-up", best_bid=0.40, best_ask=0.42,
+        last_trade_price=0.40, last_trade_size=10.0,
+        last_trade_side="SELL",
+    )
+    assert fills == []
+    assert executor.orders[order_id].status == "open"
+    assert executor.positions == {}
+
+
 def test_maker_fill_requires_print_at_exact_limit_price(monkeypatch) -> None:
     executor = PaperExecutor(100.0)
     executor._latency_sec = 0.0
