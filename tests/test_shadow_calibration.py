@@ -38,6 +38,9 @@ def test_engine_loads_only_accepted_non_boundary_horizons(tmp_path) -> None:
         240: {"sigma_multiplier": 0.6, "jump_weight": 0.58}
     }
     assert engine.params.min_maker_edge == original_edge
+
+    engine.set_shadow_calibration({**report, "calibration_version": 6})
+    assert engine._shadow_calibration == {}
     engine.ledger.conn.close()
 
 
