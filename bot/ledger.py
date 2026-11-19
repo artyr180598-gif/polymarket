@@ -410,7 +410,38 @@ class Ledger:
                 None if anchor_verified is None else int(anchor_verified),
             ),
         )
+        # Resolution may be recorded before Gamma publishes its closed-market
+        # metadata. A later audit updates only still-unverified resolutions.
+        self.conn.execute(
+            """
+            UPDATE resolutions
+            SET gamma_price_to_beat = ?, anchor_delta = ?, anchor_verified = ?
+            WHERE mode = ? AND slug = ? AND anchor_verified IS NULL
+            """,
+            (
+                gamma_price_to_beat, anchor_delta,
+                None if anchor_verified is None else int(anchor_verified),
+                mode, slug,
+            ),
+        )
         self.conn.commit()
+
+    def unverified_resolutions(self, mode: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return resolved RTDS-anchored markets still awaiting Gamma verification."""
+        rows = self.conn.execute(
+            """
+            SELECT slug, condition_id, price_to_beat, price_to_beat_source
+            FROM resolutions
+            WHERE mode = ?
+              AND anchor_verified IS NULL
+              AND price_to_beat IS NOT NULL
+              AND price_to_beat_source LIKE 'rtds.%'
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (mode, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_equity(
         self,
