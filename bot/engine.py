@@ -1159,15 +1159,26 @@ class TradingEngine:
             exposure += sum(max(0.0, float(order.price)) * max(0.0, float(order.remaining))
                             for order in self.executor.get_open_orders())
         return exposure
+    @staticmethod
+    def _bid_liquidation_value(book: Dict[str, Any], shares: float) -> float:
+        """Consume visible bid depth; any unfillable remainder is valued at zero."""
+        remaining = max(0.0, float(shares))
+        value = 0.0
+        bids = book.get("bids") or {}
+        levels = sorted(((float(p), float(q)) for p, q in bids.items() if float(q) > 0), reverse=True)
+        for price, depth in levels:
+            if remaining <= 1e-9:
+                break
+            taken = min(remaining, depth)
+            value += taken * price
+            remaining -= taken
+        return value
     def _mark_to_market_state(self) -> Dict[str, Any]:
         """Conservatively value open inventory using fresh CLOB bids."""
         positions = self.ledger.open_positions(self.cfg.trading_mode)
         if not positions:
             return {"complete": True, "market_value": 0.0, "unrealized_pnl": 0.0,
                     "unpaired_exposure_usd": 0.0, "reason": ""}
-        if not self._market_feed_connected:
-            return {"complete": False, "market_value": None, "unrealized_pnl": None,
-                    "unpaired_exposure_usd": None, "reason": "CLOB feed disconnected"}
         market_value = inventory_cost = open_fees = unpaired_exposure = 0.0
         now_mono = time.monotonic()
         for position in positions:
@@ -1191,12 +1202,12 @@ class TradingEngine:
                     return {"complete": False, "market_value": None, "unrealized_pnl": None,
                             "unpaired_exposure_usd": None,
                             "reason": f"missing or stale bid for {position['slug']}"}
-                bid, _ = self._book_best(book)
-                if not math.isfinite(bid) or bid <= 0.0 or bid >= 1.0:
+                bid_levels = book.get("bids") or {}
+                if any(not math.isfinite(float(price)) or float(price) <= 0.0 or float(price) >= 1.0 for price in bid_levels):
                     return {"complete": False, "market_value": None, "unrealized_pnl": None,
-                            "unpaired_exposure_usd": None,
-                            "reason": f"invalid best bid for {position['slug']}"}
-                position_value += residual * bid
+                            "unpaired_exposure_usd": None, "reason": "invalid bid ladder"}
+                # Use executable visible depth rather than multiplying the whole size by top bid.
+                position_value += self._bid_liquidation_value(book, residual)
             market_value += position_value
             inventory_cost += up_cost + down_cost
             open_fees += up_fees + down_fees
