@@ -620,3 +620,46 @@ def test_new_telegram_events_do_not_bypass_active_retry_after():
 
     assert session.calls == 1
     assert controller._pending_notifications == ["first trade event", "second trade event"]
+
+def test_telegram_event_wakeups_do_not_extend_absolute_retry_deadline():
+    async def scenario():
+        engine = SimpleNamespace(
+            cfg=SimpleNamespace(
+                telegram_bot_token="test-token",
+                telegram_chat_id="123",
+            )
+        )
+        controller = TelegramController(engine)
+        controller._running = True
+        controller._session = object()
+        controller._pending_notifications = ["queued trade"]
+        controller._pending_notification_ids = [None]
+        controller._pending_notification_keys = [None]
+        attempts = []
+
+        async def flaky_send(message, keyboard=None):
+            attempts.append(time.monotonic())
+            if len(attempts) == 1:
+                controller._notification_retry_interval = 0.12
+                controller._notification_retry_at = time.monotonic() + 0.12
+                return False
+            return True
+
+        controller.send = flaky_send
+        worker = asyncio.create_task(controller._notification_delivery_loop())
+        try:
+            # Repeated unrelated events wake the worker during the backoff.
+            # They must not push the original retry deadline into the future.
+            for _ in range(12):
+                await asyncio.sleep(0.015)
+                controller._notification_wakeup.set()
+            await asyncio.sleep(0.04)
+        finally:
+            controller._running = False
+            controller._notification_wakeup.set()
+            await asyncio.wait_for(worker, timeout=0.5)
+
+        assert len(attempts) >= 2
+        assert controller._pending_notifications == []
+
+    asyncio.run(scenario())
