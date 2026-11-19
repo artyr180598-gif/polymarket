@@ -549,7 +549,7 @@ class TelegramController:
             f"· MERGE gross: <b>${merge_pnl:+.2f}</b>\n"
             f"· Разрешённые рынки gross: <b>${res_pnl:+.2f}</b>\n"
             f"· Все комиссии: <b>−${float(stats.get('total_fees', fees) or 0):.2f}</b>\n"
-            f"· Формула: MERGE gross + resolved gross − все комиссии = Lifetime net\n"
+            f"· Проверка: MERGE gross + resolved gross − комиссии = Lifetime net\n"
             f"· Equity − старт: ${pnl:+.2f}; открытые позиции пока по себестоимости, не mark-to-market.\n"
             f"· Это PAPER симуляция, не фактический PnL аккаунта Polymarket.\n\n"
             f"<b>Общее исполнение</b>\n"
