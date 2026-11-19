@@ -658,6 +658,80 @@ def test_profitable_pair_completion_remains_available_when_directional_taker_is_
     engine.ledger.conn.close()
 
 
+def test_clean_session_stats_exclude_pre_session_markets(tmp_path) -> None:
+    from bot.ledger import Ledger
+
+    ledger = Ledger(str(tmp_path / "session-stats.db"))
+    start = 2_000_000_000.0
+    common = {
+        "mode": "paper",
+        "condition_id": "0x" + "9" * 64,
+        "asset": "BTC",
+        "timeframe": "5m",
+        "reason": "test",
+        "price": 0.40,
+        "fee": 0.0,
+        "fair_prob": 0.60,
+    }
+    ledger.record_fill(
+        slug="btc-updown-5m-old",
+        outcome="Up",
+        role="MAKER",
+        shares=5.0,
+        ts=start - 10,
+        **common,
+    )
+    ledger.record_resolution(
+        mode="paper",
+        slug="btc-updown-5m-old",
+        condition_id=common["condition_id"],
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100_000.0,
+        final_price=100_001.0,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+    ledger.record_fill(
+        slug="btc-updown-5m-new",
+        outcome="Up",
+        role="MAKER",
+        shares=5.0,
+        ts=start + 10,
+        **{**common, "condition_id": "0x" + "a" * 64},
+    )
+    ledger.record_resolution(
+        mode="paper",
+        slug="btc-updown-5m-new",
+        condition_id="0x" + "a" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100_000.0,
+        final_price=100_001.0,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+
+    stats = ledger.get_session_stats("paper", start)
+    assert stats["enabled"] is True
+    assert stats["total_fills"] == 1
+    assert stats["maker_fills"] == 1
+    assert stats["maker_fill_pct"] == 100.0
+    assert stats["completed_markets"] == 1
+    assert stats["realized_net_pnl"] == 3.0
+    ledger.conn.close()
+
+
 def test_config_defaults_to_btc_only(monkeypatch) -> None:
     from bot.config import BotConfig
 
