@@ -17,7 +17,7 @@ class StrategyParams:
     title_ru: str
     description_ru: str
 
-    # Engine 1: @mo-money Post-Only Maker + Synthetic BUY-Opposite TP/SL + MERGE
+    # Engine 1: @mo-money-style Post-Only Maker + profitable opposite-side completion + MERGE
     enable_maker: bool = False
     min_maker_edge: float = 0.025
     maker_min_size: float = 5.0
@@ -64,8 +64,9 @@ PRESETS: Dict[str, StrategyParams] = {
             "Maker-заявки парные: суммарная цена пары ограничена, а незакрытый перекос ограничен 5 акциями; "
             "частичные исполнения учитываются по live CLOB tape и видимой очереди L2. "
             "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются. "
-            "Направленный fair-value Maker/Taker вход отключён; остаются парные Maker-котировки, "
-            "выгодное парное завершение и MERGE. Прибыльность не доказана."
+            "Новые пары открываются Maker-котировками; Taker разрешён только для выгодного "
+            "завершения уже существующего перекоса Up/Down. Направленный Taker и Lock-In отключены. "
+            "Прибыльность не доказана."
         ),
         enable_maker=True,
         enable_lockin=False,
