@@ -1302,7 +1302,8 @@ class TradingEngine:
                 self._log_event(
                     "INFO",
                     f"📌 PAPER post-only {window.asset} {outcome}: "
-                    f"{size:.2f} шт. по ${quote_price:.4f}; очередь впереди {queue_ahead:.2f}",
+                    f"{size:.2f} шт. по ${quote_price:.4f}; очередь впереди {queue_ahead:.2f}; "
+                    f"slug={window.slug}",
                     notify=False,
                 )
 
