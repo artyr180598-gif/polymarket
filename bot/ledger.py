@@ -536,9 +536,14 @@ class Ledger:
         return {
             "total_fills": total_fills,
             "maker_fills": int(f_row["maker_fills"]),
+            "taker_fills": max(0, total_fills - int(f_row["maker_fills"])),
             "maker_fill_pct": round(100.0 * f_row["maker_fills"] / total_fills, 1) if total_fills else 0.0,
+            "taker_fill_pct": round(100.0 * (total_fills - f_row["maker_fills"]) / total_fills, 1) if total_fills else 0.0,
             "total_notional": round(total_notional, 2),
+            "maker_notional": round(float(f_row["maker_notional"]), 2),
+            "taker_notional": round(max(0.0, total_notional - float(f_row["maker_notional"])), 2),
             "maker_usdc_pct": round(100.0 * f_row["maker_notional"] / total_notional, 1) if total_notional else 0.0,
+            "taker_usdc_pct": round(100.0 * (total_notional - f_row["maker_notional"]) / total_notional, 1) if total_notional else 0.0,
             "total_fees": round(float(f_row["total_fees"]), 4),
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
@@ -666,6 +671,168 @@ class Ledger:
             "realized_net_pnl": round(float(completed["net_pnl"] or 0.0), 2),
             "pnl_scope": "only markets whose first fill is at/after session start; open markets excluded",
         }
+
+    def get_timeframe_stats(self, mode: str) -> List[Dict[str, Any]]:
+        """Return fee-adjusted PAPER performance, execution mix and residual inventory by timeframe.
+
+        Completed-market PnL excludes partial MERGEs until the residual inventory is
+        resolved or fully merged. Fill legs are counted separately from markets.
+        """
+        fill_rows = self.conn.execute(
+            """
+            SELECT timeframe,
+                   COUNT(*) AS total_fills,
+                   SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN 1 ELSE 0 END) AS maker_fills,
+                   SUM(CASE WHEN upper(role) NOT LIKE 'MAKER%' THEN 1 ELSE 0 END) AS taker_fills,
+                   SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN notional ELSE 0 END) AS maker_notional,
+                   SUM(CASE WHEN upper(role) NOT LIKE 'MAKER%' THEN notional ELSE 0 END) AS taker_notional,
+                   SUM(notional) AS total_notional,
+                   SUM(fee) AS fees
+            FROM fills
+            WHERE mode = ?
+            GROUP BY timeframe
+            """,
+            (mode,),
+        ).fetchall()
+
+        completed_rows = self.conn.execute(
+            """
+            WITH merge_stats AS (
+                SELECT mode, slug, SUM(pairs) AS merged_pairs,
+                       SUM(locked_pnl) AS merge_pnl
+                FROM merges
+                GROUP BY mode, slug
+            ),
+            fill_stats AS (
+                SELECT mode, slug, MAX(timeframe) AS timeframe,
+                       SUM(fee) AS fees,
+                       SUM(CASE WHEN lower(outcome) IN ('up', 'yes') THEN shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(outcome) IN ('down', 'no') THEN shares ELSE 0 END) AS down_shares
+                FROM fills
+                GROUP BY mode, slug
+            ),
+            completed AS (
+                SELECT r.timeframe, r.slug,
+                       r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS net_pnl
+                FROM resolutions r
+                LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
+                LEFT JOIN fill_stats f ON f.mode = r.mode AND f.slug = r.slug
+                WHERE r.mode = ?
+                UNION ALL
+                SELECT f.timeframe, m.slug,
+                       m.merge_pnl - COALESCE(f.fees, 0) AS net_pnl
+                FROM merge_stats m
+                JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
+                WHERE m.mode = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolutions r
+                      WHERE r.mode = m.mode AND r.slug = m.slug
+                  )
+                  AND ABS(f.up_shares - m.merged_pairs) <= 0.0001
+                  AND ABS(f.down_shares - m.merged_pairs) <= 0.0001
+            )
+            SELECT timeframe, COUNT(*) AS completed_markets,
+                   SUM(CASE WHEN net_pnl > 0.000001 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN net_pnl < -0.000001 THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN ABS(net_pnl) <= 0.000001 THEN 1 ELSE 0 END) AS breakeven,
+                   SUM(net_pnl) AS realized_net_pnl
+            FROM completed
+            GROUP BY timeframe
+            """,
+            (mode, mode),
+        ).fetchall()
+
+        merge_rows = self.conn.execute(
+            """
+            SELECT f.timeframe, COUNT(*) AS merge_count,
+                   SUM(m.pairs) AS merged_pairs,
+                   SUM(m.locked_pnl) AS merge_gross_pnl
+            FROM merges m
+            JOIN (
+                SELECT mode, slug, MAX(timeframe) AS timeframe
+                FROM fills
+                GROUP BY mode, slug
+            ) f ON f.mode = m.mode AND f.slug = m.slug
+            WHERE m.mode = ?
+            GROUP BY f.timeframe
+            """,
+            (mode,),
+        ).fetchall()
+
+        by_timeframe: Dict[str, Dict[str, Any]] = {}
+
+        def bucket(timeframe: Any) -> Dict[str, Any]:
+            key = str(timeframe or "unknown")
+            if key not in by_timeframe:
+                by_timeframe[key] = {
+                    "timeframe": key,
+                    "total_fills": 0, "maker_fills": 0, "taker_fills": 0,
+                    "maker_notional": 0.0, "taker_notional": 0.0,
+                    "total_notional": 0.0, "fees": 0.0,
+                    "merge_count": 0, "merged_pairs": 0.0, "merge_gross_pnl": 0.0,
+                    "completed_markets": 0, "wins": 0, "losses": 0,
+                    "breakeven": 0, "realized_net_pnl": 0.0,
+                    "open_markets": 0, "open_up_shares": 0.0,
+                    "open_down_shares": 0.0, "open_inventory_cost": 0.0,
+                    "open_fees": 0.0,
+                }
+            return by_timeframe[key]
+
+        for row in fill_rows:
+            target = bucket(row["timeframe"])
+            for key in (
+                "total_fills", "maker_fills", "taker_fills",
+                "maker_notional", "taker_notional", "total_notional", "fees",
+            ):
+                target[key] = float(row[key] or 0)
+        for row in completed_rows:
+            target = bucket(row["timeframe"])
+            for key in ("completed_markets", "wins", "losses", "breakeven"):
+                target[key] = int(row[key] or 0)
+            target["realized_net_pnl"] = float(row["realized_net_pnl"] or 0)
+        for row in merge_rows:
+            target = bucket(row["timeframe"])
+            target["merge_count"] = int(row["merge_count"] or 0)
+            target["merged_pairs"] = float(row["merged_pairs"] or 0)
+            target["merge_gross_pnl"] = float(row["merge_gross_pnl"] or 0)
+
+        for position in self.open_positions(mode):
+            target = bucket(position["timeframe"])
+            target["open_markets"] += 1
+            target["open_up_shares"] += float(position["up_shares"] or 0)
+            target["open_down_shares"] += float(position["down_shares"] or 0)
+            target["open_inventory_cost"] += (
+                float(position["up_cost"] or 0) + float(position["down_cost"] or 0)
+            )
+            target["open_fees"] += (
+                float(position["up_fees"] or 0) + float(position["down_fees"] or 0)
+            )
+
+        result = []
+        for target in by_timeframe.values():
+            total_fills = int(target["total_fills"])
+            total_notional = float(target["total_notional"])
+            target["maker_fill_pct"] = round(
+                100.0 * int(target["maker_fills"]) / total_fills, 1
+            ) if total_fills else 0.0
+            target["maker_notional_pct"] = round(
+                100.0 * float(target["maker_notional"]) / total_notional, 1
+            ) if total_notional else 0.0
+            target["win_rate_pct"] = round(
+                100.0 * int(target["wins"]) / int(target["completed_markets"]), 1
+            ) if target["completed_markets"] else 0.0
+            for key in (
+                "maker_notional", "taker_notional", "total_notional", "fees",
+                "merged_pairs", "merge_gross_pnl", "realized_net_pnl",
+                "open_up_shares", "open_down_shares", "open_inventory_cost", "open_fees",
+            ):
+                target[key] = round(float(target[key]), 4 if key in ("fees", "open_fees") else 2)
+            result.append(target)
+
+        return sorted(
+            result,
+            key=lambda item: ({"5m": 0, "15m": 1}.get(item["timeframe"], 2), item["timeframe"]),
+        )
 
     def open_positions(self, mode: str) -> List[Dict[str, Any]]:
         """Rebuild residual PAPER inventory from persisted fills, merges and resolutions."""
