@@ -628,3 +628,64 @@ def test_paper_reset_backs_up_then_clears_all_paper_history_and_positions(tmp_pa
     backup.close()
     ledger.conn.close()
 
+
+
+def test_timeframe_stats_separate_completed_markets_from_partial_merges_and_open_inventory(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "timeframe-stats.db"))
+
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-5m-closed", condition_id="0x" + "1" * 64,
+        asset="BTC", timeframe="5m", outcome="Up", role="MAKER_CLOB",
+        reason="maker_test", shares=10, price=0.40, fee=0.10, fair_prob=0.5,
+    )
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-5m-closed", condition_id="0x" + "1" * 64,
+        asset="BTC", timeframe="5m", outcome="Down", role="TAKER_CLOB",
+        reason="taker_test", shares=10, price=0.50, fee=0.10, fair_prob=0.5,
+    )
+    ledger.record_merge(
+        mode="paper", slug="btc-updown-5m-closed", condition_id="0x" + "1" * 64,
+        pairs=10, cost_basis=9.0, locked_pnl=1.0, tx_hash="full-merge",
+    )
+
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-15m-partial", condition_id="0x" + "2" * 64,
+        asset="BTC", timeframe="15m", outcome="Up", role="TAKER_CLOB",
+        reason="taker_test", shares=4, price=0.60, fee=0.05, fair_prob=0.6,
+    )
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-15m-partial", condition_id="0x" + "2" * 64,
+        asset="BTC", timeframe="15m", outcome="Down", role="TAKER_CLOB",
+        reason="taker_test", shares=2, price=0.30, fee=0.03, fair_prob=0.4,
+    )
+    ledger.record_merge(
+        mode="paper", slug="btc-updown-15m-partial", condition_id="0x" + "2" * 64,
+        pairs=2, cost_basis=1.8, locked_pnl=0.2, tx_hash="partial-merge",
+    )
+
+    rows = {row["timeframe"]: row for row in ledger.get_timeframe_stats("paper")}
+    five = rows["5m"]
+    fifteen = rows["15m"]
+
+    assert five["total_fills"] == 2
+    assert five["maker_fills"] == 1
+    assert five["taker_fills"] == 1
+    assert five["maker_fill_pct"] == 50.0
+    assert five["merge_count"] == 1
+    assert five["completed_markets"] == 1
+    assert five["wins"] == 1
+    assert five["realized_net_pnl"] == 0.8
+    assert five["open_markets"] == 0
+
+    assert fifteen["total_fills"] == 2
+    assert fifteen["maker_fills"] == 0
+    assert fifteen["taker_fills"] == 2
+    assert fifteen["fees"] == 0.08
+    assert fifteen["merge_count"] == 1
+    assert fifteen["completed_markets"] == 0
+    assert fifteen["open_markets"] == 1
+    assert fifteen["open_up_shares"] == 2.0
+    assert fifteen["open_down_shares"] == 0.0
+    assert fifteen["open_inventory_cost"] == 1.2
+    assert fifteen["open_fees"] == 0.025
+    ledger.conn.close()

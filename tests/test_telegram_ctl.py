@@ -666,3 +666,80 @@ def test_telegram_event_wakeups_do_not_extend_absolute_retry_deadline():
         assert controller._pending_notifications == []
 
     asyncio.run(scenario())
+
+
+def test_telegram_pnl_shows_maker_taker_and_timeframe_breakdown():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            bankroll_usd=2750.0,
+            strategy_preset="mo_money",
+            trading_mode="paper",
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        params=SimpleNamespace(title_ru="Mo Money"),
+        snapshot=lambda: {
+            "equity": 2751.0,
+            "cash": 2700.0,
+            "fees_paid": 0.25,
+            "stats": {
+                "today_total_net_pnl": 0.4,
+                "realized_gross_pnl": 0.5,
+                "merged_locked_pnl": 0.2,
+                "lifetime_total_net_pnl": 0.45,
+                "total_fees": 0.25,
+                "total_fills": 4,
+                "maker_fills": 2,
+                "taker_fills": 2,
+                "maker_fill_pct": 50.0,
+                "taker_fill_pct": 50.0,
+                "maker_usdc_pct": 60.0,
+                "taker_usdc_pct": 40.0,
+                "merge_count": 2,
+                "resolved_markets": 1,
+                "completed_markets": 2,
+                "completed_win_markets": 1,
+                "completed_loss_markets": 1,
+                "completed_breakeven_markets": 0,
+                "completed_win_rate_pct": 50.0,
+            },
+        },
+        ledger=SimpleNamespace(
+            pending_telegram_notifications=lambda limit=5000: [],
+            get_timeframe_stats=lambda mode: [
+                {
+                    "timeframe": "5m", "total_fills": 2, "maker_fills": 1,
+                    "taker_fills": 1, "maker_fill_pct": 50.0,
+                    "maker_notional": 12.0, "taker_notional": 8.0, "fees": 0.10,
+                    "completed_markets": 1, "wins": 1, "losses": 0,
+                    "breakeven": 0, "win_rate_pct": 100.0,
+                    "realized_net_pnl": 0.30, "merge_count": 1,
+                    "merged_pairs": 5.0, "merge_gross_pnl": 0.40,
+                    "open_markets": 0, "open_inventory_cost": 0.0,
+                    "open_fees": 0.0,
+                },
+                {
+                    "timeframe": "15m", "total_fills": 2, "maker_fills": 1,
+                    "taker_fills": 1, "maker_fill_pct": 50.0,
+                    "maker_notional": 18.0, "taker_notional": 12.0, "fees": 0.15,
+                    "completed_markets": 1, "wins": 0, "losses": 1,
+                    "breakeven": 0, "win_rate_pct": 0.0,
+                    "realized_net_pnl": -0.10, "merge_count": 1,
+                    "merged_pairs": 2.0, "merge_gross_pnl": 0.10,
+                    "open_markets": 1, "open_inventory_cost": 4.50,
+                    "open_fees": 0.05,
+                },
+            ],
+        ),
+    )
+    controller = TelegramController(engine)
+    message = controller._fmt_pnl()
+
+    assert "Maker 2 (50.0%)" in message
+    assert "Taker 2 (50.0%)" in message
+    assert "Доли объёма: Maker 60.0% / Taker 40.0%" in message
+    assert "<b>5m</b>" in message
+    assert "<b>15m</b>" in message
+    assert "net $+0.30" in message
+    assert "net $-0.10" in message
+    assert "инвентарь $4.50" in message
