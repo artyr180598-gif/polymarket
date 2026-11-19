@@ -24,6 +24,8 @@ class StrategyParams:
     maker_min_price: float = 0.03
     maker_max_price: float = 0.95
     maker_start_sec: float = 6.0
+    # Minimum resting age before repricing a still-valid Maker order.
+    maker_min_requote_sec: float = 10.0
     # Maker entries are pair-first; unmatched inventory is deliberately small.
     maker_pair_max_cost: float = 0.985
     maker_max_unpaired_shares: float = 5.0
