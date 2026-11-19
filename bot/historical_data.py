@@ -339,6 +339,40 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                 "at_search_boundary": best_logloss[1] in (0.25, 2.5) or best_logloss[2] in (0.0, 0.5),
             },
         }
+    rolling_30s_folds: list[dict[str, Any]] = []
+    samples_30s = samples_by_horizon[30]
+    for train_end, test_end in ((7, 14), (14, 21), (21, 31)):
+        fold_train = set(range(train_end))
+        fold_test = set(range(train_end, test_end))
+        default_holdout = _scores(samples_30s, fold_test, 1.0, 0.12)
+        fold: dict[str, Any] = {
+            "train_days": train_end,
+            "train_range": {"from": days[0], "to": days[train_end - 1]},
+            "holdout_range": {"from": days[train_end], "to": days[test_end - 1]},
+            "default_holdout": default_holdout,
+        }
+        for objective in ("brier", "logloss"):
+            best_value = float("inf")
+            best_sigma = 0.5
+            best_jump = 0.3
+            for sigma_step in range(3, 13):
+                sigma_mult = sigma_step / 10.0  # coarse 0.3 .. 1.2
+                for jump_step in range(0, 11):
+                    jump_weight = jump_step * 0.05
+                    score = _scores(samples_30s, fold_train, sigma_mult, jump_weight)
+                    value = float(score[objective])
+                    if score["n"] and value < best_value:
+                        best_value, best_sigma, best_jump = value, sigma_mult, jump_weight
+            fold[f"fit_{objective}"] = {
+                "sigma_multiplier": best_sigma,
+                "jump_weight": best_jump,
+                "train_score": round(best_value, 6),
+                "holdout": _scores(samples_30s, fold_test, best_sigma, best_jump),
+                "at_search_boundary": (
+                    best_sigma in (0.3, 1.2) or best_jump in (0.0, 0.5)
+                ),
+            }
+        rolling_30s_folds.append(fold)
     return {
         "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 60s, 30s, 15s",
         "valid_settlement_rounds": valid_rounds,
@@ -351,8 +385,9 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
                     "calibrated_model": calibrated_test, "zero_jump_baseline": baseline_test,
                     "constant_50_baseline": constant_test},
         "by_horizon": horizon_reports,
+        "rolling_30s_folds": rolling_30s_folds,
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
-        "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate. Do not apply parameters if Brier and log-loss disagree or the optimum hits a grid boundary."
+        "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate. Do not apply parameters if Brier and log-loss disagree, rolling folds are inconsistent, or the optimum hits a grid boundary."
     }
 
 
