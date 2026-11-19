@@ -394,216 +394,106 @@ class TelegramController:
                 pass
 
     def _fmt_status(self) -> str:
+        """Short operator-facing status; verbose diagnostics stay in Railway logs."""
         st = self.engine.snapshot()
-        stats = st.get("stats") or {}
-        risk_halt = bool(st.get("risk_halt_active"))
-        risk_halt_reason = str(st.get("risk_halt_reason") or "")
+        stats = st.get("session_stats") or st.get("stats") or {}
         mode = (st.get("mode") or "paper").upper()
-        running = st.get("running")
-        paused = st.get("paused")
+        paused = bool(st.get("paused"))
+        running = bool(st.get("running"))
+        risk_halt = bool(st.get("risk_halt_active"))
         oracle_ready = bool(st.get("streams_ok"))
         clob_age = st.get("clob_last_event_age_sec")
-        clob_ready = bool(st.get("clob_feed_connected")) and clob_age is not None and float(clob_age) <= 5.0
+        clob_ready = (
+            bool(st.get("clob_feed_connected"))
+            and clob_age is not None
+            and float(clob_age) <= 5.0
+        )
         strike_ready = any(
             w.get("price_to_beat") is not None
             for w in (st.get("windows") or [])
             if not w.get("resolved")
         )
-        market_data_ready = oracle_ready and clob_ready and strike_ready
         model_ready = bool(st.get("model_ready"))
-        state_emoji = (
-            "⏸" if paused else
-            "🟢" if running and market_data_ready and model_ready else
-            "🟠" if running else "⏹"
-        )
-        state_txt = (
-            "пауза" if paused
-            else "PAPER готов к сигналам" if running and market_data_ready and model_ready
-            else "накапливает волатильность" if running and market_data_ready
-            else "ожидает Chainlink TWAP60 на границе окна" if running and oracle_ready and clob_ready and not strike_ready
-            else "ожидает CLOB WebSocket" if running and oracle_ready and not clob_ready
-            else "ожидает Chainlink RTDS" if running
-            else "остановлен"
-        )
-        equity = st.get("equity", 0) or 0
-        cash = st.get("cash", 0) or 0
-        day = stats.get("today_total_net_pnl", 0)
-        day_s = f"+${day:.2f}" if day >= 0 else f"-${abs(day):.2f}"
-        fees = float(st.get("fees_paid", 0) or 0)
-        session = st.get("session_stats") or {}
-        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
-        lines = [
-            f"{state_emoji} <b>PolyBot — {state_txt}</b>",
-            "━━━━━━━━━━━━━━━━",
-            f"Стратегия: <b>{preset_title}</b>",
-            f"Режим: <b>{mode}</b>",
-            "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
-            f"Chainlink RTDS: <b>{'OK' if oracle_ready else 'нет свежих данных'}</b>",
-            *[
-                f"RTDS {asset}: spot rx {data['spot']['receive_age_sec']}s / src {data['spot']['source_age_sec']}s · "
-                f"TWAP60 rx {data['twap60']['receive_age_sec']}s / src {data['twap60']['source_age_sec']}s · "
-                f"TWAP gap max {data['twap60']['max_gap_sec']}s"
-                for asset, data in (st.get("oracle_diagnostics") or {}).items()
-            ],
-            f"Chainlink TWAP60 anchor: <b>{'OK' if strike_ready else 'ожидание'}</b>",
-            f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
-            f"Защита риска: <b>{'HOLD' if risk_halt else 'OK'}</b>",
-            f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
-            f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв ${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
-            f"Доступно: <b>${float(st.get('available_cash', cash) or 0):.2f}</b>",
-            f"",
-            f"💵 Equity: <b>${equity:,.2f}</b>",
-            f"💸 Cash: ${cash:,.2f}",
-            f"📈 Сегодня: <b>{day_s}</b>",
-            f"Комиссии всего: −${fees:.2f}",
-            "Maker-rebates в PAPER PnL пока не моделируются.",
+        ready = running and not paused and not risk_halt and oracle_ready and clob_ready and strike_ready and model_ready
+        if risk_halt:
+            state = "🛑 защитная остановка"
+        elif paused:
+            state = "⏸ пауза"
+        elif ready:
+            state = "🟢 работает"
+        elif running:
+            state = "🟠 ждёт данные"
+        else:
+            state = "⏹ остановлен"
+
+        bank = float(self.engine.cfg.bankroll_usd)
+        equity = float(st.get("equity", bank) or bank)
+        cash = float(st.get("cash", bank) or 0)
+        pnl = equity - bank
+        today = float((st.get("stats") or {}).get("today_total_net_pnl", 0) or 0)
+        fills = int(stats.get("total_fills", 0) or 0)
+        maker_pct = float(stats.get("maker_fill_pct", 0) or 0)
+        positions = [
+            w for w in (st.get("windows") or [])
+            if not w.get("resolved") and (
+                float(w.get("up_shares", 0) or 0) > 0
+                or float(w.get("down_shares", 0) or 0) > 0
+            )
         ]
-        if session.get("enabled"):
-            session_pnl = float(session.get("realized_net_pnl", 0) or 0)
-            session_pnl_s = f"+${session_pnl:.2f}" if session_pnl >= 0 else f"-${abs(session_pnl):.2f}"
-            lines.extend([
-                "",
-                "🧪 <b>НОВАЯ СТРАТЕГИЯ · с отдельного старта</b>",
-                f"Исполнения: {int(session.get('total_fills', 0))} · Maker: {float(session.get('maker_fill_pct', 0)):.1f}%",
-                f"Завершено окон: {int(session.get('completed_markets', 0))} · Net PnL: <b>{session_pnl_s}</b>",
-            ])
-        if risk_halt_reason:
-            lines.append(f"⚠️ Причина блокировки: {risk_halt_reason}")
-        windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
-        if windows:
-            lines.append(f"\n⏱ Окон: <b>{len(windows)}</b>")
-            for w in windows[:5]:
-                tau = w.get("remain_sec", 0) or 0
-                fair = w.get("fair_up")
-                fair_s = f"{fair * 100:.0f}¢" if fair is not None else "—"
-                lines.append(
-                    f"· <code>{(w.get('slug') or '')[:28]}</code> τ{tau:.0f}s fair {fair_s}"
-                )
-        return "\n".join(lines)
+        orders = int(st.get("maker_orders_open", 0) or 0)
+        risk_text = "HOLD" if risk_halt else "OK"
+        return (
+            f"{state} <b>PolyBot · {mode}</b>\\n"
+            f"Баланс: <b>${equity:,.2f}</b> · свободно ${cash:,.2f}\\n"
+            f"Результат: <b>{pnl:+.2f} $</b> · сегодня {today:+.2f} $\\n"
+            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.0f}%\\n"
+            f"Позиции: <b>{len(positions)}</b> · активные заявки {orders}\\n"
+            f"Данные: Chainlink {'OK' if oracle_ready else 'ожидание'} · "
+            f"CLOB {'OK' if clob_ready else 'ожидание'} · "
+            f"TWAP60 {'OK' if strike_ready else 'ожидание'}\\n"
+            f"Риск-защита: <b>{risk_text}</b>"
+            + (f"\\n⚠️ {st.get('risk_halt_reason')}" if risk_halt and st.get("risk_halt_reason") else "")
+        )
 
     def _fmt_pnl(self) -> str:
+        """Compact PAPER performance summary for the user."""
         st = self.engine.snapshot()
         stats = st.get("stats") or {}
-        equity = float(st.get("equity", 0) or 0)
-        cash = float(st.get("cash", 0) or 0)
+        session = st.get("session_stats") or {}
         bank = float(self.engine.cfg.bankroll_usd)
-        fees = float(st.get("fees_paid", 0) or getattr(self.engine, "fees_paid", 0) or 0)
-        pnl = equity - bank
-        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
-        day = float(stats.get("today_total_net_pnl", 0) or 0)
-        res_pnl = float(stats.get("realized_gross_pnl", 0) or 0)
-        merge_pnl = float(stats.get("merged_locked_pnl", 0) or 0)
-        lifetime_pnl = float(stats.get("lifetime_total_net_pnl", 0) or 0)
+        equity = float(st.get("equity", bank) or bank)
+        cash = float(st.get("cash", bank) or 0)
+        net = float(stats.get("lifetime_total_net_pnl", equity - bank) or 0)
+        today = float(stats.get("today_total_net_pnl", 0) or 0)
+        fills = int(stats.get("total_fills", 0) or 0)
+        maker_pct = float(stats.get("maker_fill_pct", 0) or 0)
         wins = int(stats.get("completed_win_markets", stats.get("win_markets", 0)) or 0)
         losses = int(stats.get("completed_loss_markets", stats.get("loss_markets", 0)) or 0)
-        breakeven = int(stats.get("completed_breakeven_markets", stats.get("breakeven_markets", 0)) or 0)
-        resolved = int(stats.get("resolved_markets", 0) or 0)
-        completed = int(stats.get("completed_markets", resolved) or 0)
-        completed_win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
-        anchor_verified = int(stats.get("anchor_verified_markets", 0) or 0)
-        anchor_unverified = int(stats.get("anchor_unverified_markets", 0) or 0)
-        anchor_verified_rate = float(stats.get("anchor_verified_rate_pct", 0) or 0)
-        anchor_verified_pnl = float(stats.get("anchor_verified_realized_net_pnl", 0) or 0)
-        anchor_unverified_pnl = float(stats.get("anchor_unverified_realized_net_pnl", 0) or 0)
-        n_fills = int(stats.get("total_fills", 0) or 0)
-        maker_fills = int(stats.get("maker_fills", 0) or 0)
-        taker_fills = int(stats.get("taker_fills", max(0, n_fills - maker_fills)) or 0)
-        maker_fill_pct = float(stats.get("maker_fill_pct", 0) or 0)
-        taker_fill_pct = float(stats.get("taker_fill_pct", max(0, 100.0 - maker_fill_pct) if n_fills else 0) or 0)
-        maker_notional_pct = float(stats.get("maker_usdc_pct", 0) or 0)
-        taker_notional_pct = float(stats.get("taker_usdc_pct", max(0, 100.0 - maker_notional_pct) if stats.get("total_notional") else 0) or 0)
-        n_merge = int(stats.get("merge_count", 0) or 0)
-
-        session = st.get("session_stats") or {}
+        done = int(stats.get("completed_markets", wins + losses) or 0)
+        win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
+        merges = int(stats.get("merge_count", 0) or 0)
+        open_markets = int(stats.get("open_markets", 0) or 0)
+        fees = float(stats.get("total_fees", st.get("fees_paid", 0)) or 0)
         if session.get("enabled"):
-            session_fills = int(session.get("total_fills", 0) or 0)
-            session_maker = int(session.get("maker_fills", 0) or 0)
-            session_maker_pct = float(session.get("maker_fill_pct", 0) or 0)
-            session_block = (
-                f"· Fill-ног: {session_fills} · Maker {session_maker} ({session_maker_pct:.1f}%) · "
-                f"Taker {max(0, session_fills-session_maker)} ({max(0.0, 100.0-session_maker_pct) if session_fills else 0.0:.1f}%)\n"
-                f"· Объём: ${float(session.get('notional', 0) or 0):.2f} · "
-                f"комиссии −${float(session.get('fees', 0) or 0):.2f}\n"
-                f"· Завершено рынков: {int(session.get('completed_markets', 0) or 0)} · "
-                f"прибыльных {int(session.get('winning_markets', 0) or 0)} / "
-                f"убыточных {int(session.get('losing_markets', 0) or 0)}\n"
-                f"· Реализованный net PnL: ${float(session.get('realized_net_pnl', 0) or 0):+.2f}\n"
-                f"· PTB сверка: подтверждено {int(session.get('anchor_verified_markets', 0) or 0)} / "
-                f"не подтверждено {int(session.get('anchor_unverified_markets', 0) or 0)}\n"
-                f"· Verified net: ${float(session.get('anchor_verified_realized_net_pnl', 0) or 0):+.2f} · "
-                f"unverified net: ${float(session.get('anchor_unverified_realized_net_pnl', 0) or 0):+.2f}"
-            )
-        else:
-            session_block = (
-                "Статистика эксперимента после сброса не активна: "
-                "PAPER_STATS_SINCE_TS отсутствует или некорректен."
-            )
-
-        timeframe_lines = []
-        ledger = getattr(self.engine, "ledger", None)
-        if ledger is not None and hasattr(ledger, "get_timeframe_stats"):
-            try:
-                for row in ledger.get_timeframe_stats(self.engine.cfg.trading_mode):
-                    taker_pct = max(0.0, 100.0 - float(row["maker_fill_pct"])) if row["total_fills"] else 0.0
-                    maker_volume_pct = float(row.get("maker_notional_pct", 0.0) or 0.0)
-                    open_up_shares = float(row.get("open_up_shares", 0.0) or 0.0)
-                    open_down_shares = float(row.get("open_down_shares", 0.0) or 0.0)
-                    timeframe_lines.append(
-                        f"· <b>{row['timeframe']}</b>: fills {row['total_fills']} "
-                        f"(M {row['maker_fills']}/{row['maker_fill_pct']:.1f}% · "
-                        f"T {row['taker_fills']}/{taker_pct:.1f}%) · "
-                        f"объём M/T ${row['maker_notional']:.2f}/${row['taker_notional']:.2f} "
-                        f"({maker_volume_pct:.1f}/{max(0.0, 100.0-maker_volume_pct):.1f}%) · "
-                        f"fees −${row['fees']:.2f}\n"
-                        f"  закрыто {row['completed_markets']} "
-                        f"(+{row['wins']}/−{row['losses']}/={row['breakeven']}) · "
-                        f"win {row['win_rate_pct']:.1f}% · net ${row['realized_net_pnl']:+.2f}\n"
-                        f"  MERGE {row['merge_count']} / {row['merged_pairs']:.2f} пар · "
-                        f"gross ${row['merge_gross_pnl']:+.2f} · "
-                        f"открыто {row['open_markets']} рынков · "
-                        f"остаток ↑{open_up_shares:.2f}/↓{open_down_shares:.2f} · "
-                        f"инвентарь ${row['open_inventory_cost']:.2f} · "
-                        f"комиссии входа −${row['open_fees']:.2f}"
-                    )
-            except Exception:
-                logger.exception("Could not build timeframe PAPER statistics")
-                timeframe_lines = ["Разбивка по таймфреймам временно недоступна: ошибка чтения SQLite."]
-        timeframe_block = (
-            "\n".join(timeframe_lines)
-            if timeframe_lines else "Пока нет исполнений по таймфреймам."
-        )
-        emoji = "📈" if lifetime_pnl >= 0 else "📉"
+            fills = int(session.get("total_fills", fills) or 0)
+            maker_pct = float(session.get("maker_fill_pct", maker_pct) or 0)
+            wins = int(session.get("winning_markets", wins) or 0)
+            losses = int(session.get("losing_markets", losses) or 0)
+            done = int(session.get("completed_markets", done) or 0)
+            win_rate = (wins / done * 100.0) if done else 0.0
+            net = float(session.get("realized_net_pnl", net) or 0)
+            fees = float(session.get("fees", fees) or 0)
         return (
-            f"💰 <b>PnL — PAPER / виртуальный учёт</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"Стратегия: <b>{preset_title}</b>\n"
-            f"Стартовый виртуальный банк: <b>${bank:,.0f}</b>\n"
-            f"Equity (cash + позиции по себестоимости): <b>${equity:,.2f}</b>\n"
-            f"Cash: ${cash:,.2f}\n"
-            f"{emoji} Lifetime net PnL по Ledger: <b>${lifetime_pnl:+.2f}</b>\n"
-            f"Сегодня net PnL по Ledger: <b>${day:+.2f}</b>\n"
-            f"Комиссии за всё время: <b>−${float(stats.get('total_fees', fees) or 0):.2f}</b>\n\n"
-            f"<b>Состав Lifetime PnL</b>\n"
-            f"· MERGE gross: <b>${merge_pnl:+.2f}</b>\n"
-            f"· Разрешённые рынки gross: <b>${res_pnl:+.2f}</b>\n"
-            f"· Все комиссии: <b>−${float(stats.get('total_fees', fees) or 0):.2f}</b>\n"
-            f"· Проверка: MERGE gross + resolved gross − комиссии = Lifetime net\n"
-            f"· Equity − старт: ${pnl:+.2f}; открытые позиции пока по себестоимости, не mark-to-market.\n"
-            f"· Это PAPER симуляция, не фактический PnL аккаунта Polymarket.\n\n"
-            f"<b>Общее исполнение</b>\n"
-            f"· Fill-ног: <b>{n_fills}</b> · Maker {maker_fills} ({maker_fill_pct:.1f}%) · "
-            f"Taker {taker_fills} ({taker_fill_pct:.1f}%)\n"
-            f"· Доли объёма: Maker {maker_notional_pct:.1f}% / Taker {taker_notional_pct:.1f}%\n"
-            f"· MERGE: <b>{n_merge}</b> · официально resolved: <b>{resolved}</b>\n"
-            f"· Завершённых рынков: <b>{completed}</b> · +{wins} / −{losses} / ={breakeven}\n"
-            f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n"
-            f"· PTB сверка: подтверждено {anchor_verified}/{resolved} ({anchor_verified_rate:.1f}%) · "
-            f"не подтверждено {anchor_unverified}\n"
-            f"· Verified net: ${anchor_verified_pnl:+.2f} · "
-            f"unverified net: ${anchor_unverified_pnl:+.2f}\n\n"
-            f"<b>Текущий эксперимент после сброса</b>\n{session_block}\n\n"
-            f"<b>Разбивка по таймфреймам (весь Ledger)</b>\n{timeframe_block}\n\n"
-            f"ℹ️ Частичный MERGE не считается завершённым рынком. Его результат попадёт в net после полного MERGE или официального резолва. Открытый инвентарь показан отдельно."
+            "💰 <b>PAPER · результат эксперимента</b>\\n"
+            f"Стартовый банк: ${bank:,.2f}\\n"
+            f"Текущий equity: <b>${equity:,.2f}</b> · cash ${cash:,.2f}\\n"
+            f"Net PnL: <b>{net:+.2f} $</b> · сегодня {today:+.2f} $\\n"
+            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.1f}%\\n"
+            f"Закрыто рынков: <b>{done}</b> · прибыльных {wins} / убыточных {losses}\\n"
+            f"Win rate: <b>{win_rate:.1f}%</b> · MERGE: {merges}\\n"
+            f"Комиссии: ${fees:.2f} · открытых рынков: {open_markets}\\n"
+            "Все суммы виртуальные. Открытые позиции оцениваются отдельно; "
+            "Maker-rebates пока не учитываются."
         )
 
     def _fmt_positions(self) -> str:
