@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 from bot.telegram_ctl import TelegramController
@@ -266,9 +267,9 @@ def test_telegram_pnl_breakdown_exposes_fees_in_net_formula():
     )
     controller = TelegramController(engine)
     message = controller._fmt_pnl()
-    assert "MERGE gross" in message
-    assert "Все комиссии: <b>−$0.20</b>" in message
-    assert "MERGE gross + resolved gross − комиссии = Lifetime net" in message
+    assert "PAPER · результат эксперимента" in message
+    assert "Net PnL: <b>+0.80 $" in message
+    assert "Комиссии: $0.20" in message
 
 
 def test_telegram_queues_startup_trade_notifications_until_session_is_ready():
@@ -312,6 +313,7 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
         paused=False,
         _notification_channel_ready=True,
     )
+    engine.resume_after_notification_recovery = lambda: setattr(engine, "paused", False)
     controller = TelegramController(engine)
     controller._startup_acknowledged = True
 
@@ -328,7 +330,7 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
     asyncio.run(controller.notify("🟢 PAPER MAKER fill BTC Up: 5 shares"))
 
     assert len(controller._pending_notifications) == 1
-    assert unavailable.calls == 2  # HTML attempt plus plain-text fallback
+    assert unavailable.calls == 1  # transient 503 must not trigger a duplicate plain-text request
     assert engine.paused is True
     assert engine._notification_channel_ready is False
 
@@ -342,13 +344,15 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
 
     recovered = RecoveredSession()
     controller._session = recovered
+    # Simulate the retry deadline having elapsed before the recovered API is used.
+    controller._notification_retry_at = 0.0
     asyncio.run(controller._flush_pending_notifications())
 
     assert controller._pending_notifications == []
     assert len(recovered.calls) == 1
     assert "PAPER MAKER fill BTC Up" in recovered.calls[0][1]["text"]
     assert engine._notification_channel_ready is True
-    assert engine.paused is True  # delivery recovery never auto-resumes trading
+    assert engine.paused is False  # notification-caused pause auto-recovers after delivery
 
 
 
@@ -522,3 +526,217 @@ def test_telegram_startup_fails_when_startup_message_is_not_acknowledged(monkeyp
             await controller.stop()
 
     asyncio.run(scenario())
+
+
+def test_telegram_rate_limit_honors_retry_after_without_plain_fallback():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class RateLimitedSession:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, json):
+            self.calls.append((url, dict(json)))
+            return FakeResponse(429, {
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 7",
+                "parameters": {"retry_after": 7},
+            })
+
+    session = RateLimitedSession()
+    controller._session = session
+
+    delivered = asyncio.run(controller.send("PAPER trade notification"))
+
+    assert delivered is False
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["parse_mode"] == "HTML"
+    assert controller._notification_retry_interval == 7.0
+    assert controller._notification_retry_at > 0.0
+
+
+def test_telegram_server_error_uses_bounded_exponential_backoff():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class UnavailableSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, json):
+            self.calls += 1
+            return FakeResponse(502, {
+                "ok": False,
+                "error_code": 502,
+                "description": "Bad Gateway",
+            })
+
+    session = UnavailableSession()
+    controller._session = session
+
+    assert asyncio.run(controller.send("PAPER trade notification")) is False
+    assert session.calls == 1
+    assert controller._notification_retry_interval == 2.0
+
+
+def test_new_telegram_events_do_not_bypass_active_retry_after():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        )
+    )
+    controller = TelegramController(engine)
+
+    class RateLimitedSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, json):
+            self.calls += 1
+            return FakeResponse(429, {
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 7",
+                "parameters": {"retry_after": 7},
+            })
+
+    session = RateLimitedSession()
+    controller._session = session
+
+    async def scenario():
+        await controller.notify("first trade event")
+        await controller.notify("second trade event")
+
+    asyncio.run(scenario())
+
+    assert session.calls == 1
+    assert controller._pending_notifications == ["first trade event", "second trade event"]
+
+def test_telegram_event_wakeups_do_not_extend_absolute_retry_deadline():
+    async def scenario():
+        engine = SimpleNamespace(
+            cfg=SimpleNamespace(
+                telegram_bot_token="test-token",
+                telegram_chat_id="123",
+            )
+        )
+        controller = TelegramController(engine)
+        controller._running = True
+        controller._session = object()
+        controller._pending_notifications = ["queued trade"]
+        controller._pending_notification_ids = [None]
+        controller._pending_notification_keys = [None]
+        attempts = []
+
+        async def flaky_send(message, keyboard=None):
+            attempts.append(time.monotonic())
+            if len(attempts) == 1:
+                controller._notification_retry_interval = 0.12
+                controller._notification_retry_at = time.monotonic() + 0.12
+                return False
+            return True
+
+        controller.send = flaky_send
+        worker = asyncio.create_task(controller._notification_delivery_loop())
+        try:
+            # Repeated unrelated events wake the worker during the backoff.
+            # They must not push the original retry deadline into the future.
+            for _ in range(12):
+                await asyncio.sleep(0.015)
+                controller._notification_wakeup.set()
+            await asyncio.sleep(0.04)
+        finally:
+            controller._running = False
+            controller._notification_wakeup.set()
+            await asyncio.wait_for(worker, timeout=0.5)
+
+        assert len(attempts) >= 2
+        assert controller._pending_notifications == []
+
+    asyncio.run(scenario())
+
+
+def test_telegram_pnl_shows_maker_taker_and_timeframe_breakdown():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            bankroll_usd=2750.0,
+            strategy_preset="mo_money",
+            trading_mode="paper",
+            telegram_bot_token="test-token",
+            telegram_chat_id="123",
+        ),
+        params=SimpleNamespace(title_ru="Mo Money"),
+        snapshot=lambda: {
+            "equity": 2751.0,
+            "cash": 2700.0,
+            "fees_paid": 0.25,
+            "stats": {
+                "today_total_net_pnl": 0.4,
+                "realized_gross_pnl": 0.5,
+                "merged_locked_pnl": 0.2,
+                "lifetime_total_net_pnl": 0.45,
+                "total_fees": 0.25,
+                "total_fills": 4,
+                "maker_fills": 2,
+                "taker_fills": 2,
+                "maker_fill_pct": 50.0,
+                "taker_fill_pct": 50.0,
+                "maker_usdc_pct": 60.0,
+                "taker_usdc_pct": 40.0,
+                "merge_count": 2,
+                "resolved_markets": 1,
+                "completed_markets": 2,
+                "completed_win_markets": 1,
+                "completed_loss_markets": 1,
+                "completed_breakeven_markets": 0,
+                "completed_win_rate_pct": 50.0,
+            },
+        },
+        ledger=SimpleNamespace(
+            pending_telegram_notifications=lambda limit=5000: [],
+            get_timeframe_stats=lambda mode: [
+                {
+                    "timeframe": "5m", "total_fills": 2, "maker_fills": 1,
+                    "taker_fills": 1, "maker_fill_pct": 50.0,
+                    "maker_notional": 12.0, "taker_notional": 8.0, "fees": 0.10,
+                    "completed_markets": 1, "wins": 1, "losses": 0,
+                    "breakeven": 0, "win_rate_pct": 100.0,
+                    "realized_net_pnl": 0.30, "merge_count": 1,
+                    "merged_pairs": 5.0, "merge_gross_pnl": 0.40,
+                    "open_markets": 0, "open_inventory_cost": 0.0,
+                    "open_fees": 0.0,
+                },
+                {
+                    "timeframe": "15m", "total_fills": 2, "maker_fills": 1,
+                    "taker_fills": 1, "maker_fill_pct": 50.0,
+                    "maker_notional": 18.0, "taker_notional": 12.0, "fees": 0.15,
+                    "completed_markets": 1, "wins": 0, "losses": 1,
+                    "breakeven": 0, "win_rate_pct": 0.0,
+                    "realized_net_pnl": -0.10, "merge_count": 1,
+                    "merged_pairs": 2.0, "merge_gross_pnl": 0.10,
+                    "open_markets": 1, "open_inventory_cost": 4.50,
+                    "open_fees": 0.05,
+                },
+            ],
+        ),
+    )
+    controller = TelegramController(engine)
+    message = controller._fmt_pnl()
+
+    assert "Исполнений: <b>4</b> · Maker 50.0%" in message
+    assert "Закрыто рынков: <b>2</b> · прибыльных 1 / убыточных 1" in message
+    assert "Win rate: <b>50.0%</b> · MERGE: 2" in message
+    assert "Комиссии: $0.25" in message

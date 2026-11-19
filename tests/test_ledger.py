@@ -7,7 +7,10 @@ import pytest
 from bot.ledger import Ledger
 
 
-def _record_buy(ledger: Ledger, *, slug: str, outcome: str, shares: float, price: float, fee: float) -> None:
+def _record_buy(
+    ledger: Ledger, *, slug: str, outcome: str, shares: float, price: float,
+    fee: float, ts: float | None = None,
+) -> None:
     ledger.record_fill(
         mode="paper",
         slug=slug,
@@ -21,6 +24,7 @@ def _record_buy(ledger: Ledger, *, slug: str, outcome: str, shares: float, price
         price=price,
         fee=fee,
         fair_prob=price,
+        ts=ts,
     )
 
 
@@ -206,6 +210,53 @@ def test_resolution_persists_chainlink_anchor_reconciliation(tmp_path) -> None:
     assert row["anchor_verified"] == 1
     ledger.conn.close()
 
+
+
+def test_delayed_anchor_check_updates_unverified_resolution(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "delayed-anchor-audit.db"))
+    slug = "btc-updown-5m-1795035600"
+    ledger.record_resolution(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "1" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=62_236.258,
+        final_price=62_240.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+
+    pending = ledger.unverified_resolutions("paper")
+    assert len(pending) == 1
+    assert pending[0]["slug"] == slug
+
+    ledger.record_anchor_check(
+        mode="paper",
+        slug=slug,
+        price_to_beat=62_236.258,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=62_236.262,
+        anchor_delta=0.004,
+        anchor_verified=True,
+    )
+
+    row = ledger.recent_resolutions("paper", 1)[0]
+    assert row["anchor_verified"] == 1
+    assert row["gamma_price_to_beat"] == 62_236.262
+    assert row["anchor_delta"] == 0.004
+    assert row["net_pnl"] == 3.0
+    assert ledger.unverified_resolutions("paper") == []
+    ledger.conn.close()
 
 
 def test_existing_ledger_schema_migrates_anchor_audit_columns(tmp_path) -> None:
@@ -471,6 +522,40 @@ def test_consecutive_net_losses_include_fully_merged_markets(tmp_path) -> None:
     ledger.conn.close()
 
 
+def test_consecutive_net_losses_are_scoped_to_first_fill_in_session(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "session-loss-streak.db"))
+
+    def add_loss(slug: str, fill_ts: float) -> None:
+        _record_buy(
+            ledger, slug=slug, outcome="Up", shares=1.0,
+            price=1.0, fee=0.10, ts=fill_ts,
+        )
+        ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "5" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Down",
+            price_to_beat=100_000.0,
+            final_price=99_999.0,
+            up_shares_total=1.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=1.0,
+            total_fees=0.10,
+            total_payout=0.0,
+        )
+
+    add_loss("pre-session-loss", 100.0)
+    add_loss("session-loss-1", 300.0)
+    add_loss("session-loss-2", 400.0)
+
+    assert ledger.consecutive_net_losses("paper") == 3
+    assert ledger.consecutive_net_losses("paper", since_ts=200.0) == 2
+    ledger.conn.close()
+
+
 def test_telegram_outbox_survives_ledger_reopen_and_tracks_delivery(tmp_path) -> None:
     db_path = str(tmp_path / "telegram-outbox.db")
     first = Ledger(db_path)
@@ -590,3 +675,269 @@ def test_atomic_pair_and_outbox_roll_back_on_event_key_collision(tmp_path) -> No
     assert ledger.recent_fills("paper", 5) == []
     assert ledger.pending_telegram_notifications()[0]["message"] == "original event"
     ledger.conn.close()
+
+
+def test_paper_reset_backs_up_then_clears_all_paper_history_and_positions(tmp_path) -> None:
+    db_path = str(tmp_path / "paper-reset.db")
+    ledger = Ledger(db_path)
+    slug = "btc-updown-5m-1795035600"
+    _record_buy(ledger, slug=slug, outcome="Up", shares=10, price=0.40, fee=0.10)
+    ledger.record_anchor_check(
+        mode="paper", slug=slug, price_to_beat=100000.0,
+        price_to_beat_source="rtds", gamma_price_to_beat=None,
+        anchor_delta=None, anchor_verified=None,
+    )
+    ledger.enqueue_telegram_notification("old trade", "old-trade-event")
+    ledger.conn.execute(
+        "INSERT INTO equity_points (ts, mode, equity, cash, realized_net_pnl, fees_paid) "
+        "VALUES (?, 'paper', 100, 90, 0, 0.1)", (1.0,)
+    )
+    ledger.conn.commit()
+
+    result = ledger.reset_paper_history("paper")
+
+    assert result["deleted"]["fills"] == 1
+    assert result["deleted"]["anchor_checks"] == 1
+    assert result["deleted"]["equity_points"] == 1
+    assert all(value == 0 for value in result["remaining"].values())
+    assert ledger.open_positions("paper") == []
+    state = ledger.portfolio_state("paper", 2750.0)
+    assert state["cash"] == 2750.0
+    assert state["inventory_cost"] == 0.0
+    assert state["equity"] == 2750.0
+
+    backup = sqlite3.connect(result["backup_path"])
+    assert backup.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert backup.execute("SELECT COUNT(*) FROM fills WHERE mode='paper'").fetchone()[0] == 1
+    assert backup.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0] == 1
+    backup.close()
+    ledger.conn.close()
+
+
+
+def test_timeframe_stats_separate_completed_markets_from_partial_merges_and_open_inventory(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "timeframe-stats.db"))
+
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-5m-closed", condition_id="0x" + "1" * 64,
+        asset="BTC", timeframe="5m", outcome="Up", role="MAKER_CLOB",
+        reason="maker_test", shares=10, price=0.40, fee=0.10, fair_prob=0.5,
+    )
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-5m-closed", condition_id="0x" + "1" * 64,
+        asset="BTC", timeframe="5m", outcome="Down", role="TAKER_CLOB",
+        reason="taker_test", shares=10, price=0.50, fee=0.10, fair_prob=0.5,
+    )
+    ledger.record_merge(
+        mode="paper", slug="btc-updown-5m-closed", condition_id="0x" + "1" * 64,
+        pairs=10, cost_basis=9.0, locked_pnl=1.0, tx_hash="full-merge",
+    )
+
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-15m-partial", condition_id="0x" + "2" * 64,
+        asset="BTC", timeframe="15m", outcome="Up", role="TAKER_CLOB",
+        reason="taker_test", shares=4, price=0.60, fee=0.05, fair_prob=0.6,
+    )
+    ledger.record_fill(
+        mode="paper", slug="btc-updown-15m-partial", condition_id="0x" + "2" * 64,
+        asset="BTC", timeframe="15m", outcome="Down", role="TAKER_CLOB",
+        reason="taker_test", shares=2, price=0.30, fee=0.03, fair_prob=0.4,
+    )
+    ledger.record_merge(
+        mode="paper", slug="btc-updown-15m-partial", condition_id="0x" + "2" * 64,
+        pairs=2, cost_basis=1.8, locked_pnl=0.2, tx_hash="partial-merge",
+    )
+
+    rows = {row["timeframe"]: row for row in ledger.get_timeframe_stats("paper")}
+    five = rows["5m"]
+    fifteen = rows["15m"]
+
+    assert five["total_fills"] == 2
+    assert five["maker_fills"] == 1
+    assert five["taker_fills"] == 1
+    assert five["maker_fill_pct"] == 50.0
+    assert five["merge_count"] == 1
+    assert five["completed_markets"] == 1
+    assert five["wins"] == 1
+    assert five["realized_net_pnl"] == 0.8
+    assert five["open_markets"] == 0
+
+    assert fifteen["total_fills"] == 2
+    assert fifteen["maker_fills"] == 0
+    assert fifteen["taker_fills"] == 2
+    assert fifteen["fees"] == 0.08
+    assert fifteen["merge_count"] == 1
+    assert fifteen["completed_markets"] == 0
+    assert fifteen["open_markets"] == 1
+    assert fifteen["open_up_shares"] == 2.0
+    assert fifteen["open_down_shares"] == 0.0
+    assert fifteen["open_inventory_cost"] == 1.2
+    assert fifteen["open_fees"] == 0.025
+    ledger.conn.close()
+
+def test_session_stats_excludes_later_fills_on_markets_started_before_epoch(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "session-epoch.db"))
+
+    def fill(slug: str, ts: float, outcome: str, price: float) -> None:
+        ledger.record_fill(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome=outcome,
+            role="MAKER_CLOB",
+            reason="session-test",
+            shares=10,
+            price=price,
+            fee=0.01,
+            fair_prob=0.5,
+            ts=ts,
+        )
+
+    # This market existed before the experiment. A later fill must not leak
+    # into the clean-session execution counters or volume.
+    fill("old-market", 100.0, "Up", 0.40)
+    fill("old-market", 250.0, "Down", 0.50)
+
+    # This market began after the experiment epoch and is fully in scope.
+    fill("new-market", 250.0, "Up", 0.40)
+    fill("new-market", 251.0, "Down", 0.50)
+
+    stats = ledger.get_session_stats("paper", 200.0)
+    assert stats["total_fills"] == 2
+    assert stats["maker_fills"] == 2
+    assert stats["notional"] == 9.0
+    assert stats["fees"] == 0.02
+    assert stats["completed_markets"] == 0
+
+
+def test_timeframe_maker_and_taker_volume_reconcile_after_rounding(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "timeframe-rounding.db"))
+    for role in ("MAKER_CLOB", "TAKER_CLOB"):
+        ledger.record_fill(
+            mode="paper",
+            slug="rounding-market",
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome="Up",
+            role=role,
+            reason="rounding-test",
+            shares=1,
+            price=0.3333,
+            fee=0.0,
+            fair_prob=0.5,
+        )
+
+    row = ledger.get_timeframe_stats("paper")[0]
+    assert row["maker_notional"] + row["taker_notional"] == row["total_notional"]
+    assert row["total_notional"] == 0.67
+
+
+def test_stats_separate_anchor_verified_and_unverified_resolution_pnl(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "anchor-quality-stats.db"))
+    common = {
+        "mode": "paper",
+        "condition_id": "0x" + "1" * 64,
+        "asset": "BTC",
+        "timeframe": "5m",
+        "winner": "Up",
+        "price_to_beat": 100_000.0,
+        "final_price": 100_001.0,
+        "up_shares_total": 2.0,
+        "down_shares_total": 0.0,
+        "merged_pairs": 0.0,
+        "total_fees": 0.10,
+    }
+    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Up", shares=2, price=0.25, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-verified", outcome="Down", shares=2, price=0.25, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-unverified", outcome="Up", shares=2, price=0.50, fee=0.05)
+    _record_buy(ledger, slug="btc-updown-5m-unverified", outcome="Down", shares=2, price=0.50, fee=0.05)
+
+    ledger.record_resolution(
+        slug="btc-updown-5m-verified",
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=100_000.0,
+        anchor_delta=0.0,
+        anchor_verified=True,
+        gross_cost=1.0,
+        total_payout=2.0,
+        **common,
+    )
+    ledger.record_resolution(
+        slug="btc-updown-5m-unverified",
+        price_to_beat_source="",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+        gross_cost=2.0,
+        total_payout=1.0,
+        **common,
+    )
+
+    stats = ledger.get_stats("paper")
+    assert stats["resolved_markets"] == 2
+    assert stats["anchor_verified_markets"] == 1
+    assert stats["anchor_unverified_markets"] == 1
+    assert stats["anchor_verified_rate_pct"] == 50.0
+    assert stats["anchor_verified_realized_net_pnl"] == 0.90
+    assert stats["anchor_unverified_realized_net_pnl"] == -1.10
+    ledger.conn.close()
+
+
+def test_session_stats_split_verified_and_unverified_anchor_pnl(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "session-anchor-quality.db"))
+
+    def add_market(slug: str, price: float, verified: bool) -> None:
+        for outcome in ("Up", "Down"):
+            ledger.record_fill(
+                mode="paper",
+                slug=slug,
+                condition_id="0x" + "1" * 64,
+                asset="BTC",
+                timeframe="5m",
+                outcome=outcome,
+                role="MAKER_CLOB",
+                reason="session-anchor-test",
+                shares=2.0,
+                price=price,
+                fee=0.05,
+                fair_prob=0.5,
+                ts=250.0,
+            )
+        ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Up",
+            price_to_beat=100_000.0,
+            final_price=100_001.0,
+            price_to_beat_source=(
+                "rtds.chainlink_twap60.near_exact_window_start" if verified else ""
+            ),
+            gamma_price_to_beat=100_000.0 if verified else None,
+            anchor_delta=0.0 if verified else None,
+            anchor_verified=verified if verified else None,
+            up_shares_total=2.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=1.0 if verified else 2.0,
+            total_fees=0.10,
+            total_payout=2.0 if verified else 1.0,
+        )
+
+    add_market("session-verified", 0.25, True)
+    add_market("session-unverified", 0.50, False)
+
+    stats = ledger.get_session_stats("paper", 200.0)
+    assert stats["resolved_markets_with_anchor_audit"] == 2
+    assert stats["anchor_verified_markets"] == 1
+    assert stats["anchor_unverified_markets"] == 1
+    assert stats["anchor_verified_realized_net_pnl"] == 0.90
+    assert stats["anchor_unverified_realized_net_pnl"] == -1.10
+    ledger.conn.close()
+
+

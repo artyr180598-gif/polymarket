@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import uuid
+import time
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -49,6 +50,7 @@ class TelegramController:
         self._task: Optional[asyncio.Task] = None
         self._notification_task: Optional[asyncio.Task] = None
         self._notification_retry_interval = 1.0
+        self._notification_retry_at = 0.0
         self._notification_wakeup = asyncio.Event()
         self._running = False
         self._offset = 0
@@ -89,18 +91,26 @@ class TelegramController:
             logger.exception("Could not load next Telegram outbox batch")
 
     def _set_delivery_ready(self, ready: bool) -> None:
-        """Fail closed when durable trade notifications cannot be delivered."""
+        """Fail closed on delivery errors and recover only notification-caused pauses."""
         self._delivery_ready = bool(ready)
         if hasattr(self.engine, "_notification_channel_ready"):
             self.engine._notification_channel_ready = bool(ready)
         if not ready and hasattr(self.engine, "paused"):
-            self.engine.paused = True
-            executor = getattr(self.engine, "executor", None)
-            if executor is not None:
-                try:
-                    asyncio.get_running_loop().create_task(executor.cancel_all())
-                except RuntimeError:
-                    logger.exception("Could not schedule maker cancellation after Telegram delivery failure")
+            pause = getattr(self.engine, "pause", None)
+            if callable(pause):
+                pause(reason="telegram_delivery", notify=False)
+            else:
+                self.engine.paused = True
+                executor = getattr(self.engine, "executor", None)
+                if executor is not None:
+                    try:
+                        asyncio.get_running_loop().create_task(executor.cancel_all())
+                    except RuntimeError:
+                        logger.exception("Could not schedule maker cancellation after Telegram delivery failure")
+        elif ready:
+            recover = getattr(self.engine, "resume_after_notification_recovery", None)
+            if callable(recover):
+                recover()
 
     @property
     def _base(self) -> str:
@@ -218,26 +228,54 @@ class TelegramController:
                 result = await r.json(content_type=None)
                 if r.status != 200 or not result.get("ok", False):
                     logger.warning("sendMessage rejected: status=%s response=%s", r.status, str(result)[:180])
-                    # Telegram's HTML parser rejects unescaped '<', '&', and
-                    # unsupported tags in dynamic market/error text. Retry as
-                    # genuinely plain text, stripping markup rather than only
-                    # the handful of tags used by our templates.
-                    plain = re.sub(r"</?[^>]+>", "", clean)
-                    payload["text"] = plain[:4090]
-                    payload.pop("parse_mode", None)
-                    async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
-                        result2 = await r2.json(content_type=None)
-                        if r2.status != 200 or not result2.get("ok", False):
-                            logger.warning(
-                                "sendMessage plain rejected: status=%s response=%s",
-                                r2.status, str(result2)[:180],
-                            )
-                            return False
-                        return True
+                    description = str(result.get("description") or "").lower()
+                    # Only retry as plain text for Telegram's explicit HTML
+                    # entity parser error. Retrying 429/5xx as plain text doubles
+                    # requests during an outage and can worsen rate limiting.
+                    if r.status == 400 and "parse entities" in description:
+                        plain = re.sub(r"</?[^>]+>", "", clean)
+                        payload["text"] = plain[:4090]
+                        payload.pop("parse_mode", None)
+                        async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
+                            result2 = await r2.json(content_type=None)
+                            if r2.status != 200 or not result2.get("ok", False):
+                                logger.warning(
+                                    "sendMessage plain rejected: status=%s response=%s",
+                                    r2.status, str(result2)[:180],
+                                )
+                                self._set_notification_retry_delay(r2.status, result2)
+                                return False
+                            self._notification_retry_interval = 1.0
+                            self._notification_retry_at = 0.0
+                            return True
+                    self._set_notification_retry_delay(r.status, result)
+                    return False
+                self._notification_retry_interval = 1.0
+                self._notification_retry_at = 0.0
                 return True
         except Exception as e:
             logger.warning("Telegram send failed: %s", e)
+            self._set_notification_retry_delay(503, {})
             return False
+
+    def _set_notification_retry_delay(self, status: int, result: Dict[str, Any]) -> None:
+        """Back off on Telegram rate limits and transient API failures."""
+        if status == 429:
+            parameters = result.get("parameters") or {}
+            try:
+                delay = float(parameters.get("retry_after", 5))
+            except (TypeError, ValueError):
+                delay = 5.0
+            self._notification_retry_interval = max(1.0, min(60.0, delay))
+        elif status >= 500:
+            self._notification_retry_interval = min(
+                30.0, max(2.0, self._notification_retry_interval * 2.0)
+            )
+        elif status >= 400:
+            # Keep the event queued and fail closed; avoid hammering a persistent
+            # request/configuration error once per second.
+            self._notification_retry_interval = max(30.0, self._notification_retry_interval)
+        self._notification_retry_at = time.monotonic() + self._notification_retry_interval
 
     async def notify(self, text: str, event_key: Optional[str] = None) -> None:
         msg = (text or "").strip()
@@ -274,6 +312,11 @@ class TelegramController:
             return
         async with self._notification_delivery_lock:
             while self._pending_notifications and self._session is not None:
+                # New events may wake this worker during a Telegram rate limit;
+                # never let those wakeups bypass retry_after/backoff.
+                delay_remaining = self._notification_retry_at - time.monotonic()
+                if delay_remaining > 0:
+                    break
                 msg = self._pending_notifications[0]
                 notification_id = self._pending_notification_ids[0]
                 event_key = self._pending_notification_keys[0]
@@ -323,12 +366,22 @@ class TelegramController:
             self._notification_wakeup.clear()
             await self._drain_pending_notifications()
             try:
+                timeout = None
+                if self._pending_notifications:
+                    # Use the absolute retry deadline. Repeated event wakeups must
+                    # not restart the full delay and starve delivery indefinitely.
+                    remaining = self._notification_retry_at - time.monotonic()
+                    timeout = (
+                        max(0.01, remaining)
+                        if remaining > 0
+                        else self._notification_retry_interval
+                    )
                 await asyncio.wait_for(
                     self._notification_wakeup.wait(),
-                    timeout=self._notification_retry_interval if self._pending_notifications else None,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                # A failed delivery is retried after a short bounded delay.
+                # A failed delivery is retried when its absolute deadline expires.
                 continue
             except asyncio.CancelledError:
                 raise
@@ -341,131 +394,109 @@ class TelegramController:
                 pass
 
     def _fmt_status(self) -> str:
+        """Short operator-facing status; verbose diagnostics stay in Railway logs."""
         st = self.engine.snapshot()
-        stats = st.get("stats") or {}
-        risk_halt = bool(st.get("risk_halt_active"))
-        risk_halt_reason = str(st.get("risk_halt_reason") or "")
+        stats = st.get("session_stats") or st.get("stats") or {}
         mode = (st.get("mode") or "paper").upper()
-        running = st.get("running")
-        paused = st.get("paused")
+        paused = bool(st.get("paused"))
+        running = bool(st.get("running"))
+        risk_halt = bool(st.get("risk_halt_active"))
         oracle_ready = bool(st.get("streams_ok"))
         clob_age = st.get("clob_last_event_age_sec")
-        clob_ready = bool(st.get("clob_feed_connected")) and clob_age is not None and float(clob_age) <= 5.0
+        clob_ready = (
+            bool(st.get("clob_feed_connected"))
+            and clob_age is not None
+            and float(clob_age) <= 5.0
+        )
         strike_ready = any(
             w.get("price_to_beat") is not None
             for w in (st.get("windows") or [])
             if not w.get("resolved")
         )
-        market_data_ready = oracle_ready and clob_ready and strike_ready
         model_ready = bool(st.get("model_ready"))
-        state_emoji = (
-            "⏸" if paused else
-            "🟢" if running and market_data_ready and model_ready else
-            "🟠" if running else "⏹"
-        )
-        state_txt = (
-            "пауза" if paused
-            else "PAPER готов к сигналам" if running and market_data_ready and model_ready
-            else "накапливает волатильность" if running and market_data_ready
-            else "ожидает Chainlink TWAP60 на границе окна" if running and oracle_ready and clob_ready and not strike_ready
-            else "ожидает CLOB WebSocket" if running and oracle_ready and not clob_ready
-            else "ожидает Chainlink RTDS" if running
-            else "остановлен"
-        )
-        equity = st.get("equity", 0) or 0
-        cash = st.get("cash", 0) or 0
-        day = stats.get("today_total_net_pnl", 0)
-        day_s = f"+${day:.2f}" if day >= 0 else f"-${abs(day):.2f}"
-        fees = float(st.get("fees_paid", 0) or 0)
-        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
-        lines = [
-            f"{state_emoji} <b>PolyBot — {state_txt}</b>",
-            "━━━━━━━━━━━━━━━━",
-            f"Стратегия: <b>{preset_title}</b>",
-            f"Режим: <b>{mode}</b>",
-            "Исполнение: <b>виртуальное (PAPER)</b>" if mode == "PAPER" else "Исполнение: <b>LIVE заблокирован защитой</b>",
-            f"Chainlink RTDS: <b>{'OK' if oracle_ready else 'нет свежих данных'}</b>",
-            f"Chainlink TWAP60 anchor: <b>{'OK' if strike_ready else 'ожидание'}</b>",
-            f"CLOB WebSocket: <b>{'OK' if clob_ready else 'нет связи'}</b>",
-            f"Защита риска: <b>{'HOLD' if risk_halt else 'OK'}</b>",
-            f"Модель волатильности: <b>{'готова' if model_ready else 'сбор данных (60+ наблюдений)'}</b>",
-            f"Maker-заявок: <b>{int(st.get('maker_orders_open', 0) or 0)}</b> · резерв ${float(st.get('reserved_maker_orders_usd', 0) or 0):.2f}",
-            f"Доступно: <b>${float(st.get('available_cash', cash) or 0):.2f}</b>",
-            f"",
-            f"💵 Equity: <b>${equity:,.2f}</b>",
-            f"💸 Cash: ${cash:,.2f}",
-            f"📈 Сегодня: <b>{day_s}</b>",
-            f"Комиссии всего: −${fees:.2f}",
-            "Maker-rebates в PAPER PnL пока не моделируются.",
+        ready = running and not paused and not risk_halt and oracle_ready and clob_ready and strike_ready and model_ready
+        if risk_halt:
+            state = "🛑 защитная остановка"
+        elif paused:
+            state = "⏸ пауза"
+        elif ready:
+            state = "🟢 работает"
+        elif running:
+            state = "🟠 ждёт данные"
+        else:
+            state = "⏹ остановлен"
+
+        bank = float(self.engine.cfg.bankroll_usd)
+        equity = float(st.get("equity", bank) or bank)
+        cash = float(st.get("cash", bank) or 0)
+        pnl = equity - bank
+        today = float((st.get("stats") or {}).get("today_total_net_pnl", 0) or 0)
+        fills = int(stats.get("total_fills", 0) or 0)
+        maker_pct = float(stats.get("maker_fill_pct", 0) or 0)
+        positions = [
+            w for w in (st.get("windows") or [])
+            if not w.get("resolved") and (
+                float(w.get("up_shares", 0) or 0) > 0
+                or float(w.get("down_shares", 0) or 0) > 0
+            )
         ]
-        if risk_halt_reason:
-            lines.append(f"⚠️ Причина блокировки: {risk_halt_reason}")
-        windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
-        if windows:
-            lines.append(f"\n⏱ Окон: <b>{len(windows)}</b>")
-            for w in windows[:5]:
-                tau = w.get("remain_sec", 0) or 0
-                fair = w.get("fair_up")
-                fair_s = f"{fair * 100:.0f}¢" if fair is not None else "—"
-                lines.append(
-                    f"· <code>{(w.get('slug') or '')[:28]}</code> τ{tau:.0f}s fair {fair_s}"
-                )
-        return "\n".join(lines)
+        orders = int(st.get("maker_orders_open", 0) or 0)
+        risk_text = "HOLD" if risk_halt else "OK"
+        return (
+            f"{state} <b>PolyBot · {mode}</b>\n"
+            f"Баланс: <b>${equity:,.2f}</b> · свободно ${cash:,.2f}\n"
+            f"Результат equity: <b>{pnl:+.2f} $</b> · сегодня {today:+.2f} $\n"
+            f"Реализовано: {float((st.get('stats') or {}).get('lifetime_total_net_pnl', 0) or 0):+.2f} $ · "
+            f"MTM открытых: {float(st.get('unrealized_pnl') or 0):+.2f} $"
+            + ("" if st.get("mark_to_market_complete", False) else " · оценка ожидает свежий CLOB") + "\n"
+            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.0f}%\n"
+            f"Позиции: <b>{len(positions)}</b> · активные заявки {orders}\n"
+            f"Данные: Chainlink {'OK' if oracle_ready else 'ожидание'} · "
+            f"CLOB {'OK' if clob_ready else 'ожидание'} · "
+            f"TWAP60 {'OK' if strike_ready else 'ожидание'}\n"
+            f"Риск-защита: <b>{risk_text}</b>"
+            + (f"\n⚠️ {st.get('risk_halt_reason')}" if risk_halt and st.get("risk_halt_reason") else "")
+        )
 
     def _fmt_pnl(self) -> str:
+        """Compact PAPER performance summary for the user."""
         st = self.engine.snapshot()
         stats = st.get("stats") or {}
-        equity = float(st.get("equity", 0) or 0)
-        cash = float(st.get("cash", 0) or 0)
+        session = st.get("session_stats") or {}
         bank = float(self.engine.cfg.bankroll_usd)
-        fees = float(st.get("fees_paid", 0) or getattr(self.engine, "fees_paid", 0) or 0)
-        pnl = equity - bank
-        preset_title = getattr(self.engine.params, "title_ru", self.engine.cfg.strategy_preset)
-        day = float(stats.get("today_total_net_pnl", 0) or 0)
-        res_pnl = float(stats.get("realized_gross_pnl", 0) or 0)
-        merge_pnl = float(stats.get("merged_locked_pnl", 0) or 0)
-        lifetime_pnl = float(stats.get("lifetime_total_net_pnl", 0) or 0)
-        wins = int(stats.get("win_markets", 0) or 0)
-        losses = int(stats.get("loss_markets", 0) or 0)
-        breakeven = int(stats.get("breakeven_markets", 0) or 0)
-        resolved = int(stats.get("resolved_markets", 0) or 0)
-        completed = int(stats.get("completed_markets", resolved) or 0)
-        wins = int(stats.get("completed_win_markets", wins) or 0)
-        losses = int(stats.get("completed_loss_markets", losses) or 0)
-        breakeven = int(stats.get("completed_breakeven_markets", breakeven) or 0)
-        completed_win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
-        n_fills = int(stats.get("total_fills", 0) or 0)
-        maker_fills = int(stats.get("maker_fills", 0) or 0)
-        maker_fill_pct = float(stats.get("maker_fill_pct", 0) or 0)
-        n_merge = int(stats.get("merge_count", 0) or 0)
-        emoji = "📈" if lifetime_pnl >= 0 else "📉"
+        equity = float(st.get("equity", bank) or bank)
+        cash = float(st.get("cash", bank) or 0)
+        net = float(stats.get("lifetime_total_net_pnl", equity - bank) or 0)
+        today = float(stats.get("today_total_net_pnl", 0) or 0)
+        fills = int(stats.get("total_fills", 0) or 0)
+        maker_pct = float(stats.get("maker_fill_pct", 0) or 0)
+        wins = int(stats.get("completed_win_markets", stats.get("win_markets", 0)) or 0)
+        losses = int(stats.get("completed_loss_markets", stats.get("loss_markets", 0)) or 0)
+        done = int(stats.get("completed_markets", wins + losses) or 0)
+        win_rate = float(stats.get("completed_win_rate_pct", 0) or 0)
+        merges = int(stats.get("merge_count", 0) or 0)
+        open_markets = int(stats.get("open_markets", 0) or 0)
+        fees = float(stats.get("total_fees", st.get("fees_paid", 0)) or 0)
+        if session.get("enabled"):
+            fills = int(session.get("total_fills", fills) or 0)
+            maker_pct = float(session.get("maker_fill_pct", maker_pct) or 0)
+            wins = int(session.get("winning_markets", wins) or 0)
+            losses = int(session.get("losing_markets", losses) or 0)
+            done = int(session.get("completed_markets", done) or 0)
+            win_rate = (wins / done * 100.0) if done else 0.0
+            net = float(session.get("realized_net_pnl", net) or 0)
+            fees = float(session.get("fees", fees) or 0)
         return (
-            f"💰 <b>PnL — PAPER / виртуальный учёт</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"Стратегия: <b>{preset_title}</b>\n"
-            f"Стартовый виртуальный банк: <b>${bank:,.0f}</b>\n"
-            f"Equity текущего процесса (cash + позиции по себестоимости): <b>${equity:,.2f}</b>\n"
-            f"Cash текущего процесса: ${cash:,.2f}\n"
-            f"{emoji} Lifetime net PnL по Ledger: <b>${lifetime_pnl:+.2f}</b>\n"
-            f"Сегодня net PnL по Ledger: <b>${day:+.2f}</b>\n"
-            f"Комиссии за всё время: <b>−${float(stats.get('total_fees', 0) or 0):.2f}</b>\n\n"
-            f"<b>Состав Lifetime PnL</b>\n"
-            f"· MERGE gross: <b>${merge_pnl:+.2f}</b>\n"
-            f"· Разрешённые рынки gross: <b>${res_pnl:+.2f}</b>\n"
-            f"· Все комиссии: <b>−${float(stats.get('total_fees', 0) or 0):.2f}</b>\n"
-            f"· Проверка: MERGE gross + resolved gross − комиссии = Lifetime net\n"
-            f"· Equity текущего процесса − старт: ${pnl:+.2f} (не lifetime)\n"
-            f"· Открытые позиции оцениваются по себестоимости, не по mark-to-market.\n"
-            f"· Это PAPER симуляция, не фактический PnL аккаунта Polymarket.\n\n"
-            f"📊 Журнал\n"
-            f"· Исполнений (отдельных ног): <b>{n_fills}</b>\n"
-            f"· Maker: <b>{maker_fills}</b> ({maker_fill_pct:.1f}%)\n"
-            f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Официально resolved: <b>{resolved}</b>\n"
-            f"· Завершённых рынков (резолв или полный MERGE): <b>{completed}</b>\n"
-            f"· Плюсовых: <b>{wins}</b> · минусовых: <b>{losses}</b> · около нуля: <b>{breakeven}</b>\n"
-            f"· Win rate завершённых: <b>{completed_win_rate:.1f}%</b>\n\n"
-            f"ℹ️ Частичный MERGE с оставшейся позицией не считается завершённой сделкой; его результат будет учтён после полного закрытия или официального резолва."
+            "💰 <b>PAPER · результат эксперимента</b>\n"
+            f"Стартовый банк: ${bank:,.2f}\n"
+            f"Текущий equity: <b>${equity:,.2f}</b> · cash ${cash:,.2f}\n"
+            f"Net PnL: <b>{net:+.2f} $</b> · сегодня {today:+.2f} $\n"
+            f"Исполнений: <b>{fills}</b> · Maker {maker_pct:.1f}%\n"
+            f"Закрыто рынков: <b>{done}</b> · прибыльных {wins} / убыточных {losses}\n"
+            f"Win rate: <b>{win_rate:.1f}%</b> · MERGE: {merges}\n"
+            f"Комиссии: ${fees:.2f} · открытых рынков: {open_markets}\n"
+            "Все суммы виртуальные. Открытые позиции оцениваются отдельно; "
+            "Maker-rebates пока не учитываются."
         )
 
     def _fmt_positions(self) -> str:

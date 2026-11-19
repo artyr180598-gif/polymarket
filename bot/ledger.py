@@ -410,7 +410,38 @@ class Ledger:
                 None if anchor_verified is None else int(anchor_verified),
             ),
         )
+        # Resolution may be recorded before Gamma publishes its closed-market
+        # metadata. A later audit updates only still-unverified resolutions.
+        self.conn.execute(
+            """
+            UPDATE resolutions
+            SET gamma_price_to_beat = ?, anchor_delta = ?, anchor_verified = ?
+            WHERE mode = ? AND slug = ? AND anchor_verified IS NULL
+            """,
+            (
+                gamma_price_to_beat, anchor_delta,
+                None if anchor_verified is None else int(anchor_verified),
+                mode, slug,
+            ),
+        )
         self.conn.commit()
+
+    def unverified_resolutions(self, mode: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return resolved RTDS-anchored markets still awaiting Gamma verification."""
+        rows = self.conn.execute(
+            """
+            SELECT slug, condition_id, price_to_beat, price_to_beat_source
+            FROM resolutions
+            WHERE mode = ?
+              AND anchor_verified IS NULL
+              AND price_to_beat IS NOT NULL
+              AND price_to_beat_source LIKE 'rtds.%'
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (mode, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_equity(
         self,
@@ -452,6 +483,16 @@ class Ledger:
             """
             SELECT
                 COUNT(*) AS resolved_mkts,
+                COALESCE(SUM(CASE WHEN r.anchor_verified = 1 THEN 1 ELSE 0 END), 0) AS anchor_verified_mkts,
+                COALESCE(SUM(CASE WHEN COALESCE(r.anchor_verified, 0) != 1 THEN 1 ELSE 0 END), 0) AS anchor_unverified_mkts,
+                COALESCE(SUM(CASE
+                    WHEN r.anchor_verified = 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS anchor_verified_net_pnl,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(r.anchor_verified, 0) != 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS anchor_unverified_net_pnl,
                 COALESCE(SUM(CASE
                     WHEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) > 0.000001
                     THEN 1 ELSE 0 END), 0) AS win_mkts,
@@ -536,12 +577,25 @@ class Ledger:
         return {
             "total_fills": total_fills,
             "maker_fills": int(f_row["maker_fills"]),
+            "taker_fills": max(0, total_fills - int(f_row["maker_fills"])),
             "maker_fill_pct": round(100.0 * f_row["maker_fills"] / total_fills, 1) if total_fills else 0.0,
+            "taker_fill_pct": round(100.0 * (total_fills - f_row["maker_fills"]) / total_fills, 1) if total_fills else 0.0,
             "total_notional": round(total_notional, 2),
+            "maker_notional": round(float(f_row["maker_notional"]), 2),
+            "taker_notional": round(max(0.0, total_notional - float(f_row["maker_notional"])), 2),
             "maker_usdc_pct": round(100.0 * f_row["maker_notional"] / total_notional, 1) if total_notional else 0.0,
+            "taker_usdc_pct": round(100.0 * (total_notional - f_row["maker_notional"]) / total_notional, 1) if total_notional else 0.0,
             "total_fees": round(float(f_row["total_fees"]), 4),
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
+            # NULL means no independent RTDS-vs-Gamma verification was available.
+            "anchor_verified_markets": int(r_row["anchor_verified_mkts"]),
+            "anchor_unverified_markets": int(r_row["anchor_unverified_mkts"]),
+            "anchor_verified_rate_pct": round(
+                100.0 * r_row["anchor_verified_mkts"] / resolved_mkts, 1
+            ) if resolved_mkts else 0.0,
+            "anchor_verified_realized_net_pnl": round(float(r_row["anchor_verified_net_pnl"]), 2),
+            "anchor_unverified_realized_net_pnl": round(float(r_row["anchor_unverified_net_pnl"]), 2),
             "win_markets": int(r_row["win_mkts"]),
             "loss_markets": int(r_row["loss_mkts"]),
             "breakeven_markets": int(r_row["breakeven_mkts"]),
@@ -580,6 +634,312 @@ class Ledger:
             "merged_usd": round(float(m_row["merged_usd"]), 2),
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
         }
+
+    def get_session_stats(self, mode: str, since_ts: float) -> Dict[str, Any]:
+        """Stats for markets opened entirely after the current PAPER strategy epoch.
+
+        Historical fills and inherited inventory remain in the accounting ledger,
+        but are excluded from this clean experiment view.
+        """
+        since_ts = max(0.0, float(since_ts))
+        if since_ts <= 0:
+            return {"enabled": False, "reason": "PAPER_STATS_SINCE_TS is not configured"}
+
+        fills = self.conn.execute(
+            """
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            )
+            SELECT COUNT(*) AS total_fills,
+                   COALESCE(SUM(CASE WHEN upper(f.role) LIKE 'MAKER%' THEN 1 ELSE 0 END), 0) AS maker_fills,
+                   COALESCE(SUM(f.notional), 0) AS notional,
+                   COALESCE(SUM(f.fee), 0) AS fees
+            FROM fills f
+            JOIN eligible e ON e.mode = f.mode AND e.slug = f.slug
+            WHERE f.mode = ?
+            """,
+            (mode, since_ts, mode),
+        ).fetchone()
+
+        completed = self.conn.execute(
+            """
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            ),
+            fill_stats AS (
+                SELECT f.mode, f.slug, SUM(f.fee) AS fees,
+                       SUM(CASE WHEN lower(f.outcome) IN ('up','yes') THEN f.shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(f.outcome) IN ('down','no') THEN f.shares ELSE 0 END) AS down_shares
+                FROM fills f JOIN eligible e ON e.mode=f.mode AND e.slug=f.slug
+                GROUP BY f.mode, f.slug
+            ),
+            merge_stats AS (
+                SELECT m.mode, m.slug, SUM(m.pairs) AS pairs,
+                       SUM(m.locked_pnl) AS pnl, MAX(m.ts) AS last_ts
+                FROM merges m JOIN eligible e ON e.mode=m.mode AND e.slug=m.slug
+                GROUP BY m.mode, m.slug
+            ),
+            finished AS (
+                SELECT r.mode, r.slug, r.ts,
+                       r.gross_pnl + COALESCE(m.pnl,0) - COALESCE(f.fees,0) AS net_pnl
+                FROM resolutions r JOIN eligible e ON e.mode=r.mode AND e.slug=r.slug
+                LEFT JOIN merge_stats m ON m.mode=r.mode AND m.slug=r.slug
+                LEFT JOIN fill_stats f ON f.mode=r.mode AND f.slug=r.slug
+                UNION ALL
+                SELECT m.mode, m.slug, m.last_ts,
+                       m.pnl - COALESCE(f.fees,0) AS net_pnl
+                FROM merge_stats m JOIN fill_stats f ON f.mode=m.mode AND f.slug=m.slug
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM resolutions r WHERE r.mode=m.mode AND r.slug=m.slug
+                )
+                  AND ABS(f.up_shares-m.pairs) <= 0.0001
+                  AND ABS(f.down_shares-m.pairs) <= 0.0001
+            )
+            SELECT COUNT(*) AS completed,
+                   COALESCE(SUM(CASE WHEN net_pnl > 0.000001 THEN 1 ELSE 0 END),0) AS wins,
+                   COALESCE(SUM(CASE WHEN net_pnl < -0.000001 THEN 1 ELSE 0 END),0) AS losses,
+                   COALESCE(SUM(net_pnl),0) AS net_pnl
+            FROM finished WHERE mode = ?
+            """,
+            (mode, since_ts, mode),
+        ).fetchone()
+
+        anchor_stats = self.conn.execute(
+            """
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            ),
+            merge_stats AS (
+                SELECT mode, slug, SUM(locked_pnl) AS merge_pnl
+                FROM merges
+                GROUP BY mode, slug
+            ),
+            fee_stats AS (
+                SELECT mode, slug, SUM(fee) AS fees
+                FROM fills
+                GROUP BY mode, slug
+            )
+            SELECT
+                COUNT(*) AS resolved_markets,
+                COALESCE(SUM(CASE WHEN r.anchor_verified = 1 THEN 1 ELSE 0 END), 0) AS verified_markets,
+                COALESCE(SUM(CASE WHEN COALESCE(r.anchor_verified, 0) != 1 THEN 1 ELSE 0 END), 0) AS unverified_markets,
+                COALESCE(SUM(CASE
+                    WHEN r.anchor_verified = 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS verified_net_pnl,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(r.anchor_verified, 0) != 1
+                    THEN r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0)
+                    ELSE 0 END), 0) AS unverified_net_pnl
+            FROM resolutions r
+            JOIN eligible e ON e.mode = r.mode AND e.slug = r.slug
+            LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
+            LEFT JOIN fee_stats f ON f.mode = r.mode AND f.slug = r.slug
+            WHERE r.mode = ?
+            """,
+            (mode, since_ts, mode),
+        ).fetchone()
+
+        total = int(fills["total_fills"] or 0)
+        maker = int(fills["maker_fills"] or 0)
+        return {
+            "enabled": True,
+            "since_ts": since_ts,
+            "total_fills": total,
+            "maker_fills": maker,
+            "maker_fill_pct": round(100.0 * maker / total, 1) if total else 0.0,
+            "notional": round(float(fills["notional"] or 0.0), 2),
+            "fees": round(float(fills["fees"] or 0.0), 4),
+            "completed_markets": int(completed["completed"] or 0),
+            "winning_markets": int(completed["wins"] or 0),
+            "losing_markets": int(completed["losses"] or 0),
+            "realized_net_pnl": round(float(completed["net_pnl"] or 0.0), 2),
+            "resolved_markets_with_anchor_audit": int(anchor_stats["resolved_markets"] or 0),
+            "anchor_verified_markets": int(anchor_stats["verified_markets"] or 0),
+            "anchor_unverified_markets": int(anchor_stats["unverified_markets"] or 0),
+            "anchor_verified_realized_net_pnl": round(float(anchor_stats["verified_net_pnl"] or 0.0), 2),
+            "anchor_unverified_realized_net_pnl": round(float(anchor_stats["unverified_net_pnl"] or 0.0), 2),
+            "pnl_scope": "only markets whose first fill is at/after session start; open markets excluded",
+        }
+
+    def get_timeframe_stats(self, mode: str) -> List[Dict[str, Any]]:
+        """Return fee-adjusted PAPER performance, execution mix and residual inventory by timeframe.
+
+        Completed-market PnL excludes partial MERGEs until the residual inventory is
+        resolved or fully merged. Fill legs are counted separately from markets.
+        """
+        fill_rows = self.conn.execute(
+            """
+            SELECT timeframe,
+                   COUNT(*) AS total_fills,
+                   SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN 1 ELSE 0 END) AS maker_fills,
+                   SUM(CASE WHEN upper(role) NOT LIKE 'MAKER%' THEN 1 ELSE 0 END) AS taker_fills,
+                   SUM(CASE WHEN upper(role) LIKE 'MAKER%' THEN notional ELSE 0 END) AS maker_notional,
+                   SUM(CASE WHEN upper(role) NOT LIKE 'MAKER%' THEN notional ELSE 0 END) AS taker_notional,
+                   SUM(notional) AS total_notional,
+                   SUM(fee) AS fees
+            FROM fills
+            WHERE mode = ?
+            GROUP BY timeframe
+            """,
+            (mode,),
+        ).fetchall()
+
+        completed_rows = self.conn.execute(
+            """
+            WITH merge_stats AS (
+                SELECT mode, slug, SUM(pairs) AS merged_pairs,
+                       SUM(locked_pnl) AS merge_pnl
+                FROM merges
+                GROUP BY mode, slug
+            ),
+            fill_stats AS (
+                SELECT mode, slug, MAX(timeframe) AS timeframe,
+                       SUM(fee) AS fees,
+                       SUM(CASE WHEN lower(outcome) IN ('up', 'yes') THEN shares ELSE 0 END) AS up_shares,
+                       SUM(CASE WHEN lower(outcome) IN ('down', 'no') THEN shares ELSE 0 END) AS down_shares
+                FROM fills
+                GROUP BY mode, slug
+            ),
+            completed AS (
+                SELECT r.timeframe, r.slug,
+                       r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS net_pnl
+                FROM resolutions r
+                LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
+                LEFT JOIN fill_stats f ON f.mode = r.mode AND f.slug = r.slug
+                WHERE r.mode = ?
+                UNION ALL
+                SELECT f.timeframe, m.slug,
+                       m.merge_pnl - COALESCE(f.fees, 0) AS net_pnl
+                FROM merge_stats m
+                JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
+                WHERE m.mode = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolutions r
+                      WHERE r.mode = m.mode AND r.slug = m.slug
+                  )
+                  AND ABS(f.up_shares - m.merged_pairs) <= 0.0001
+                  AND ABS(f.down_shares - m.merged_pairs) <= 0.0001
+            )
+            SELECT timeframe, COUNT(*) AS completed_markets,
+                   SUM(CASE WHEN net_pnl > 0.000001 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN net_pnl < -0.000001 THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN ABS(net_pnl) <= 0.000001 THEN 1 ELSE 0 END) AS breakeven,
+                   SUM(net_pnl) AS realized_net_pnl
+            FROM completed
+            GROUP BY timeframe
+            """,
+            (mode, mode),
+        ).fetchall()
+
+        merge_rows = self.conn.execute(
+            """
+            SELECT f.timeframe, COUNT(*) AS merge_count,
+                   SUM(m.pairs) AS merged_pairs,
+                   SUM(m.locked_pnl) AS merge_gross_pnl
+            FROM merges m
+            JOIN (
+                SELECT mode, slug, MAX(timeframe) AS timeframe
+                FROM fills
+                GROUP BY mode, slug
+            ) f ON f.mode = m.mode AND f.slug = m.slug
+            WHERE m.mode = ?
+            GROUP BY f.timeframe
+            """,
+            (mode,),
+        ).fetchall()
+
+        by_timeframe: Dict[str, Dict[str, Any]] = {}
+
+        def bucket(timeframe: Any) -> Dict[str, Any]:
+            key = str(timeframe or "unknown")
+            if key not in by_timeframe:
+                by_timeframe[key] = {
+                    "timeframe": key,
+                    "total_fills": 0, "maker_fills": 0, "taker_fills": 0,
+                    "maker_notional": 0.0, "taker_notional": 0.0,
+                    "total_notional": 0.0, "fees": 0.0,
+                    "merge_count": 0, "merged_pairs": 0.0, "merge_gross_pnl": 0.0,
+                    "completed_markets": 0, "wins": 0, "losses": 0,
+                    "breakeven": 0, "realized_net_pnl": 0.0,
+                    "open_markets": 0, "open_up_shares": 0.0,
+                    "open_down_shares": 0.0, "open_inventory_cost": 0.0,
+                    "open_fees": 0.0,
+                }
+            return by_timeframe[key]
+
+        for row in fill_rows:
+            target = bucket(row["timeframe"])
+            for key in ("total_fills", "maker_fills", "taker_fills"):
+                target[key] = int(row[key] or 0)
+            for key in ("maker_notional", "taker_notional", "total_notional", "fees"):
+                target[key] = float(row[key] or 0)
+        for row in completed_rows:
+            target = bucket(row["timeframe"])
+            for key in ("completed_markets", "wins", "losses", "breakeven"):
+                target[key] = int(row[key] or 0)
+            target["realized_net_pnl"] = float(row["realized_net_pnl"] or 0)
+        for row in merge_rows:
+            target = bucket(row["timeframe"])
+            target["merge_count"] = int(row["merge_count"] or 0)
+            target["merged_pairs"] = float(row["merged_pairs"] or 0)
+            target["merge_gross_pnl"] = float(row["merge_gross_pnl"] or 0)
+
+        for position in self.open_positions(mode):
+            target = bucket(position["timeframe"])
+            target["open_markets"] += 1
+            target["open_up_shares"] += float(position["up_shares"] or 0)
+            target["open_down_shares"] += float(position["down_shares"] or 0)
+            target["open_inventory_cost"] += (
+                float(position["up_cost"] or 0) + float(position["down_cost"] or 0)
+            )
+            target["open_fees"] += (
+                float(position["up_fees"] or 0) + float(position["down_fees"] or 0)
+            )
+
+        result = []
+        for target in by_timeframe.values():
+            total_fills = int(target["total_fills"])
+            total_notional = float(target["total_notional"])
+            target["maker_fill_pct"] = round(
+                100.0 * int(target["maker_fills"]) / total_fills, 1
+            ) if total_fills else 0.0
+            target["maker_notional_pct"] = round(
+                100.0 * float(target["maker_notional"]) / total_notional, 1
+            ) if total_notional else 0.0
+            target["win_rate_pct"] = round(
+                100.0 * int(target["wins"]) / int(target["completed_markets"]), 1
+            ) if target["completed_markets"] else 0.0
+            for key in (
+                "maker_notional", "taker_notional", "total_notional", "fees",
+                "merged_pairs", "merge_gross_pnl", "realized_net_pnl",
+                "open_up_shares", "open_down_shares", "open_inventory_cost", "open_fees",
+            ):
+                target[key] = round(float(target[key]), 4 if key in ("fees", "open_fees") else 2)
+            # Keep the displayed Maker + Taker amounts equal to the displayed
+            # total after cent rounding; independently rounding all three can
+            # otherwise create a misleading one-cent discrepancy.
+            target["taker_notional"] = round(
+                max(0.0, float(target["total_notional"]) - float(target["maker_notional"])), 2
+            )
+            result.append(target)
+
+        return sorted(
+            result,
+            key=lambda item: ({"5m": 0, "15m": 1}.get(item["timeframe"], 2), item["timeframe"]),
+        )
 
     def open_positions(self, mode: str) -> List[Dict[str, Any]]:
         """Rebuild residual PAPER inventory from persisted fills, merges and resolutions."""
@@ -674,6 +1034,66 @@ class Ledger:
             "day_net_pnl": float(stats.get("today_total_net_pnl", 0.0)),
         }
 
+
+    def reset_paper_history(self, mode: str = "paper") -> Dict[str, Any]:
+        """Back up the SQLite ledger, then clear one simulated account atomically.
+
+        The backup is a durable sibling file on the same Railway volume. This
+        operation is intended only for an explicit PAPER experiment reset.
+        """
+        if str(mode).lower() != "paper":
+            raise ValueError("Only the PAPER ledger can be reset")
+
+        backup_path = f"{self.db_path}.pre-reset-{time.time_ns()}.sqlite3"
+        backup = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(backup)
+            integrity = backup.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise RuntimeError("Pre-reset backup failed SQLite integrity_check")
+            backup.commit()
+        except Exception:
+            backup.close()
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                pass
+            raise
+        else:
+            backup.close()
+
+        tables = ("fills", "merges", "resolutions", "anchor_checks", "equity_points")
+        deleted: Dict[str, int] = {}
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            for table in tables:
+                count = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE mode = ?", (mode,)
+                ).fetchone()[0]
+                deleted[table] = int(count)
+                self.conn.execute(f"DELETE FROM {table} WHERE mode = ?", (mode,))
+            deleted["telegram_outbox"] = int(
+                self.conn.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0]
+            )
+            self.conn.execute("DELETE FROM telegram_outbox")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+        remaining = {
+            table: int(self.conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE mode = ?", (mode,)
+            ).fetchone()[0])
+            for table in tables
+        }
+        remaining["telegram_outbox"] = int(
+            self.conn.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0]
+        )
+        if any(remaining.values()) or self.open_positions(mode):
+            raise RuntimeError(f"PAPER reset verification failed: {remaining}")
+        return {"backup_path": backup_path, "deleted": deleted, "remaining": remaining}
+
     def fees_for_market(self, mode: str, slug: str) -> float:
         row = self.conn.execute(
             "SELECT COALESCE(SUM(fee), 0) AS fees FROM fills WHERE mode = ? AND slug = ?",
@@ -681,11 +1101,18 @@ class Ledger:
         ).fetchone()
         return float(row["fees"] or 0.0)
 
-    def consecutive_net_losses(self, mode: str) -> int:
-        """Count consecutive completed market losses, including fully merged markets."""
+    def consecutive_net_losses(self, mode: str, since_ts: float = 0.0) -> int:
+        """Count consecutive completed losses whose first fill belongs to this session."""
         rows = self.conn.execute(
             """
-            WITH merge_stats AS (
+            WITH eligible AS (
+                SELECT mode, slug
+                FROM fills
+                WHERE mode = ?
+                GROUP BY mode, slug
+                HAVING MIN(ts) >= ?
+            ),
+            merge_stats AS (
                 SELECT mode, slug, SUM(pairs) AS merged_pairs,
                        SUM(locked_pnl) AS merge_pnl, MAX(ts) AS merge_ts
                 FROM merges GROUP BY mode, slug
@@ -700,12 +1127,14 @@ class Ledger:
                 SELECT r.mode, r.slug, r.ts,
                        r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS market_net_pnl
                 FROM resolutions r
+                JOIN eligible e ON e.mode = r.mode AND e.slug = r.slug
                 LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
                 LEFT JOIN fill_stats f ON f.mode = r.mode AND f.slug = r.slug
                 UNION ALL
                 SELECT m.mode, m.slug, m.merge_ts AS ts,
                        m.merge_pnl - COALESCE(f.fees, 0) AS market_net_pnl
                 FROM merge_stats m
+                JOIN eligible e ON e.mode = m.mode AND e.slug = m.slug
                 JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
                 WHERE NOT EXISTS (
                     SELECT 1 FROM resolutions r
@@ -719,7 +1148,7 @@ class Ledger:
             WHERE mode = ?
             ORDER BY ts DESC, slug DESC
             """,
-            (mode,),
+            (mode, since_ts, mode),
         ).fetchall()
         count = 0
         for row in rows:

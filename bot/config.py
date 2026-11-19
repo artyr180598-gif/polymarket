@@ -17,13 +17,18 @@ class StrategyParams:
     title_ru: str
     description_ru: str
 
-    # Engine 1: @mo-money Post-Only Maker + Synthetic BUY-Opposite TP/SL + MERGE
+    # Engine 1: @mo-money-style Post-Only Maker + profitable opposite-side completion + MERGE
     enable_maker: bool = False
     min_maker_edge: float = 0.025
     maker_min_size: float = 5.0
     maker_min_price: float = 0.03
     maker_max_price: float = 0.95
     maker_start_sec: float = 6.0
+    # Minimum resting age before repricing a still-valid Maker order.
+    maker_min_requote_sec: float = 10.0
+    # Maker entries are pair-first; unmatched inventory is deliberately small.
+    maker_pair_max_cost: float = 0.985
+    maker_max_unpaired_shares: float = 5.0
     take_profit_edge: float = 0.015
     stop_loss_drop: float = 0.12
     stop_loss_min_remain_sec: float = 30.0
@@ -39,6 +44,9 @@ class StrategyParams:
 
     # Engine 3: Selective Taker (sniper)
     enable_taker: bool = False
+    # Directional Taker entries remain off until the fair-value model is calibrated.
+    # Profitable paired completion / MERGE paths are controlled separately.
+    enable_directional_taker: bool = False
     min_taker_net_edge_btc: float = 0.038
     min_taker_net_edge_alt: float = 0.024
     taker_min_price: float = 0.45
@@ -53,15 +61,19 @@ PRESETS: Dict[str, StrategyParams] = {
         title_ru="PAPER-прототип по mo-money (Maker + Taker)",
         description_ru=(
             "PAPER-исследовательский прототип по публичной истории кошелька, не точная копия. "
-            "Maker-заявки моделируются по живому CLOB WebSocket и видимой очереди L2; "
-            "частичные исполнения учитываются. Отмены и риск-лимиты работают. "
-            "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются; "
-            "fair-value модель не откалибрована. Прибыльность не доказана."
+            "Maker-заявки парные: суммарная цена пары ограничена, а незакрытый перекос ограничен 5 акциями; "
+            "частичные исполнения учитываются по live CLOB tape и видимой очереди L2. "
+            "Скрытая очередь, отмены впереди нас и maker-rebates не моделируются. "
+            "Новые пары открываются Maker-котировками; Taker разрешён только для выгодного "
+            "завершения уже существующего перекоса Up/Down. Направленный Taker и Lock-In отключены. "
+            "Прибыльность не доказана."
         ),
         enable_maker=True,
         enable_lockin=False,
         enable_taker=True,
         min_maker_edge=0.024,
+        maker_pair_max_cost=0.985,
+        maker_max_unpaired_shares=5.0,
         min_taker_net_edge_btc=0.040,
         min_taker_net_edge_alt=0.026,
     ),
@@ -95,13 +107,15 @@ class BotConfig:
     trading_mode: str = "paper"
     bankroll_usd: float = 2750.0
     strategy_preset: str = "mo_money"
-    enabled_assets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    enabled_assets: List[str] = field(default_factory=lambda: ["BTC"])
     enabled_timeframes: List[str] = field(default_factory=lambda: ["5m"])
     auto_start: bool = True
+    clob_capture_enabled: bool = False
 
     order_clip_usd: float = 18.0
     max_window_risk_usd: float = 60.0
     max_total_exposure_usd: float = 350.0
+    max_unpaired_exposure_usd: float = 10.0
     max_daily_loss_usd: float = 95.0
     max_consecutive_losses: int = 6
 
@@ -119,6 +133,9 @@ class BotConfig:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     db_path: str = "data/polybot.db"
+    paper_stats_since_ts: float = 0.0
+    paper_reset_once: bool = False
+    paper_reset_id: str = ""
 
     @property
     def params(self) -> StrategyParams:
@@ -151,9 +168,10 @@ class BotConfig:
         if preset not in PRESETS:
             preset = "mo_money"
 
-        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL") if a.upper() in ("BTC", "ETH", "SOL")]
-        if not assets:
-            assets = ["BTC"]
+        # This deployment is intentionally BTC-only. Ignore ENABLED_ASSETS so a
+        # stale Railway value or operator typo cannot silently enable ETH/SOL.
+        # Expand the allowlist only after those markets have separate validation.
+        assets = ["BTC"]
 
         tfs = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m") if t.lower() in ("5m", "15m")]
         if not tfs:
@@ -166,9 +184,14 @@ class BotConfig:
             enabled_assets=assets,
             enabled_timeframes=tfs,
             auto_start=os.getenv("AUTO_START", "true").strip().lower() in ("1", "true", "yes"),
+            clob_capture_enabled=(
+                mode == "paper"
+                and os.getenv("CLOB_CAPTURE_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            ),
             order_clip_usd=max(5.0, float(os.getenv("ORDER_CLIP_USD", "18"))),
             max_window_risk_usd=max(10.0, float(os.getenv("MAX_WINDOW_RISK_USD", "60"))),
             max_total_exposure_usd=max(25.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "350"))),
+            max_unpaired_exposure_usd=max(0.01, float(os.getenv("MAX_UNPAIRED_EXPOSURE_USD", "10"))),
             max_daily_loss_usd=max(10.0, float(os.getenv("MAX_DAILY_LOSS_USD", "95"))),
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "6"))),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
@@ -185,4 +208,7 @@ class BotConfig:
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             db_path=os.getenv("DB_PATH", "data/polybot.db").strip(),
+            paper_stats_since_ts=max(0.0, float(os.getenv("PAPER_STATS_SINCE_TS", "0") or 0)),
+            paper_reset_once=os.getenv("PAPER_RESET_ONCE", "false").strip().lower() in ("1", "true", "yes"),
+            paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
         )

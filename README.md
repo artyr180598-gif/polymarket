@@ -62,6 +62,7 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 BANKROLL_USD=2750
 STRATEGY_PRESET=mo_money
+MAX_UNPAIRED_EXPOSURE_USD=10
 DB_PATH=/data/polybot.db
 ```
 
@@ -96,7 +97,8 @@ bot/
 
 ## Risk defaults
 
-The configured limits are guardrails for the PAPER prototype, not proof of a profitable strategy. Each limit must be exercised by tests before any live use.
+- `MAX_UNPAIRED_EXPOSURE_USD=10` caps the portfolio-wide cost basis plus entry fees of unmatched inventory, together with the notional reserved by outstanding Maker buy orders. The cap is enforced before Maker quotes and Taker additions; opposite-side completion can reduce the unmatched amount.
+- The configured limits are guardrails for the PAPER prototype, not proof of a profitable strategy. Each limit must be exercised by tests before any live use.
 
 ## Validation
 

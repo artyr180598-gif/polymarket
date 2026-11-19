@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from bot.config import BotConfig
-from bot.engine import TradingEngine, WindowState, _select_closed_gamma_strike
+from bot.engine import TradingEngine, WindowState, _clob_timestamp_seconds, _paper_reset_marker_path, _select_closed_gamma_strike
 
 
 def test_expired_window_reports_negative_remaining_time(monkeypatch) -> None:
@@ -165,13 +165,158 @@ def test_maker_quote_joins_live_book_post_only_and_reserves_cash(tmp_path) -> No
         "recv_mono": time.monotonic(),
     }
 
+    engine._market_books["down-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.99, fair_down=0.01))
+
+    up_orders = engine.executor.get_open_orders("up-token")
+    down_orders = engine.executor.get_open_orders("down-token")
+    assert len(up_orders) == len(down_orders) == 1
+    assert up_orders[0].price == down_orders[0].price == 0.40
+    assert up_orders[0].size == down_orders[0].size == 5.0
+    assert engine.executor.cash == 100.0 - 0.40 * 10.0
+    assert any(f"slug={window.slug}" in event for event in engine.events)
+    engine.ledger.conn.close()
+
+
+def test_maker_pair_quotes_reject_combined_cost_above_limit(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-cost-filter.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-pair-cost-filter",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "2" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0}, "asks": {0.45: 20.0},
+        "best_bid": 0.40, "best_ask": 0.45,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+    engine._market_books["down-token"] = {
+        "bids": {0.59: 10.0}, "asks": {0.64: 20.0},
+        "best_bid": 0.59, "best_ask": 0.64,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+
+    # Even a strongly directional fair-value estimate cannot open one leg.
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.99, fair_down=0.01))
+
+    assert engine.executor.get_open_orders("up-token") == []
+    assert engine.executor.get_open_orders("down-token") == []
+    engine.ledger.conn.close()
+
+
+def test_maker_pair_quotes_only_the_opposite_leg_for_unpaired_inventory(tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-completion-maker.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-pair-completion-maker",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "3" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=100_000.0,
+        up_shares=5.0,
+        up_cost=3.0,
+    )
+    engine.windows[window.slug] = window
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0}, "asks": {0.45: 20.0},
+        "best_bid": 0.40, "best_ask": 0.45,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+    engine._market_books["down-token"] = {
+        "bids": {0.37: 10.0}, "asks": {0.42: 20.0},
+        "best_bid": 0.37, "best_ask": 0.42,
+        "tick_size": 0.01, "recv_mono": time.monotonic(),
+    }
+
+    # Existing Up cost is $0.60/share; Down at $0.37 keeps pair cost at $0.97.
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.01, fair_down=0.99))
+
+    assert engine.executor.get_open_orders("up-token") == []
+    down_orders = engine.executor.get_open_orders("down-token")
+    assert len(down_orders) == 1
+    assert down_orders[0].price == 0.37
+    assert down_orders[0].size == 5.0
+    engine.ledger.conn.close()
+
+
+def test_maker_quotes_are_not_created_without_settlement_anchor(tmp_path, caplog) -> None:
+    from bot.execution import PaperExecutor
+
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "missing-anchor.db"),
+    )
+    engine = TradingEngine(cfg)
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    import logging
+    caplog.set_level(logging.INFO, logger="bot.engine")
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-missing-anchor",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 10,
+        end_ts=now + 290,
+        price_to_beat=None,
+    )
+    engine._market_books["up-token"] = {
+        "bids": {0.40: 10.0},
+        "asks": {0.45: 20.0},
+        "best_bid": 0.40,
+        "best_ask": 0.45,
+        "tick_size": 0.01,
+        "recv_mono": time.monotonic(),
+    }
+
     asyncio.run(engine._update_maker_quotes(window, fair_up=0.60, fair_down=0.40))
 
-    orders = engine.executor.get_open_orders("up-token")
-    assert len(orders) == 1
-    assert orders[0].price == 0.41
-    assert orders[0].size == 12.0
-    assert engine.executor.cash == 100.0 - 0.41 * 12.0
+    assert engine.executor.get_open_orders("up-token") == []
+    assert "reason=missing_settlement_anchor" in caplog.text
+    engine.ledger.conn.close()
 
 
 def test_maker_quotes_are_not_created_without_live_clob_feed(tmp_path) -> None:
@@ -342,6 +487,174 @@ def test_resume_refuses_to_bypass_daily_loss_limit(tmp_path) -> None:
 
 
 
+def test_delayed_anchor_mismatch_halts_after_gamma_metadata_arrives(monkeypatch, tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "delayed-anchor-mismatch.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 100.0)
+    slug = "btc-updown-5m-delayed-anchor"
+    engine.ledger.record_resolution(
+        mode="paper",
+        slug=slug,
+        condition_id="0x" + "6" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100_000.0,
+        final_price=100_010.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+        gamma_price_to_beat=None,
+        anchor_delta=None,
+        anchor_verified=None,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+
+    async def fake_gamma(requested_slug: str):
+        assert requested_slug == slug
+        return {"price_to_beat": 100_000.02}
+
+    engine._gamma = fake_gamma  # type: ignore[method-assign]
+    asyncio.run(engine._reconcile_pending_anchors())
+
+    row = engine.ledger.recent_resolutions("paper", 1)[0]
+    assert row["anchor_verified"] == 0
+    assert abs(row["anchor_delta"] - 0.02) < 1e-9
+    assert row["net_pnl"] == 3.0
+    assert engine.paused is True
+    assert engine._risk_halt_active is True
+    assert "Chainlink/Gamma settlement-anchor mismatch" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
+def test_unresolved_official_result_is_logged_and_not_booked(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "resolution-pending.db"),
+    ))
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 100.0)
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def json(self):
+            return {"data": []}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def get(self, url):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "bot.engine.aiohttp.ClientSession",
+        lambda **kwargs: FakeSession(),
+    )
+    window = WindowState(
+        slug="btc-updown-5m-resolution-pending",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "7" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=time.time() - 400,
+        end_ts=time.time() - 100,
+        price_to_beat=100_000.0,
+        price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+    )
+    window.up_shares = 0.01
+    window.up_cost = 0.01
+
+    asyncio.run(engine._resolve(window))
+
+    assert window.resolved is False
+    assert window.up_shares == 0.01
+    assert engine.ledger.recent_resolutions("paper", 10) == []
+    assert any(
+        "PAPER resolution pending" in event and "no_resolution_rows" in event
+        for event in engine.events
+    )
+    engine.ledger.conn.close()
+
+
+def test_risk_guard_counts_only_losses_started_in_current_paper_session(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "session-risk-guard.db"),
+        paper_stats_since_ts=200.0,
+        max_consecutive_losses=2,
+        max_daily_loss_usd=1_000.0,
+    ))
+
+    def add_loss(slug: str, fill_ts: float) -> None:
+        engine.ledger.record_fill(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "8" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome="Up",
+            role="TAKER_CLOB",
+            reason="risk-guard-session-test",
+            shares=1.0,
+            price=1.0,
+            fee=0.10,
+            fair_prob=0.5,
+            ts=fill_ts,
+        )
+        engine.ledger.record_resolution(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "8" * 64,
+            asset="BTC",
+            timeframe="5m",
+            winner="Down",
+            price_to_beat=100_000.0,
+            final_price=99_999.0,
+            price_to_beat_source="rtds.chainlink_twap60.near_exact_window_start",
+            gamma_price_to_beat=100_000.0,
+            anchor_delta=0.0,
+            anchor_verified=True,
+            up_shares_total=1.0,
+            down_shares_total=0.0,
+            merged_pairs=0.0,
+            gross_cost=1.0,
+            total_fees=0.10,
+            total_payout=0.0,
+        )
+
+    add_loss("old-session-loss-1", 100.0)
+    add_loss("old-session-loss-2", 150.0)
+    add_loss("new-session-loss-1", 300.0)
+    add_loss("new-session-loss-2", 400.0)
+
+    assert engine._risk_halted() is True
+    assert engine.consecutive_losses == 2
+    assert "2/2" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
 def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],
@@ -385,52 +698,6 @@ def test_discovery_rehydrates_expired_open_position_metadata(monkeypatch, tmp_pa
     engine.ledger.conn.close()
 
 
-def test_atomic_pair_entry_debits_engine_and_executor_cash_once(tmp_path) -> None:
-    from bot.execution import PaperExecutor
-
-    cfg = BotConfig(
-        enabled_assets=["BTC"],
-        enabled_timeframes=["5m"],
-        db_path=str(tmp_path / "pair-cash.db"),
-    )
-    engine = TradingEngine(cfg)
-    engine.executor = PaperExecutor(100.0)
-    engine.cash = 100.0
-    window = WindowState(
-        slug="btc-updown-5m-pair-cash",
-        asset="BTC",
-        timeframe="5m",
-        condition_id="0x" + "5" * 64,
-        up_token="up-token",
-        down_token="down-token",
-        start_ts=time.time(),
-        end_ts=time.time() + 300,
-        price_to_beat=100_000.0,
-    )
-    engine.windows[window.slug] = window
-
-    opened = asyncio.run(engine._open_pair(
-        window,
-        price_up=0.40,
-        price_down=0.50,
-        size=10.0,
-        fee_up=0.10,
-        fee_down=0.10,
-        fair_up=0.60,
-        fair_down=0.40,
-    ))
-
-    assert opened is True
-    expected_cash = 100.0 - (10.0 * (0.40 + 0.50) + 0.20)
-    assert engine.cash == expected_cash
-    assert engine.executor.cash == expected_cash
-    assert window.up_shares == 10.0
-    assert window.down_shares == 10.0
-    assert len([row for row in engine.ledger.recent_fills("paper", limit=10) if row["slug"] == window.slug]) == 2
-    assert len(engine.ledger.pending_telegram_notifications()) == 1
-    engine.ledger.conn.close()
-
-
 def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path) -> None:
     engine = TradingEngine(BotConfig(
         enabled_assets=["BTC"],
@@ -442,4 +709,952 @@ def test_resume_refuses_when_trade_notification_channel_is_unavailable(tmp_path)
     assert engine.resume() is False
     assert engine.paused is True
     assert "Telegram delivery is not initialized" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
+
+def test_notification_recovery_resumes_only_notification_caused_pause(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "notification-recovery.db"),
+    ))
+    engine.running = True
+    engine._notification_channel_ready = False
+    engine.pause(reason="telegram_delivery", notify=False)
+    engine._notification_channel_ready = True
+
+    assert engine.resume_after_notification_recovery() is True
+    assert engine.paused is False
+    assert engine._pause_reason == ""
+    engine.ledger.conn.close()
+
+
+def test_notification_recovery_does_not_clear_manual_pause(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "manual-pause-preserved.db"),
+    ))
+    engine.running = True
+    engine.pause(reason="manual", notify=False)
+    engine._notification_channel_ready = True
+
+    assert engine.resume_after_notification_recovery() is False
+    assert engine.paused is True
+    assert engine._pause_reason == "manual"
+    engine.ledger.conn.close()
+
+
+def test_notification_recovery_does_not_bypass_risk_halt(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "risk-pause-preserved.db"),
+    ))
+    engine.running = True
+    engine._notification_channel_ready = False
+    engine.pause(reason="telegram_delivery", notify=False)
+    engine._notification_channel_ready = True
+    engine._risk_halted = lambda: True
+    engine._risk_halt_reason = "test risk halt"
+
+    assert engine.resume_after_notification_recovery() is False
+    assert engine.paused is True
+    assert engine._pause_reason == "risk"
+    engine.ledger.conn.close()
+
+
+def test_oracle_diagnostics_report_source_age_and_observed_twap_cadence(monkeypatch, tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "oracle-diagnostics.db"),
+    )
+    engine = TradingEngine(cfg)
+    tracker = engine.trackers["BTC"]
+    tracker.cl_spot = 100_000.0
+    tracker.cl_spot_ts = 1_000.0
+    tracker.cl_recv_mono = 50.0
+    tracker.cl_twap60 = 100_001.0
+    tracker.cl_twap60_ts = 998.0
+    tracker.cl_twap_recv_mono = 48.0
+    engine._oracle_metrics["BTC"]["chainlink_twap60"].update({
+        "count": 12,
+        "last_gap_sec": 2.0,
+        "max_gap_sec": 4.0,
+        "stale_rejected": 3,
+    })
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_003.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 53.0)
+
+    diagnostics = engine._oracle_diagnostics()["BTC"]
+
+    assert diagnostics["spot"]["source_age_sec"] == 3.0
+    assert diagnostics["spot"]["receive_age_sec"] == 3.0
+    assert diagnostics["twap60"]["source_age_sec"] == 5.0
+    assert diagnostics["twap60"]["receive_age_sec"] == 5.0
+    assert diagnostics["twap60"]["event_count"] == 12
+    assert diagnostics["twap60"]["last_gap_sec"] == 2.0
+    assert diagnostics["twap60"]["max_gap_sec"] == 4.0
+    assert diagnostics["twap60"]["stale_rejected"] == 3
+    engine.ledger.conn.close()
+
+
+def test_oracle_freshness_remains_fail_closed_at_five_seconds(monkeypatch, tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "oracle-freshness.db"),
+    )
+    engine = TradingEngine(cfg)
+    tracker = engine.trackers["BTC"]
+    tracker.cl_spot = 100_000.0
+    tracker.cl_spot_ts = 1_000.0
+    tracker.cl_recv_mono = 50.0
+    tracker.cl_twap60 = 100_001.0
+    tracker.cl_twap60_ts = 1_000.0
+    tracker.cl_twap_recv_mono = 50.0
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_005.1)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 55.1)
+
+    assert engine._oracle_fresh() is False
+    engine.ledger.conn.close()
+
+
+def test_btc_only_readiness_ignores_legacy_disabled_asset_tracker(monkeypatch, tmp_path) -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "btc-only.db"),
+    ))
+    btc = engine.trackers["BTC"]
+    btc.cl_spot = 100_000.0
+    btc.cl_spot_ts = 1_000.0
+    btc.cl_recv_mono = 50.0
+    btc.cl_twap60 = 100_001.0
+    btc.cl_twap60_ts = 1_000.0
+    btc.cl_twap_recv_mono = 50.0
+    engine.trackers["ETH"] = AssetPriceTracker("ETH")
+
+    monkeypatch.setattr("bot.engine.time.time", lambda: 1_002.0)
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: 52.0)
+
+    assert engine._oracle_fresh() is True
+    assert list(engine._oracle_diagnostics()) == ["BTC"]
+    engine.ledger.conn.close()
+
+
+def test_directional_taker_entries_are_disabled_until_model_calibration(tmp_path) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "directional-taker-off.db"),
+    ))
+    engine.params = replace(
+        engine.params,
+        enable_maker=False,
+        enable_taker=True,
+        enable_directional_taker=False,
+    )
+
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.90)
+
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-directional-off",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "7" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 30,
+        end_ts=now + 270,
+        price_to_beat=100_000.0,
+        fee_rate=0.0,
+    )
+    opened = []
+
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+
+    async def ask_info(token):
+        return (0.50, 100.0)
+
+    async def record_open(*args, **kwargs):
+        opened.append((args, kwargs))
+
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+    engine._open = record_open
+
+    asyncio.run(engine._run(window))
+
+    assert opened == []
+    engine.ledger.conn.close()
+
+
+def test_taker_does_not_open_a_fresh_balanced_pair(tmp_path) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "taker-no-new-pair.db"),
+    ))
+    engine.params = replace(
+        engine.params,
+        enable_maker=False,
+        enable_taker=True,
+        enable_directional_taker=False,
+    )
+
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.50)
+
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-taker-no-new-pair",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "a" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 30,
+        end_ts=now + 270,
+        price_to_beat=100_000.0,
+        fee_rate=0.0,
+    )
+    engine.windows[window.slug] = window
+
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+
+    async def ask_info(token):
+        return (0.40, 100.0) if token == "up-token" else (0.50, 100.0)
+
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+
+    cash_before = engine.cash
+    asyncio.run(engine._run(window))
+
+    assert window.up_shares == 0.0
+    assert window.down_shares == 0.0
+    assert engine.cash == cash_before
+    assert engine.ledger.recent_fills("paper", limit=10) == []
+    engine.ledger.conn.close()
+
+
+def test_profitable_pair_completion_remains_available_when_directional_taker_is_off(tmp_path) -> None:
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "pair-completion-on.db"),
+    ))
+    engine.params = replace(
+        engine.params,
+        enable_maker=False,
+        enable_taker=True,
+        enable_directional_taker=False,
+    )
+
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.90)
+
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-pair-completion",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "8" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=now - 30,
+        end_ts=now + 270,
+        price_to_beat=100_000.0,
+        fee_rate=0.0,
+        up_shares=10.0,
+        up_cost=4.0,
+    )
+    opened = []
+
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+
+    async def ask_info(token):
+        return (0.50, 100.0) if token == "down-token" else (None, 0.0)
+
+    async def record_open(*args, **kwargs):
+        opened.append((args, kwargs))
+
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+    engine._open = record_open
+
+    asyncio.run(engine._run(window))
+
+    assert len(opened) == 1
+    assert opened[0][0][1] == "Down"
+    assert opened[0][0][4] == "syn_tp"
+    engine.ledger.conn.close()
+
+
+def test_clean_session_stats_exclude_pre_session_markets(tmp_path) -> None:
+    from bot.ledger import Ledger
+
+    ledger = Ledger(str(tmp_path / "session-stats.db"))
+    start = 2_000_000_000.0
+    common = {
+        "mode": "paper",
+        "condition_id": "0x" + "9" * 64,
+        "asset": "BTC",
+        "timeframe": "5m",
+        "reason": "test",
+        "price": 0.40,
+        "fee": 0.0,
+        "fair_prob": 0.60,
+    }
+    ledger.record_fill(
+        slug="btc-updown-5m-old",
+        outcome="Up",
+        role="MAKER",
+        shares=5.0,
+        ts=start - 10,
+        **common,
+    )
+    ledger.record_resolution(
+        mode="paper",
+        slug="btc-updown-5m-old",
+        condition_id=common["condition_id"],
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100_000.0,
+        final_price=100_001.0,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+    ledger.record_fill(
+        slug="btc-updown-5m-new",
+        outcome="Up",
+        role="MAKER",
+        shares=5.0,
+        ts=start + 10,
+        **{**common, "condition_id": "0x" + "a" * 64},
+    )
+    ledger.record_resolution(
+        mode="paper",
+        slug="btc-updown-5m-new",
+        condition_id="0x" + "a" * 64,
+        asset="BTC",
+        timeframe="5m",
+        winner="Up",
+        price_to_beat=100_000.0,
+        final_price=100_001.0,
+        up_shares_total=5.0,
+        down_shares_total=0.0,
+        merged_pairs=0.0,
+        gross_cost=2.0,
+        total_fees=0.0,
+        total_payout=5.0,
+    )
+
+    stats = ledger.get_session_stats("paper", start)
+    assert stats["enabled"] is True
+    assert stats["total_fills"] == 1
+    assert stats["maker_fills"] == 1
+    assert stats["maker_fill_pct"] == 100.0
+    assert stats["completed_markets"] == 1
+    assert stats["realized_net_pnl"] == 3.0
+    ledger.conn.close()
+
+
+def test_config_defaults_to_btc_only(monkeypatch) -> None:
+    from bot.config import BotConfig
+
+    monkeypatch.delenv("ENABLED_ASSETS", raising=False)
+    cfg = BotConfig.from_env(env_file="/nonexistent/polybot-test.env")
+    assert cfg.enabled_assets == ["BTC"]
+
+
+def test_oracle_fresh_fails_closed_when_no_assets_are_enabled(tmp_path) -> None:
+    from bot.twap_model import AssetPriceTracker
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=[],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "empty-assets.db"),
+    ))
+    # Legacy inventory trackers must not make an empty trading config look ready.
+    engine.trackers["ETH"] = AssetPriceTracker("ETH")
+    assert engine._oracle_fresh() is False
+    assert engine._oracle_diagnostics() == {}
+    engine.ledger.conn.close()
+
+
+def test_disabled_asset_merge_is_not_skipped_near_window_end(tmp_path) -> None:
+    class FakeExecutor:
+        def __init__(self):
+            self.canceled = []
+
+        async def cancel_all(self, tokens=None):
+            self.canceled.append(tokens)
+            return 0
+
+    async def scenario():
+        engine = TradingEngine(BotConfig(
+            enabled_assets=["BTC"],
+            enabled_timeframes=["5m"],
+            db_path=str(tmp_path / "disabled-merge.db"),
+        ))
+        engine.running = True
+        engine.paused = False
+        engine.executor = FakeExecutor()
+        window = WindowState(
+            slug="eth-updown-5m-disabled",
+            asset="ETH",
+            timeframe="5m",
+            condition_id="0x" + "6" * 64,
+            up_token="eth-up",
+            down_token="eth-down",
+            start_ts=time.time() - 295,
+            end_ts=time.time() + 5,
+        )
+        engine.windows[window.slug] = window
+        merged = asyncio.Event()
+        engine._risk_halted = lambda: False
+
+        async def record_merge(_window):
+            merged.set()
+
+        engine._try_merge = record_merge
+        task = asyncio.create_task(engine._strategy_loop())
+        try:
+            await asyncio.wait_for(merged.wait(), timeout=0.5)
+            assert engine.executor.canceled
+        finally:
+            engine.running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            engine.ledger.conn.close()
+
+    asyncio.run(scenario())
+
+
+
+def test_paper_reset_marker_is_unique_and_filesystem_safe() -> None:
+    first = _paper_reset_marker_path("/data/polybot.db", "fresh-paper-2026-11-19")
+    second = _paper_reset_marker_path("/data/polybot.db", "fresh-paper-2026-11-20")
+    assert first == "/data/polybot.db.paper-reset-fresh-paper-2026-11-19.done"
+    assert second != first
+    unsafe_marker = _paper_reset_marker_path("/data/polybot.db", "../../unsafe/reset")
+    assert "/" not in unsafe_marker.rsplit(".paper-reset-", 1)[1]
+    assert _paper_reset_marker_path("/data/polybot.db") == "/data/polybot.db.paper-reset-v2.done"
+
+
+
+def test_clob_timestamp_milliseconds_are_normalized_to_seconds() -> None:
+    assert _clob_timestamp_seconds("1795096055123") == 1795096055.123
+
+
+def test_clob_timestamp_rejects_invalid_values() -> None:
+    assert _clob_timestamp_seconds(None) is None
+    assert _clob_timestamp_seconds("not-a-timestamp") is None
+    assert _clob_timestamp_seconds(float("nan")) is None
+
+
+
+def test_maker_gate_diagnostics_are_rate_limited(monkeypatch, caplog, tmp_path) -> None:
+    cfg = BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "paper.db"),
+    )
+    engine = TradingEngine(cfg)
+    window = WindowState(
+        slug="btc-updown-5m-900",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "1" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=900.0,
+        end_ts=1200.0,
+    )
+    now = [100.0]
+    monkeypatch.setattr("bot.engine.time.monotonic", lambda: now[0])
+
+    with caplog.at_level("INFO"):
+        engine._log_maker_skip(window, "oracle", "spot_stale", spot_age_sec=7.0)
+        now[0] += 10.0
+        engine._log_maker_skip(window, "oracle", "spot_stale", spot_age_sec=8.0)
+        now[0] += 21.0
+        engine._log_maker_skip(window, "oracle", "spot_stale", spot_age_sec=9.0)
+
+    assert caplog.text.count("PAPER maker gate") == 2
+    assert "spot_age_sec=7.0" in caplog.text
+    assert "spot_age_sec=9.0" in caplog.text
+    engine.ledger.conn.close()
+
+
+
+def test_maker_quote_keeps_queue_priority_after_twenty_seconds(monkeypatch, tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "maker-queue-priority.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = [1_000.0]
+    monkeypatch.setattr("bot.engine.time.time", lambda: now[0])
+    window = WindowState(
+        slug="btc-updown-5m-maker-queue-priority",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "7" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=900.0,
+        end_ts=1_200.0,
+        price_to_beat=100_000.0,
+    )
+    for token, bid in (("up-token", 0.40), ("down-token", 0.37)):
+        engine._market_books[token] = {
+            "bids": {bid: 10.0},
+            "asks": {bid + 0.05: 20.0},
+            "best_bid": bid,
+            "best_ask": bid + 0.05,
+            "tick_size": 0.01,
+            "recv_mono": time.monotonic(),
+        }
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    before = {
+        order.asset_id: (order.order_id, order.created_ts, order.queue_ahead)
+        for order in engine.executor.get_open_orders()
+    }
+    assert len(before) == 2
+
+    now[0] += 25.0
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    after = {
+        order.asset_id: (order.order_id, order.created_ts, order.queue_ahead)
+        for order in engine.executor.get_open_orders()
+    }
+
+    assert after == before
+    engine.ledger.conn.close()
+
+
+def test_taker_pair_completion_accepts_standard_five_share_maker_inventory(monkeypatch, tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "five-share-completion.db"),
+    ))
+    from types import SimpleNamespace
+
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.90)
+
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-five-share",
+        asset="BTC", timeframe="5m", condition_id="0x" + "1" * 64,
+        up_token="up-token", down_token="down-token",
+        start_ts=now - 30, end_ts=now + 270,
+        price_to_beat=100_000.0, fee_rate=0.0,
+        up_shares=5.0, up_cost=2.0, up_fees=0.0,
+    )
+    engine.windows[window.slug] = window
+    opened = []
+
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+
+    async def ask_info(token):
+        return (0.50, 100.0) if token == "down-token" else (None, 0.0)
+
+    async def record_open(*args, **kwargs):
+        opened.append((args, kwargs))
+
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+    engine._open = record_open
+    monkeypatch.setattr("bot.engine.calc_taker_fee_usdc", lambda *args, **kwargs: 0.0)
+
+    asyncio.run(engine._run(window))
+
+    assert len(opened) == 1
+    assert opened[0][0][1] == "Down"
+    assert opened[0][0][3] == 5.0
+    assert opened[0][0][4] == "syn_tp"
+    engine.ledger.conn.close()
+
+
+def test_try_merge_closes_profitable_single_matched_pair_with_residual_inventory(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "single-pair-merge.db"),
+    ))
+    window = WindowState(
+        slug="btc-updown-5m-single-pair",
+        asset="BTC", timeframe="5m", condition_id="0x" + "2" * 64,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 100, end_ts=time.time() + 200,
+        up_shares=5.0, down_shares=1.0,
+        up_cost=2.0, down_cost=0.4,
+        up_fees=0.0, down_fees=0.0,
+    )
+    called = []
+
+    async def execute_merge(w):
+        called.append(w.mergeable_pairs)
+        return w.mergeable_pairs
+
+    engine._execute_merge = execute_merge
+    asyncio.run(engine._try_merge(window))
+    assert called == [1.0]
+    engine.ledger.conn.close()
+
+
+def test_mark_to_market_values_matched_pairs_at_redemption_and_residual_at_bid(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "mtm-pair-and-residual.db"),
+    ))
+    slug = "btc-updown-5m-mtm"
+    condition = "0x" + "3" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=5.0, price=0.60, fee=0.05, fair_prob=0.5,
+    )
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Down", role="MAKER", reason="test",
+        shares=2.0, price=0.30, fee=0.02, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+        up_shares=5.0, down_shares=2.0, up_cost=3.0, down_cost=0.6,
+        up_fees=0.05, down_fees=0.02,
+    )
+    engine.windows[slug] = window
+    engine._market_feed_connected = True
+    engine._market_books = {
+        "up-token": {"bids": {0.20: 100.0}, "asks": {0.21: 100.0},
+                     "recv_mono": time.monotonic()},
+        "down-token": {"bids": {0.10: 100.0}, "asks": {0.11: 100.0},
+                       "recv_mono": time.monotonic()},
+    }
+    state = engine._mark_to_market_state()
+    assert state["complete"] is True
+    assert round(state["market_value"], 2) == 2.60
+    assert round(state["unrealized_pnl"], 2) == -1.07
+    assert round(state["unpaired_exposure_usd"], 2) == 1.83
+    engine.ledger.conn.close()
+
+
+def test_mark_to_market_fails_closed_when_residual_book_is_stale(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "mtm-stale.db"),
+    ))
+    slug = "btc-updown-5m-mtm-stale"
+    condition = "0x" + "4" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=5.0, price=0.60, fee=0.05, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+    )
+    engine.windows[slug] = window
+    engine._market_feed_connected = True
+    engine._market_books = {
+        "up-token": {"bids": {0.20: 100.0}, "asks": {0.21: 100.0},
+                     "recv_mono": time.monotonic() - 10.0},
+    }
+    state = engine._mark_to_market_state()
+    assert state["complete"] is False
+    assert "stale" in state["reason"]
+    engine.ledger.conn.close()
+
+
+def test_daily_risk_guard_includes_unrealized_loss_from_fresh_bid(tmp_path):
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "mtm-risk-halt.db"), max_daily_loss_usd=10.0,
+    ))
+    slug = "btc-updown-5m-mtm-risk"
+    condition = "0x" + "5" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=20.0, price=0.80, fee=0.10, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+    )
+    engine.windows[slug] = window
+    engine._market_feed_connected = True
+    engine._market_feed_ever_connected = True
+    engine._market_books = {
+        "up-token": {"bids": {0.10: 100.0}, "asks": {0.11: 100.0},
+                     "recv_mono": time.monotonic()},
+    }
+    assert engine._risk_halted() is True
+    assert "Daily net loss limit reached" in engine._risk_halt_reason
+    engine.ledger.conn.close()
+
+
+def test_unpaired_cost_counts_only_residual_inventory_and_entry_fees() -> None:
+    assert round(TradingEngine._unpaired_cost(5, 2, 3.0, 0.6, 0.05, 0.02), 2) == 1.83
+    assert TradingEngine._unpaired_cost(5, 5, 3.0, 2.0, 0.05, 0.03) == 0.0
+    assert round(TradingEngine._unpaired_cost(5, 6, 3.0, 2.4, 0.05, 0.06), 4) == 0.41
+
+
+def test_portfolio_unpaired_exposure_includes_pending_maker_reserves(tmp_path) -> None:
+    from types import SimpleNamespace
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"], db_path=str(tmp_path / "unpaired-cap.db")))
+    engine.ledger.record_fill(mode="paper", slug="btc-updown-5m-cap", condition_id="0x" + "6" * 64, asset="BTC", timeframe="5m", outcome="Up", role="MAKER", reason="test", shares=5.0, price=0.60, fee=0.05, fair_prob=0.5)
+    engine.ledger.record_fill(mode="paper", slug="btc-updown-5m-cap", condition_id="0x" + "6" * 64, asset="BTC", timeframe="5m", outcome="Down", role="MAKER", reason="test", shares=2.0, price=0.30, fee=0.02, fair_prob=0.5)
+    engine.executor = SimpleNamespace(get_open_orders=lambda: [SimpleNamespace(price=0.40, remaining=5.0)])
+    assert round(engine._unpaired_exposure_usd(), 2) == 3.83
+    assert round(engine._unpaired_exposure_usd(include_orders=False), 2) == 1.83
+    engine.ledger.conn.close()
+
+
+def test_taker_pair_completion_rounds_496_partial_fill_to_clob_minimum(tmp_path) -> None:
+    from types import SimpleNamespace
+    engine = TradingEngine(BotConfig(enabled_assets=["BTC"], enabled_timeframes=["5m"], db_path=str(tmp_path / "partial-completion.db")))
+    class FreshTracker:
+        cl_spot = 100_000.0
+        cl_twap60 = 100_000.0
+        cl_recv_mono = time.monotonic()
+        cl_twap_recv_mono = time.monotonic()
+        cl_spot_ts = time.time()
+        cl_twap60_ts = time.time()
+        _vol_samples = 60
+        def compute_fair_value(self, *_args):
+            return SimpleNamespace(prob_up=0.90)
+    engine.trackers["BTC"] = FreshTracker()
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-partial-completion", asset="BTC", timeframe="5m",
+        condition_id="0x" + "7" * 64, up_token="up-token", down_token="down-token",
+        start_ts=now - 30, end_ts=now + 270, price_to_beat=100_000.0,
+        fee_rate=0.0, up_shares=4.96, up_cost=1.984, up_fees=0.0,
+    )
+    opened = []
+    async def no_maker_quotes(*_args, **_kwargs):
+        return None
+    async def ask_info(token):
+        return (0.50, 100.0) if token == "down-token" else (None, 0.0)
+    async def record_open(*args, **kwargs):
+        opened.append((args, kwargs))
+    engine._update_maker_quotes = no_maker_quotes
+    engine._clob_ask_info = ask_info
+    engine._open = record_open
+    asyncio.run(engine._run(window))
+    assert len(opened) == 1
+    assert opened[0][0][1] == "Down"
+    assert opened[0][0][3] == 5.0
+    assert opened[0][0][4] == "syn_tp"
+    engine.ledger.conn.close()
+
+
+def test_mark_to_market_liquidation_uses_visible_bid_depth_and_zero_for_unfilled_size() -> None:
+    book = {"bids": {0.20: 1.0, 0.10: 1.0}}
+    assert round(TradingEngine._bid_liquidation_value(book, 3.0), 2) == 0.30
+    assert round(TradingEngine._bid_liquidation_value(book, 1.5), 2) == 0.25
+
+
+def test_open_blocks_taker_addition_that_exceeds_portfolio_unpaired_cap(tmp_path) -> None:
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "taker-unpaired-cap.db"),
+        max_unpaired_exposure_usd=10.0,
+    ))
+    slug = "btc-updown-5m-taker-cap"
+    condition = "0x" + "8" * 64
+    engine.ledger.record_fill(
+        mode="paper", slug=slug, condition_id=condition, asset="BTC",
+        timeframe="5m", outcome="Up", role="MAKER", reason="test",
+        shares=10.0, price=0.90, fee=0.0, fair_prob=0.5,
+    )
+    window = WindowState(
+        slug=slug, asset="BTC", timeframe="5m", condition_id=condition,
+        up_token="up-token", down_token="down-token",
+        start_ts=time.time() - 60, end_ts=time.time() + 240,
+        up_shares=10.0, up_cost=9.0, up_fees=0.0,
+    )
+    engine.windows[slug] = window
+    cash_before = engine.cash
+    shares_before = window.up_shares
+
+    asyncio.run(engine._open(
+        window, "Up", 0.90, 5.0, "taker_entry", fee=0.0, fair_prob=0.5,
+    ))
+
+    assert engine.cash == cash_before
+    assert window.up_shares == shares_before
+    assert round(engine._unpaired_exposure_usd(), 2) == 9.0
+    engine.ledger.conn.close()
+
+
+
+def test_maker_quotes_respect_projected_portfolio_unpaired_cap(tmp_path, monkeypatch) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"], enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "maker-unpaired-cap.db"),
+        max_unpaired_exposure_usd=10.0,
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = time.time()
+    window = WindowState(
+        slug="btc-updown-5m-maker-cap", asset="BTC", timeframe="5m",
+        condition_id="0x" + "9" * 64, up_token="up-token", down_token="down-token",
+        start_ts=now - 30, end_ts=now + 270, price_to_beat=100_000.0,
+    )
+    engine.windows[window.slug] = window
+    for token in ("up-token", "down-token"):
+        engine._market_books[token] = {
+            "bids": {0.40: 10.0}, "asks": {0.45: 20.0},
+            "best_bid": 0.40, "best_ask": 0.45,
+            "tick_size": 0.01, "recv_mono": time.monotonic(),
+        }
+    monkeypatch.setattr(engine, "_unpaired_exposure_usd", lambda **_kwargs: 9.0)
+
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+
+    assert engine.executor.get_open_orders() == []
+    engine.ledger.conn.close()
+
+
+def test_maker_quote_reprice_waits_for_minimum_resting_age(monkeypatch, tmp_path) -> None:
+    from bot.execution import PaperExecutor
+
+    engine = TradingEngine(BotConfig(
+        enabled_assets=["BTC"],
+        enabled_timeframes=["5m"],
+        db_path=str(tmp_path / "maker-requote-cooldown.db"),
+    ))
+    engine.executor = PaperExecutor(100.0)
+    engine.cash = 100.0
+    engine._market_feed_connected = True
+    now = [2_000.0]
+    monkeypatch.setattr("bot.engine.time.time", lambda: now[0])
+    window = WindowState(
+        slug="btc-updown-5m-maker-requote-cooldown",
+        asset="BTC",
+        timeframe="5m",
+        condition_id="0x" + "b" * 64,
+        up_token="up-token",
+        down_token="down-token",
+        start_ts=1_900.0,
+        end_ts=2_200.0,
+        price_to_beat=100_000.0,
+    )
+
+    def set_books(up_bid: float) -> None:
+        for token, bid in (("up-token", up_bid), ("down-token", 0.37)):
+            engine._market_books[token] = {
+                "bids": {bid: 10.0},
+                "asks": {bid + 0.05: 20.0},
+                "best_bid": bid,
+                "best_ask": bid + 0.05,
+                "tick_size": 0.01,
+                "recv_mono": time.monotonic(),
+            }
+
+    set_books(0.40)
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    first_up = engine.executor.get_open_orders("up-token")[0]
+
+    # A three-tick book move after only two seconds must retain queue priority.
+    now[0] += 2.0
+    set_books(0.43)
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    retained_up = engine.executor.get_open_orders("up-token")[0]
+    assert retained_up.order_id == first_up.order_id
+    assert retained_up.price == 0.40
+
+    # After the minimum resting age, the quote may follow the new best bid.
+    now[0] += 9.0
+    set_books(0.43)
+    asyncio.run(engine._update_maker_quotes(window, fair_up=0.5, fair_down=0.5))
+    repriced_up = engine.executor.get_open_orders("up-token")[0]
+    assert repriced_up.order_id != first_up.order_id
+    assert repriced_up.price == 0.43
     engine.ledger.conn.close()

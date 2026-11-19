@@ -6,13 +6,16 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 
 from .config import BotConfig, PRESETS, StrategyParams
+from .clob_recorder import CLOBRecorder
 from .execution import PaperExecutor, LiveExecutor
 from .fees import calc_taker_fee_usdc, fee_regime_label
 from .ledger import Ledger
@@ -22,6 +25,18 @@ from .twap_model import AssetPriceTracker
 
 log = logging.getLogger(__name__)
 NotifyFn = Callable[..., Any]
+
+
+def _clob_timestamp_seconds(value: Any) -> Optional[float]:
+    """Normalize CLOB event timestamps (Unix ms) to local Unix seconds."""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        return None
+    # Polymarket CLOB WebSocket timestamps are epoch milliseconds.
+    return timestamp / 1000.0 if timestamp >= 100_000_000_000 else timestamp
 
 
 @dataclass
@@ -92,6 +107,16 @@ def _select_closed_gamma_strike(event: dict[str, Any]) -> tuple[Optional[float],
     return None, ""
 
 
+def _paper_reset_marker_path(db_path: str, reset_id: str = "") -> str:
+    """Return a stable, filesystem-safe marker for one explicitly named PAPER reset."""
+    import re
+
+    key = re.sub(r"[^A-Za-z0-9._-]+", "-", str(reset_id or "").strip())[:64].strip(".-_")
+    if not key:
+        key = "v2"
+    return f"{db_path}.paper-reset-{key}.done"
+
+
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
@@ -101,6 +126,8 @@ class TradingEngine:
         self.windows: Dict[str, WindowState] = {}
         self.running = False
         self.paused = not cfg.auto_start
+        # Keep pause sources distinct so Telegram recovery cannot clear operator/risk stops.
+        self._pause_reason = "manual" if self.paused else ""
         self._tasks: List[asyncio.Task] = []
         self.executor: Any = None
         self.cash = float(cfg.bankroll_usd)
@@ -114,22 +141,85 @@ class TradingEngine:
         self._price_ok = False
         self._oracle_connected = False
         self._oracle_last_event_ts = 0.0
+        # Runtime cadence telemetry: do not relax freshness thresholds without evidence.
+        self._oracle_metrics = {
+            asset: {
+                kind: {"count": 0, "last_gap_sec": None, "max_gap_sec": 0.0,
+                       "last_recv_mono": 0.0, "stale_rejected": 0}
+                for kind in ("chainlink_spot", "chainlink_twap60")
+            }
+            for asset in cfg.enabled_assets
+        }
         self._fill_history: List[Dict[str, Any]] = []
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
         self._market_books: Dict[str, Dict[str, Any]] = {}
         self._market_tokens_changed = asyncio.Event()
         self._market_feed_connected = False
+        self._market_feed_ever_connected = False
         self._market_feed_last_event_mono = 0.0
+        self._maker_diag_last: Dict[str, float] = {}
+        # Calibration remains telemetry-only until execution-aware validation passes.
+        self._shadow_calibration: Dict[int, Dict[str, float]] = {}
+        self._shadow_logged: set[tuple[str, int]] = set()
+        self._anchor_reconcile_last: Dict[str, float] = {}
+        self._anchor_reconcile_cursor = 0
+        self._resolution_diag_last: Dict[str, float] = {}
         self._risk_halt_active = False
         self._risk_halt_reason = ""
         # Set by the application after Telegram's delivery session initializes.
         # None preserves library/test embedding behavior; False blocks resuming
         # an auto-started engine when the required trade-notification channel failed.
         self._notification_channel_ready: Optional[bool] = None
+        self._clob_recorder = (
+            CLOBRecorder(Path(cfg.db_path).parent / "market-data" / "clob")
+            if cfg.clob_capture_enabled and cfg.trading_mode == "paper"
+            else None
+        )
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
+
+    def set_shadow_calibration(self, report: Dict[str, Any]) -> None:
+        """Load only independently accepted BTC 5m horizons for diagnostics.
+
+        This never changes the trading fair value, quote prices, or risk limits.
+        """
+        if not isinstance(report, dict) or report.get("calibration_version") != 7:
+            log.warning("Unsupported calibration report version; shadow mode remains off")
+            self._shadow_calibration = {}
+            return
+        calibration = report.get("calibration")
+        holdout = calibration.get("holdout") if isinstance(calibration, dict) else None
+        by_horizon = holdout.get("by_seconds_to_settlement") if isinstance(holdout, dict) else None
+        if not isinstance(by_horizon, dict):
+            log.warning("Calibration report has no per-horizon holdout; shadow mode remains off")
+            return
+        accepted: Dict[int, Dict[str, float]] = {}
+        for key, metrics in by_horizon.items():
+            try:
+                horizon = int(key)
+                sigma = float(metrics["fitted_sigma_multiplier"])
+                jump = float(metrics["fitted_jump_weight"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                horizon not in {240, 180, 120, 60, 30, 15}
+                or metrics.get("accepted_for_shadow_research") is not True
+                or metrics.get("at_search_boundary") is True
+                or not math.isfinite(sigma)
+                or not math.isfinite(jump)
+                or not 0.4 <= sigma <= 2.5
+                or not 0.0 <= jump <= 0.8
+            ):
+                continue
+            accepted[horizon] = {"sigma_multiplier": sigma, "jump_weight": jump}
+        self._shadow_calibration = accepted
+        log.info(
+            "BTC 5m calibration shadow loaded · version=%s · horizons=%s · trading parameters unchanged",
+            report.get("calibration_version", "unknown"),
+            ",".join(str(x) for x in sorted(accepted, reverse=True)) or "none",
+        )
 
     def _log_event(
         self, level: str, msg: str, notify: bool = False,
@@ -152,6 +242,22 @@ class TradingEngine:
             except Exception:
                 pass
 
+    def _log_maker_skip(self, window: WindowState, key: str, reason: str, **details: Any) -> None:
+        """Rate-limited diagnostics for silent Maker quote eligibility gates."""
+        now = time.monotonic()
+        throttle_key = f"{window.slug}:{key}"
+        if now - self._maker_diag_last.get(throttle_key, 0.0) < 30.0:
+            return
+        self._maker_diag_last[throttle_key] = now
+        detail_text = " ".join(
+            f"{name}={value}" for name, value in details.items()
+            if value is not None
+        )
+        log.info(
+            "PAPER maker gate · slug=%s · gate=%s · reason=%s%s",
+            window.slug, key, reason, f" · {detail_text}" if detail_text else "",
+        )
+
     async def start(self) -> None:
         # SAFETY INTERLOCK: live execution is not implemented end-to-end yet.
         # _open() currently mutates the local ledger and _execute_merge() credits
@@ -162,6 +268,28 @@ class TradingEngine:
                 "merge confirmation are not implemented. Use paper mode only."
             )
         self.executor = PaperExecutor(self.cfg.bankroll_usd)
+        if self._clob_recorder is not None:
+            self.executor.set_order_event_callback(self._record_paper_order_event)
+        reset_id = str(getattr(self.cfg, "paper_reset_id", "") or "").strip()
+        if self.cfg.paper_reset_once or reset_id:
+            marker_path = _paper_reset_marker_path(self.cfg.db_path, reset_id)
+            if not os.path.exists(marker_path):
+                if self.cfg.trading_mode != "paper":
+                    raise RuntimeError("PAPER ledger reset requested outside PAPER mode")
+                reset = self.ledger.reset_paper_history("paper")
+                with open(marker_path, "w", encoding="utf-8") as marker:
+                    json.dump(
+                        {"completed_at": time.time(), "backup_path": reset["backup_path"],
+                         "deleted": reset["deleted"]},
+                        marker,
+                    )
+                self.cfg.paper_stats_since_ts = time.time()
+                log.warning(
+                    "PAPER_LEDGER_RESET complete backup=%s deleted=%s remaining=%s",
+                    reset["backup_path"], reset["deleted"], reset["remaining"],
+                )
+            else:
+                log.info("PAPER_LEDGER_RESET already completed; marker=%s", marker_path)
         try:
             state = self.ledger.portfolio_state(self.cfg.trading_mode, self.cfg.bankroll_usd)
             self.cash = state["cash"]
@@ -174,6 +302,7 @@ class TradingEngine:
         self._log_event("WARNING", "PAPER only: live execution is safety-disabled", notify=True)
         if self._risk_halted():
             self.paused = True
+            self._pause_reason = "risk"
             self._risk_halt_active = True
             self._log_event(
                 "ALERT",
@@ -189,6 +318,11 @@ class TradingEngine:
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
         ]
+        if self._clob_recorder is not None:
+            self._tasks.append(
+                asyncio.create_task(self._clob_recorder.run(), name="clob_recorder")
+            )
+            log.info("PAPER CLOB capture enabled · retention=7d · cap=120MiB")
         self._log_event("INFO", "Старт · honest paper (best-ask fix)", notify=True)
 
     async def stop(self) -> None:
@@ -196,29 +330,41 @@ class TradingEngine:
         self._market_feed_connected = False
         if self.executor is not None:
             await self.executor.cancel_all()
+        if self._clob_recorder is not None:
+            self._clob_recorder.request_stop()
         for t in self._tasks:
-            t.cancel()
+            if t.get_name() != "clob_recorder":
+                t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
-    def pause(self) -> None:
+    def pause(self, reason: str = "manual", notify: bool = True) -> None:
+        # A Telegram outage must not overwrite an existing manual or critical stop.
+        if reason == "telegram_delivery":
+            if not self.paused or not self._pause_reason:
+                self._pause_reason = reason
+        else:
+            self._pause_reason = reason
         self.paused = True
         if self.executor is not None:
             try:
                 asyncio.get_running_loop().create_task(self.executor.cancel_all())
             except RuntimeError:
                 pass
-        self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=True)
+        self._log_event("INFO", "Пауза · maker-заявки отменяются", notify=notify)
 
     def resume(self) -> bool:
         if self._notification_channel_ready is False:
             self.paused = True
+            if not self._pause_reason:
+                self._pause_reason = "telegram_delivery"
             self._risk_halt_reason = "Telegram delivery is not initialized; PAPER trading remains paused"
             self._log_event("ALERT", self._risk_halt_reason, notify=False)
             return False
         # Re-check durable risk and data-integrity guards before unpausing.
         if self._risk_halted():
             self.paused = True
+            self._pause_reason = "risk"
             self._risk_halt_active = True
             self._log_event(
                 "ALERT",
@@ -227,7 +373,29 @@ class TradingEngine:
             )
             return False
         self.paused = False
+        self._pause_reason = ""
         self._log_event("INFO", "PAPER-торговля возобновлена", notify=True)
+        return True
+
+    def resume_after_notification_recovery(self) -> bool:
+        """Resume only a pause caused solely by Telegram delivery recovery."""
+        if not self.paused or self._pause_reason != "telegram_delivery":
+            return False
+        if not self.running or self._notification_channel_ready is False:
+            return False
+        if self._risk_halted():
+            self._pause_reason = "risk"
+            self._risk_halt_active = True
+            self._log_event(
+                "ALERT",
+                f"Автовозобновление заблокировано защитой: {self._risk_halt_reason}",
+                notify=False,
+            )
+            return False
+        self.paused = False
+        self._pause_reason = ""
+        # Avoid enqueueing a new message while draining the Telegram outbox.
+        self._log_event("INFO", "PAPER-торговля автоматически возобновлена после восстановления Telegram", notify=False)
         return True
 
     def set_preset(self, key: str) -> bool:
@@ -244,6 +412,7 @@ class TradingEngine:
 
     async def emergency_kill(self) -> Dict[str, Any]:
         self.paused = True
+        self._pause_reason = "emergency"
         canceled = await self.executor.cancel_all() if self.executor is not None else 0
         merged = 0.0
         for w in list(self.windows.values()):
@@ -272,11 +441,15 @@ class TradingEngine:
             if duration <= 0:
                 log.error("Unsupported restored timeframe in slug: %s", slug)
                 continue
+            asset = str(position["asset"]).upper()
+            # Preserve trackers for legacy inventory in disabled assets so status,
+            # settlement and risk-reducing MERGE remain safe after BTC-only switch.
+            self.trackers.setdefault(asset, AssetPriceTracker(asset))
             meta = await self._gamma(slug)
             condition_id = str((meta or {}).get("condition_id") or position["condition_id"])
             window = WindowState(
                 slug=slug,
-                asset=str(position["asset"]),
+                asset=asset,
                 timeframe=timeframe,
                 condition_id=condition_id,
                 up_token=str((meta or {}).get("up_token") or ""),
@@ -301,19 +474,58 @@ class TradingEngine:
                 f"Down {window.down_shares:.2f}",
             )
 
-    def _oracle_fresh(self) -> bool:
-        if not self.trackers:
-            return False
+    def _oracle_diagnostics(self) -> Dict[str, Any]:
+        """Expose source/receive ages and observed event cadence without guessing."""
         now_mono = time.monotonic()
         now_epoch = time.time()
+        result: Dict[str, Any] = {}
+        for asset in self.cfg.enabled_assets:
+            tracker = self.trackers[asset]
+            metrics = self._oracle_metrics.get(asset, {})
+            asset_status: Dict[str, Any] = {}
+            for kind, source_ts, recv_mono in (
+                ("spot", tracker.cl_spot_ts, tracker.cl_recv_mono),
+                ("twap60", tracker.cl_twap60_ts, tracker.cl_twap_recv_mono),
+            ):
+                observed = metrics.get("chainlink_" + kind, {})
+                source_age = now_epoch - source_ts if source_ts else None
+                receive_age = now_mono - recv_mono if recv_mono else None
+                asset_status[kind] = {
+                    "source_age_sec": round(source_age, 3) if source_age is not None else None,
+                    "receive_age_sec": round(receive_age, 3) if receive_age is not None else None,
+                    "event_count": int(observed.get("count", 0)),
+                    "last_gap_sec": (
+                        round(float(observed["last_gap_sec"]), 3)
+                        if observed.get("last_gap_sec") is not None else None
+                    ),
+                    "max_gap_sec": round(float(observed.get("max_gap_sec", 0.0)), 3),
+                    "stale_rejected": int(observed.get("stale_rejected", 0)),
+                }
+            result[asset] = asset_status
+        return result
+
+    def _oracle_fresh(self) -> bool:
+        # Readiness is defined by configured trading assets, never by legacy
+        # trackers restored only for inventory settlement. Empty/missing config
+        # must fail closed rather than letting all([]) report a fresh oracle.
+        if not self.cfg.enabled_assets or any(
+            asset not in self.trackers for asset in self.cfg.enabled_assets
+        ):
+            return False
+        diagnostics = self._oracle_diagnostics()
         return all(
             tracker.cl_spot is not None
             and tracker.cl_twap60 is not None
-            and now_mono - tracker.cl_recv_mono <= 5.0
-            and now_mono - tracker.cl_twap_recv_mono <= 5.0
-            and now_epoch - tracker.cl_spot_ts <= 5.0
-            and now_epoch - tracker.cl_twap60_ts <= 5.0
-            for tracker in self.trackers.values()
+            and diagnostics[asset]["spot"]["receive_age_sec"] is not None
+            and diagnostics[asset]["spot"]["receive_age_sec"] <= 5.0
+            and diagnostics[asset]["twap60"]["receive_age_sec"] is not None
+            and diagnostics[asset]["twap60"]["receive_age_sec"] <= 5.0
+            and diagnostics[asset]["spot"]["source_age_sec"] is not None
+            and diagnostics[asset]["spot"]["source_age_sec"] <= 5.0
+            and diagnostics[asset]["twap60"]["source_age_sec"] is not None
+            and diagnostics[asset]["twap60"]["source_age_sec"] <= 5.0
+            for asset in self.cfg.enabled_assets
+            for tracker in (self.trackers[asset],)
         )
 
     async def _polymarket_oracle_loop(self) -> None:
@@ -331,8 +543,28 @@ class TradingEngine:
                         # Reject timestamps that are clearly stale or implausibly in the future.
                         source_ts = ts_ms / 1000.0
                         age = time.time() - source_ts
-                        if age > 5.0 or age < -2.0:
+                        accepted = not (age > 5.0 or age < -2.0)
+                        if self._clob_recorder is not None:
+                            self._clob_recorder.enqueue_oracle_event(
+                                asset, kind, price, ts_ms, accepted=accepted, age_sec=age
+                            )
+                        if not accepted:
+                            metric_kind = self._oracle_metrics.get(asset, {}).get(kind)
+                            if metric_kind is not None:
+                                metric_kind["stale_rejected"] += 1
                             continue
+                        metric_kind = self._oracle_metrics.get(asset, {}).get(kind)
+                        if metric_kind is not None:
+                            recv_mono = time.monotonic()
+                            previous = float(metric_kind["last_recv_mono"] or 0.0)
+                            if previous:
+                                gap = max(0.0, recv_mono - previous)
+                                metric_kind["last_gap_sec"] = gap
+                                metric_kind["max_gap_sec"] = max(
+                                    float(metric_kind["max_gap_sec"]), gap
+                                )
+                            metric_kind["last_recv_mono"] = recv_mono
+                            metric_kind["count"] += 1
                         if kind == "chainlink_spot":
                             tracker.on_chainlink_spot(price, ts_ms)
                         elif kind == "chainlink_twap60":
@@ -632,10 +864,13 @@ class TradingEngine:
             iterator = stream.__aiter__()
             try:
                 self._market_feed_connected = False
+                # Connection churn is operational telemetry, not a trade event.
+                # Keep it in Railway logs; Telegram is reserved for fills, MERGEs,
+                # risk alerts and feed failures so users are not spammed on resubscribe.
                 self._log_event(
                     "INFO",
                     f"CLOB WebSocket подключён · {len(token_ids)} токенов",
-                    notify=True,
+                    notify=False,
                 )
                 while self.running:
                     next_task = asyncio.create_task(iterator.__anext__())
@@ -661,6 +896,7 @@ class TradingEngine:
                             break
                         self._market_feed_last_event_mono = time.monotonic()
                         self._market_feed_connected = True
+                        self._market_feed_ever_connected = True
                         await self._process_market_event(event)
             except asyncio.CancelledError:
                 raise
@@ -694,17 +930,19 @@ class TradingEngine:
             {"bids": {}, "asks": {}, "best_bid": 0.0, "best_ask": 1.0, "tick_size": 0.01, "min_order_size": 0.0},
         )
         kind = event.get("type")
+        active_window = next(
+            (
+                candidate for candidate in self.windows.values()
+                if candidate.up_token == token or candidate.down_token == token
+            ),
+            None,
+        )
+        if self._clob_recorder is not None and active_window is not None:
+            self._clob_recorder.enqueue(event, active_window)
         if self.paused or self._risk_halt_active:
             await self.executor.cancel_all()
             return
         if kind == "last_trade":
-            active_window = next(
-                (
-                    candidate for candidate in self.windows.values()
-                    if candidate.up_token == token or candidate.down_token == token
-                ),
-                None,
-            )
             if (
                 active_window is None
                 or active_window.price_to_beat is None
@@ -751,6 +989,11 @@ class TradingEngine:
         trade_price = float(event["price"]) if kind == "last_trade" else None
         trade_size = float(event.get("size") or 0.0) if kind == "last_trade" else 0.0
         trade_side = str(event.get("side") or "") if kind == "last_trade" else ""
+        raw_trade_ts = event.get("timestamp") if kind == "last_trade" else None
+        try:
+            trade_ts = _clob_timestamp_seconds(raw_trade_ts)
+        except (TypeError, ValueError):
+            trade_ts = None
         fills = self.executor.on_book_and_tape(
             token,
             best_bid=best_bid,
@@ -758,9 +1001,24 @@ class TradingEngine:
             last_trade_price=trade_price,
             last_trade_size=trade_size,
             last_trade_side=trade_side,
+            trade_ts=trade_ts,
         )
         for fill in fills:
             await self._record_maker_fill(fill)
+
+    def _record_paper_order_event(self, event: dict[str, Any]) -> None:
+        if self._clob_recorder is None:
+            return
+        token = str(event.get("asset_id") or "")
+        window = next(
+            (
+                candidate for candidate in self.windows.values()
+                if candidate.up_token == token or candidate.down_token == token
+            ),
+            None,
+        )
+        if window is not None:
+            self._clob_recorder.enqueue_order_event(event, window)
 
     async def _record_maker_fill(self, fill: Any) -> None:
         window = None
@@ -811,6 +1069,9 @@ class TradingEngine:
         except Exception as exc:
             self.executor.rollback_fill(fill)
             self.paused = True
+            self._pause_reason = "risk"
+            self._risk_halt_active = True
+            self._risk_halt_reason = "Maker PAPER fill could not be persisted to SQLite"
             await self.executor.cancel_all()
             log.exception("Maker PAPER fill not persisted; trading paused: %s", exc)
             self._log_event("ALERT", "Ошибка записи maker-fill в SQLite · торговля остановлена", notify=True)
@@ -854,7 +1115,16 @@ class TradingEngine:
                     else:
                         self._risk_halt_active = False
                         for w in list(self.windows.values()):
-                            if w.resolved or w.remain_sec < 15:
+                            if w.resolved:
+                                continue
+                            if w.asset not in self.cfg.enabled_assets:
+                                # Disabled assets are management-only at every point
+                                # in the window lifecycle: no new entries, but cancel
+                                # stale quotes and retain risk-reducing MERGE.
+                                await self._cancel_window_maker_orders(w)
+                                await self._try_merge(w)
+                                continue
+                            if w.remain_sec < 15:
                                 await self._cancel_window_maker_orders(w)
                                 continue
                             await self._run(w)
@@ -862,6 +1132,92 @@ class TradingEngine:
             except Exception as e:
                 log.warning("strategy: %s", e)
             await asyncio.sleep(1.5)
+
+    @staticmethod
+    def _unpaired_cost(up_shares: float, down_shares: float, up_cost: float, down_cost: float, up_fees: float = 0.0, down_fees: float = 0.0) -> float:
+        """Cost basis and entry fees allocated only to unmatched shares."""
+        up = max(0.0, float(up_shares))
+        down = max(0.0, float(down_shares))
+        up_residual = max(0.0, up - min(up, down))
+        down_residual = max(0.0, down - min(up, down))
+        up_value = (float(up_cost) + float(up_fees)) * up_residual / up if up > 0 else 0.0
+        down_value = (float(down_cost) + float(down_fees)) * down_residual / down if down > 0 else 0.0
+        return max(0.0, up_value + down_value)
+
+    def _unpaired_exposure_usd(self, exclude_slug: Optional[str] = None, include_orders: bool = True) -> float:
+        """Portfolio unmatched inventory cost plus all outstanding Maker reserves."""
+        exposure = 0.0
+        for position in self.ledger.open_positions(self.cfg.trading_mode):
+            if exclude_slug and str(position["slug"]) == exclude_slug:
+                continue
+            exposure += self._unpaired_cost(
+                position["up_shares"], position["down_shares"],
+                position["up_cost"], position["down_cost"],
+                position["up_fees"], position["down_fees"],
+            )
+        if include_orders and self.executor is not None:
+            exposure += sum(max(0.0, float(order.price)) * max(0.0, float(order.remaining))
+                            for order in self.executor.get_open_orders())
+        return exposure
+    @staticmethod
+    def _bid_liquidation_value(book: Dict[str, Any], shares: float) -> float:
+        """Consume visible bid depth; any unfillable remainder is valued at zero."""
+        remaining = max(0.0, float(shares))
+        value = 0.0
+        bids = book.get("bids") or {}
+        levels = sorted(((float(p), float(q)) for p, q in bids.items() if float(q) > 0), reverse=True)
+        for price, depth in levels:
+            if remaining <= 1e-9:
+                break
+            taken = min(remaining, depth)
+            value += taken * price
+            remaining -= taken
+        return value
+    def _mark_to_market_state(self) -> Dict[str, Any]:
+        """Conservatively value open inventory using fresh CLOB bids."""
+        positions = self.ledger.open_positions(self.cfg.trading_mode)
+        if not positions:
+            return {"complete": True, "market_value": 0.0, "unrealized_pnl": 0.0,
+                    "unpaired_exposure_usd": 0.0, "reason": ""}
+        market_value = inventory_cost = open_fees = unpaired_exposure = 0.0
+        now_mono = time.monotonic()
+        for position in positions:
+            window = self.windows.get(str(position["slug"]))
+            if window is None or not window.up_token or not window.down_token:
+                return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                        "unpaired_exposure_usd": None,
+                        "reason": f"missing market tokens for {position['slug']}"}
+            up, down = float(position["up_shares"]), float(position["down_shares"])
+            up_cost, down_cost = float(position["up_cost"]), float(position["down_cost"])
+            up_fees, down_fees = float(position["up_fees"]), float(position["down_fees"])
+            paired = min(up, down)
+            up_residual, down_residual = max(0.0, up-paired), max(0.0, down-paired)
+            position_value = paired
+            for token, residual in ((window.up_token, up_residual), (window.down_token, down_residual)):
+                if residual <= 1e-6:
+                    continue
+                book = self._market_books.get(token)
+                age = now_mono - float(book.get("recv_mono", 0.0)) if book else None
+                if not book or age is None or age > 5.0:
+                    return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                            "unpaired_exposure_usd": None,
+                            "reason": f"missing or stale bid for {position['slug']}"}
+                bid_levels = book.get("bids") or {}
+                if any(not math.isfinite(float(price)) or float(price) <= 0.0 or float(price) >= 1.0 for price in bid_levels):
+                    return {"complete": False, "market_value": None, "unrealized_pnl": None,
+                            "unpaired_exposure_usd": None, "reason": "invalid bid ladder"}
+                # Use executable visible depth rather than multiplying the whole size by top bid.
+                position_value += self._bid_liquidation_value(book, residual)
+            market_value += position_value
+            inventory_cost += up_cost + down_cost
+            open_fees += up_fees + down_fees
+            if up_residual > 1e-6 and up > 0:
+                unpaired_exposure += (up_cost + up_fees) * up_residual / up
+            if down_residual > 1e-6 and down > 0:
+                unpaired_exposure += (down_cost + down_fees) * down_residual / down
+        return {"complete": True, "market_value": market_value,
+                "unrealized_pnl": market_value-inventory_cost-open_fees,
+                "unpaired_exposure_usd": unpaired_exposure, "reason": ""}
 
     def _risk_halted(self) -> bool:
         # A confirmed RTDS-vs-Gamma mismatch is a persistent data-integrity halt.
@@ -895,6 +1251,15 @@ class TradingEngine:
         except Exception:
             self._risk_halt_reason = "Cannot read PAPER ledger PnL; trading remains halted"
             return True
+        if self._market_feed_ever_connected:
+            mtm = self._mark_to_market_state()
+            if not mtm["complete"]:
+                self._risk_halt_reason = (
+                    "Cannot conservatively mark open PAPER inventory: "
+                    + str(mtm.get("reason") or "market data unavailable")
+                )
+                return True
+            current_day_pnl += float(mtm["unrealized_pnl"])
         if current_day_pnl <= -self.cfg.max_daily_loss_usd:
             self._risk_halt_reason = (
                 f"Daily net loss limit reached: ${current_day_pnl:.2f} "
@@ -902,7 +1267,14 @@ class TradingEngine:
             )
             return True
         try:
-            self.consecutive_losses = self.ledger.consecutive_net_losses(self.cfg.trading_mode)
+            loss_session_since = (
+                float(self.cfg.paper_stats_since_ts)
+                if self.cfg.trading_mode == "paper"
+                else 0.0
+            )
+            self.consecutive_losses = self.ledger.consecutive_net_losses(
+                self.cfg.trading_mode, since_ts=loss_session_since
+            )
         except Exception:
             self._risk_halt_reason = "Cannot read consecutive-loss state from SQLite"
             return True
@@ -926,35 +1298,62 @@ class TradingEngine:
         fair_up: float,
         fair_down: float,
     ) -> None:
+        """Place conservative pair-first Maker quotes; fair-value is not an entry trigger."""
         if self.executor is None:
             return
-        if (
-            not self.params.enable_maker
-            or not self._market_feed_connected
-            or window.price_to_beat is None
-            or window.remain_sec <= 15
-            or time.time() - window.start_ts < float(self.params.maker_start_sec)
-        ):
+        gate_reason = None
+        if not self.params.enable_maker:
+            gate_reason = "maker_disabled"
+        elif not self._market_feed_connected:
+            gate_reason = "clob_feed_disconnected"
+        elif window.price_to_beat is None:
+            gate_reason = "missing_settlement_anchor"
+        elif window.remain_sec <= 15:
+            gate_reason = "inside_last_15_seconds"
+        elif time.time() - window.start_ts < float(self.params.maker_start_sec):
+            gate_reason = "maker_start_delay"
+        if gate_reason is not None:
+            self._log_maker_skip(
+                window, "window", gate_reason,
+                remain_sec=round(window.remain_sec, 1),
+                market_feed_connected=self._market_feed_connected,
+                anchor_source=window.price_to_beat_source or "none",
+            )
             await self._cancel_window_maker_orders(window)
             return
 
-        # Empirical median maker fill sizes from the target wallet's 5m history.
-        # These are conservative PAPER seed sizes, not a claim of exact wallet sizing.
-        size_caps = {"BTC": 12.0, "ETH": 11.0, "SOL": 8.0}
-        min_edge = float(self.params.min_maker_edge)
-        min_price = float(self.params.maker_min_price)
-        max_price = float(self.params.maker_max_price)
+        # Historical probability calibration is telemetry-only. Do not use the
+        # unvalidated directional fair-value estimate to select a Maker leg.
+        _ = fair_up, fair_down
+        unpaired_exposure = self._unpaired_exposure_usd()
+        if unpaired_exposure > self.cfg.max_unpaired_exposure_usd + 1e-9:
+            self._log_maker_skip(
+                window, "portfolio", "unpaired_exposure_cap",
+                exposure=round(unpaired_exposure, 4),
+                cap=self.cfg.max_unpaired_exposure_usd,
+            )
+            await self.executor.cancel_all()
+            return
+        pair_max_cost = min(0.999, max(0.50, float(self.params.maker_pair_max_cost)))
+        max_unpaired = min(12.0, max(5.0, float(self.params.maker_max_unpaired_shares)))
         now_mono = time.monotonic()
         now_wall = time.time()
+        candidates: Dict[str, Dict[str, Any]] = {}
 
-        for outcome, token, fair_prob in (
-            ("Up", window.up_token, fair_up),
-            ("Down", window.down_token, fair_down),
+        # Both books must be fresh and valid before either side can be quoted.
+        for outcome, token in (
+            ("Up", window.up_token),
+            ("Down", window.down_token),
         ):
             book = self._market_books.get(token)
-            if not book or now_mono - float(book.get("recv_mono", 0.0)) > 5.0:
-                await self.executor.cancel_all([token])
-                continue
+            book_age = now_mono - float(book.get("recv_mono", 0.0)) if book else None
+            if not book or book_age is None or book_age > 5.0:
+                self._log_maker_skip(
+                    window, outcome, "missing_or_stale_book",
+                    book_age_sec=round(book_age, 2) if book_age is not None else None,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
             min_size = max(
                 float(self.params.maker_min_size),
                 float(book.get("min_order_size") or 0.0),
@@ -962,44 +1361,134 @@ class TradingEngine:
             best_bid, best_ask = self._book_best(book)
             tick = float(book.get("tick_size") or 0.01)
             if (
-                tick <= 0
+                not all(math.isfinite(value) for value in (tick, best_bid, best_ask, min_size))
+                or tick <= 0
                 or best_bid <= 0
                 or best_ask >= 1
                 or best_bid >= best_ask
             ):
-                await self.executor.cancel_all([token])
-                continue
+                self._log_maker_skip(
+                    window, outcome, "invalid_book",
+                    best_bid=best_bid, best_ask=best_ask, tick=tick,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
 
-            # Improve the best bid by one tick where the spread permits, but
-            # never cross the ask. This is a post-only quote, not a taker fill.
-            raw_quote = min(best_bid + tick, best_ask - tick)
-            quote_price = round(math.floor((raw_quote + 1e-12) / tick) * tick, 6)
+            # Join the existing best bid rather than improving it. This
+            # preserves maker priority honestly and avoids pushing pair cost
+            # above the lock-in ceiling just to chase queue position.
+            quote_price = round(math.floor((best_bid + 1e-12) / tick) * tick, 6)
             if (
-                quote_price < min_price
-                or quote_price > max_price
+                quote_price < float(self.params.maker_min_price)
+                or quote_price > float(self.params.maker_max_price)
                 or quote_price >= best_ask - 1e-9
-                or fair_prob - quote_price < min_edge
             ):
+                self._log_maker_skip(
+                    window, outcome, "pair_quote_price_filter",
+                    quote_price=quote_price, best_bid=best_bid,
+                    best_ask=best_ask, tick=tick,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
+            if min_size > max_unpaired + 1e-9:
+                self._log_maker_skip(
+                    window, outcome, "minimum_size_exceeds_unpaired_cap",
+                    min_size=min_size, max_unpaired=max_unpaired,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
+            candidates[outcome] = {
+                "token": token,
+                "book": book,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "tick": tick,
+                "quote_price": quote_price,
+                "min_size": min_size,
+            }
+
+        imbalance = window.up_shares - window.down_shares
+        if imbalance > 1e-6:
+            avg_up_cost = (window.up_cost + window.up_fees) / max(window.up_shares, 1e-9)
+            pair_cost = avg_up_cost + candidates["Down"]["quote_price"]
+            allowed_outcomes = {"Down"}
+            pair_gate = "unpaired_up"
+        elif imbalance < -1e-6:
+            avg_down_cost = (window.down_cost + window.down_fees) / max(window.down_shares, 1e-9)
+            pair_cost = avg_down_cost + candidates["Up"]["quote_price"]
+            allowed_outcomes = {"Up"}
+            pair_gate = "unpaired_down"
+        else:
+            pair_cost = candidates["Up"]["quote_price"] + candidates["Down"]["quote_price"]
+            allowed_outcomes = {"Up", "Down"}
+            pair_gate = "balanced_pair"
+
+        if pair_cost > pair_max_cost + 1e-9:
+            self._log_maker_skip(
+                window, "pair", "pair_cost_filter",
+                pair_gate=pair_gate, pair_cost=round(pair_cost, 5),
+                max_pair_cost=pair_max_cost,
+            )
+            await self._cancel_window_maker_orders(window)
+            return
+
+        for outcome in ("Up", "Down"):
+            candidate = candidates[outcome]
+            token = candidate["token"]
+            quote_price = float(candidate["quote_price"])
+            tick = float(candidate["tick"])
+            book = candidate["book"]
+            min_size = float(candidate["min_size"])
+
+            if outcome not in allowed_outcomes:
                 await self.executor.cancel_all([token])
+                self._log_maker_skip(
+                    window, outcome, "unpaired_side_blocked",
+                    imbalance=round(imbalance, 4),
+                )
                 continue
 
             existing = self.executor.get_open_orders(token)
             if existing:
                 order = existing[0]
-                stale_edge = fair_prob - order.price < min_edge
+                if imbalance > 1e-6 and outcome == "Down":
+                    existing_pair_cost = (
+                        (window.up_cost + window.up_fees)
+                        / max(window.up_shares, 1e-9)
+                        + order.price
+                    )
+                elif imbalance < -1e-6 and outcome == "Up":
+                    existing_pair_cost = (
+                        (window.down_cost + window.down_fees)
+                        / max(window.down_shares, 1e-9)
+                        + order.price
+                    )
+                else:
+                    other = "Down" if outcome == "Up" else "Up"
+                    existing_pair_cost = order.price + float(candidates[other]["quote_price"])
                 moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
-                aged = now_wall - order.created_ts > 20.0
-                if stale_edge or moved or aged:
+                min_requote_age = max(0.0, float(self.params.maker_min_requote_sec))
+                order_age = max(0.0, now_wall - float(order.created_ts))
+                must_cancel = (
+                    existing_pair_cost > pair_max_cost + 1e-9
+                    or order.price >= float(candidate["best_ask"]) - 1e-9
+                )
+                should_requote = moved and order_age >= min_requote_age
+                # Avoid repeatedly surrendering queue priority during fast book
+                # oscillations. Pair-economics violations and a now-crossed quote
+                # still cancel immediately; otherwise a moved quote waits for
+                # the minimum resting age before it may be replaced.
+                if must_cancel or should_requote:
                     for stale in existing:
                         await self.executor.cancel_order(stale.order_id)
                 else:
-                    # Keep queue priority while the quote remains competitive.
                     for extra in existing[1:]:
                         await self.executor.cancel_order(extra.order_id)
                     continue
 
             reserved_total = sum(
-                order.price * order.remaining for order in self.executor.get_open_orders()
+                order.price * order.remaining
+                for order in self.executor.get_open_orders()
             )
             window_reserved = sum(
                 order.price * order.remaining
@@ -1012,23 +1501,44 @@ class TradingEngine:
                 for item in self.windows.values() if not item.resolved
             ) + reserved_total
             if window_exposure >= self.cfg.max_window_risk_usd:
+                self._log_maker_skip(
+                    window, outcome, "window_exposure_cap",
+                    exposure=round(window_exposure, 2),
+                    cap=self.cfg.max_window_risk_usd,
+                )
                 continue
             if total_exposure >= self.cfg.max_total_exposure_usd:
+                self._log_maker_skip(
+                    window, outcome, "total_exposure_cap",
+                    exposure=round(total_exposure, 2),
+                    cap=self.cfg.max_total_exposure_usd,
+                )
                 continue
 
-            size = min(
-                size_caps.get(window.asset, 8.0),
-                float(self.cfg.order_clip_usd) / quote_price,
-            )
+            size = min(max_unpaired, float(self.cfg.order_clip_usd) / quote_price)
             available_cash = min(self.cash, self.executor.cash)
             size = min(size, max(0.0, available_cash / quote_price))
             size = math.floor(size * 100.0) / 100.0
             cost = quote_price * size
+            projected_unpaired_with_order = self._unpaired_exposure_usd() + cost
+            if projected_unpaired_with_order > self.cfg.max_unpaired_exposure_usd + 1e-9:
+                self._log_maker_skip(
+                    window, outcome, "unpaired_exposure_cap",
+                    exposure=round(projected_unpaired_with_order, 4),
+                    cap=self.cfg.max_unpaired_exposure_usd,
+                    order_cost=round(cost, 4),
+                )
+                continue
             if (
                 size < min_size
                 or window_exposure + cost > self.cfg.max_window_risk_usd
                 or total_exposure + cost > self.cfg.max_total_exposure_usd
             ):
+                self._log_maker_skip(
+                    window, outcome, "size_or_risk_filter",
+                    size=round(size, 3), min_size=min_size,
+                    cost=round(cost, 2), available_cash=round(available_cash, 2),
+                )
                 continue
 
             queue_ahead = sum(
@@ -1040,16 +1550,18 @@ class TradingEngine:
                 asset_id=token,
                 price=quote_price,
                 size=size,
-                best_bid=best_bid,
-                best_ask=best_ask,
+                best_bid=float(candidate["best_bid"]),
+                best_ask=float(candidate["best_ask"]),
                 bid_size_at_or_better=queue_ahead,
                 tick_size=tick,
             )
             if order_id:
                 self._log_event(
                     "INFO",
-                    f"📌 PAPER post-only {window.asset} {outcome}: "
-                    f"{size:.2f} шт. по ${quote_price:.4f}; очередь впереди {queue_ahead:.2f}",
+                    f"📌 PAPER pair-maker {window.asset} {outcome}: "
+                    f"{size:.2f} шт. по ${quote_price:.4f}; "
+                    f"pair_cost={pair_cost:.4f}/{pair_max_cost:.4f}; "
+                    f"очередь впереди {queue_ahead:.2f}; slug={window.slug}",
                     notify=False,
                 )
 
@@ -1057,18 +1569,35 @@ class TradingEngine:
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
         now_mono = time.monotonic()
-        if (
-            spot is None
-            or tr.cl_twap60 is None
-            or now_mono - tr.cl_recv_mono > 5.0
-            or now_mono - tr.cl_twap_recv_mono > 5.0
-            or time.time() - tr.cl_spot_ts > 5.0
-            or time.time() - tr.cl_twap60_ts > 5.0
-            or tr._vol_samples < 60
-        ):
+        oracle_reasons = []
+        spot_age = now_mono - tr.cl_recv_mono if tr.cl_recv_mono else None
+        twap_age = now_mono - tr.cl_twap_recv_mono if tr.cl_twap_recv_mono else None
+        if spot is None:
+            oracle_reasons.append("spot_missing")
+        if tr.cl_twap60 is None:
+            oracle_reasons.append("twap60_missing")
+        if spot_age is None or spot_age > 5.0 or time.time() - tr.cl_spot_ts > 5.0:
+            oracle_reasons.append("spot_stale")
+        if twap_age is None or twap_age > 5.0 or time.time() - tr.cl_twap60_ts > 5.0:
+            oracle_reasons.append("twap60_stale")
+        if tr._vol_samples < 60:
+            oracle_reasons.append("volatility_warmup")
+        if oracle_reasons:
+            self._log_maker_skip(w, "oracle", ",".join(oracle_reasons),
+                                 spot_age_sec=round(spot_age, 2) if spot_age is not None else None,
+                                 twap_age_sec=round(twap_age, 2) if twap_age is not None else None,
+                                 volatility_samples=tr._vol_samples)
             await self._cancel_window_maker_orders(w)
             return
         if w.price_to_beat is None:
+            nearest_twap = tr.nearest_twap_sample(w.start_ts)
+            self._log_maker_skip(
+                w, "anchor", "missing_settlement_anchor",
+                anchor_source=w.price_to_beat_source or "none",
+                nearest_twap_ts=round(nearest_twap[0], 3) if nearest_twap else None,
+                nearest_twap_delta_sec=round(nearest_twap[2], 3) if nearest_twap else None,
+                twap_history_samples=len(tr.cl_twap_hist),
+            )
             await self._cancel_window_maker_orders(w)
             return
         try:
@@ -1077,6 +1606,35 @@ class TradingEngine:
             return
 
         tau = w.remain_sec
+        # Compare calibrated probabilities only at the six trained horizons.
+        # The result is telemetry: existing fair_up/fair_dn and all orders below
+        # continue to use the unmodified production model.
+        if w.timeframe == "5m" and self._shadow_calibration:
+            nearest = min(self._shadow_calibration, key=lambda value: abs(tau - value))
+            shadow_key = (w.slug, nearest)
+            if abs(tau - nearest) <= 2.5 and shadow_key not in self._shadow_logged:
+                params = self._shadow_calibration[nearest]
+                try:
+                    shadow = tr.compute_fair_value(
+                        float(w.price_to_beat),
+                        float(w.end_ts),
+                        sigma_multiplier=params["sigma_multiplier"],
+                        jump_weight=params["jump_weight"],
+                    )
+                    log.info(
+                        "PAPER calibration shadow · slug=%s · horizon=%ss · base_up=%.5f "
+                        "shadow_up=%.5f · delta_pp=%.2f · sigma_mult=%.2f · jump_weight=%.2f "
+                        "· execution_model=unchanged",
+                        w.slug, nearest, fv.prob_up, shadow.prob_up,
+                        (shadow.prob_up - fv.prob_up) * 100.0,
+                        params["sigma_multiplier"], params["jump_weight"],
+                    )
+                    self._shadow_logged.add(shadow_key)
+                    if len(self._shadow_logged) > 5000:
+                        self._shadow_logged.clear()
+                except Exception:
+                    log.exception("Could not calculate BTC calibration shadow probability")
+
         fair_up = float(fv.prob_up)
         fair_dn = 1.0 - fair_up
         edge = (
@@ -1110,24 +1668,14 @@ class TradingEngine:
                 w.asset, ask_up, depth_up, ask_dn, depth_dn, ask_up + ask_dn,
             )
 
-        # Pair arb after fees
-        if ask_up is not None and ask_dn is not None and abs(w.net_shares) < 5:
-            max_by_book = min(depth_up, depth_dn) * 0.45
-            sz = min(clip / max(ask_up, ask_dn, 0.05), max_by_book, 20.0)
-            sz = round(max(0.0, sz), 2)
-            if sz >= 5.0 and (ask_up + ask_dn) <= 0.985:
-                fee_up = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe, market_override_rate=w.fee_rate)
-                fee_dn = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
-                total = sz * (ask_up + ask_dn) + fee_up + fee_dn
-                if total < sz * 0.998:
-                    if await self._open_pair(
-                        w, float(ask_up), float(ask_dn), sz, fee_up, fee_dn, fair_up, fair_dn
-                    ):
-                        await self._try_merge(w)
-                        return
+        # Taker is reserved for economically positive completion of an existing
+        # one-sided Maker position below. Do not open fresh balanced pairs as Taker.
 
-        if w.up_shares >= 6 and w.down_shares < w.up_shares and ask_dn is not None:
-            need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
+        if w.up_shares >= 4.5 and w.down_shares < w.up_shares and ask_dn is not None:
+            raw_need = min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0)
+            # CLOB minimum is 5 shares: round a near-complete partial fill up to 5,
+            # leaving at most a few cents of residual exposure, still under the portfolio cap.
+            need = 5.0 if raw_need >= 4.5 and depth_dn * 0.45 >= 5.0 else round(raw_need, 2)
             if need >= 5:
                 vwap_up = w.up_cost / max(w.up_shares, 1e-9)
                 fee_up_per_share = w.up_fees / max(w.up_shares, 1e-9)
@@ -1136,8 +1684,9 @@ class TradingEngine:
                     await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee, fair_prob=fair_dn)
                     await self._try_merge(w)
                     return
-        if w.down_shares >= 6 and w.up_shares < w.down_shares and ask_up is not None:
-            need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
+        if w.down_shares >= 4.5 and w.up_shares < w.down_shares and ask_up is not None:
+            raw_need = min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0)
+            need = 5.0 if raw_need >= 4.5 and depth_up * 0.45 >= 5.0 else round(raw_need, 2)
             if need >= 5:
                 vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
                 fee_dn_per_share = w.down_fees / max(w.down_shares, 1e-9)
@@ -1161,13 +1710,15 @@ class TradingEngine:
                     await self._open(w, "Down", float(ask_dn), sz, "lockin", fee=fee, fair_prob=fair_dn)
                     return
 
-        want_up = (
+        # Directional entries rely on an uncalibrated heuristic fair-value model.
+        # Keep them disabled by default; profitable pair completion above remains active.
+        want_up = self.params.enable_directional_taker and (
             ask_up is not None and fair_up >= 0.56
             and ask_up <= fair_up - edge
             and 0.20 <= ask_up <= 0.90
             and w.up_shares < max_side and depth_up >= 5
         )
-        want_dn = (
+        want_dn = self.params.enable_directional_taker and (
             ask_dn is not None and fair_dn >= 0.56
             and ask_dn <= fair_dn - edge
             and 0.20 <= ask_dn <= 0.90
@@ -1190,98 +1741,6 @@ class TradingEngine:
                 fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe, market_override_rate=w.fee_rate)
                 await self._open(w, "Down", float(ask_dn), sz, "taker_entry", fee=fee, fair_prob=fair_dn)
                 return
-
-    async def _open_pair(
-        self,
-        w: WindowState,
-        price_up: float,
-        price_down: float,
-        size: float,
-        fee_up: float,
-        fee_down: float,
-        fair_up: float,
-        fair_down: float,
-    ) -> bool:
-        """All-or-nothing PAPER accounting for a paired Up/Down entry."""
-        if size < 5.0 or not (0 < price_up < 1 and 0 < price_down < 1):
-            return False
-        if fee_up < 0 or fee_down < 0:
-            return False
-        combined_cost = size * (price_up + price_down) + fee_up + fee_down
-        reserved_total = sum(
-            order.price * order.remaining for order in self.executor.get_open_orders()
-        ) if self.executor is not None else 0.0
-        window_reserved = sum(
-            order.price * order.remaining
-            for token in (w.up_token, w.down_token)
-            for order in (self.executor.get_open_orders(token) if self.executor is not None else [])
-        )
-        window_exposure = w.up_cost + w.down_cost + window_reserved
-        total_exposure = sum(
-            max(0.0, item.up_cost) + max(0.0, item.down_cost)
-            for item in self.windows.values() if not item.resolved
-        ) + reserved_total
-        available_cash = min(
-            self.cash,
-            self.executor.cash if self.executor is not None else self.cash,
-        )
-        if window_exposure + combined_cost > self.cfg.max_window_risk_usd:
-            return False
-        if total_exposure + combined_cost > self.cfg.max_total_exposure_usd:
-            return False
-        if combined_cost > available_cash + 1e-9:
-            return False
-        ts = time.time()
-        fills = [
-            {
-                "ts": ts, "mode": self.cfg.trading_mode, "slug": w.slug,
-                "condition_id": w.condition_id, "asset": w.asset, "timeframe": w.timeframe,
-                "outcome": "Up", "role": "TAKER_CLOB", "reason": "pair_arb",
-                "shares": size, "price": price_up, "fee": fee_up, "fair_prob": fair_up,
-                "tx_or_order_id": f"paper-pair-up-{time.time_ns()}",
-            },
-            {
-                "ts": ts, "mode": self.cfg.trading_mode, "slug": w.slug,
-                "condition_id": w.condition_id, "asset": w.asset, "timeframe": w.timeframe,
-                "outcome": "Down", "role": "TAKER_CLOB", "reason": "pair_arb",
-                "shares": size, "price": price_down, "fee": fee_down, "fair_prob": fair_down,
-                "tx_or_order_id": f"paper-pair-down-{time.time_ns()}",
-            },
-        ]
-        pair_event_key = str(fills[0]["tx_or_order_id"])
-        pair_message = (
-            f"🟢 PAPER-пара Up/Down {w.asset}: {size:.2f} + {size:.2f} шт; "
-            f"цены {price_up:.4f}/{price_down:.4f}; комиссии ${fee_up + fee_down:.4f}; "
-            f"общая стоимость ${combined_cost:.4f}\n<code>{w.slug}</code>"
-        )
-        try:
-            self.ledger.record_fills_atomic(
-                fills,
-                notification_message=pair_message,
-                notification_event_key=pair_event_key,
-            )
-        except Exception as exc:
-            log.exception("PAPER pair not persisted; refusing both legs: %s", exc)
-            return False
-        # Keep the executor's spendable cash synchronized with the engine
-        # after an atomic paired taker entry. Resting maker reservations already
-        # reduce executor.cash, so this debit must happen only after the ledger
-        # transaction succeeds.
-        if self.executor is not None:
-            self.executor.cash -= combined_cost
-        w.up_shares += size
-        w.down_shares += size
-        w.up_cost += size * price_up
-        w.down_cost += size * price_down
-        w.up_fees += fee_up
-        w.down_fees += fee_down
-        w.last_trade_mono = time.monotonic()
-        self.cash -= combined_cost
-        self.fees_paid += fee_up + fee_down
-        self._log_event(
-            "INFO", pair_message, notify=True, notification_key=pair_event_key,
-        )
-        return True
 
     async def _open(self, w, outcome, price, size, reason, fee: float = 0.0, fair_prob: Optional[float] = None) -> None:
         price = float(price)  # preserve exact CLOB tick price; never round a real quote
@@ -1326,6 +1785,27 @@ class TradingEngine:
             cost = price * size + fee
         if cost > available_cash + 1e-9:
             return
+        # Enforce the portfolio cap on Taker paths too; opposite-side completion
+        # reduces unmatched exposure, while a new directional leg increases it.
+        projected_up_shares = w.up_shares + (size if outcome == "Up" else 0.0)
+        projected_down_shares = w.down_shares + (size if outcome == "Down" else 0.0)
+        projected_up_cost = w.up_cost + (price * size if outcome == "Up" else 0.0)
+        projected_down_cost = w.down_cost + (price * size if outcome == "Down" else 0.0)
+        projected_up_fees = w.up_fees + (fee if outcome == "Up" else 0.0)
+        projected_down_fees = w.down_fees + (fee if outcome == "Down" else 0.0)
+        other_unpaired = self._unpaired_exposure_usd(exclude_slug=w.slug, include_orders=False)
+        pending_reserve = sum(order.price * order.remaining for order in self.executor.get_open_orders()) if self.executor is not None else 0.0
+        projected_unpaired = other_unpaired + pending_reserve + self._unpaired_cost(
+            projected_up_shares, projected_down_shares,
+            projected_up_cost, projected_down_cost, projected_up_fees, projected_down_fees,
+        )
+        if projected_unpaired > self.cfg.max_unpaired_exposure_usd + 1e-9:
+            self._log_event(
+                "WARNING",
+                f"Taker skipped: unmatched exposure ${projected_unpaired:.2f} exceeds ${self.cfg.max_unpaired_exposure_usd:.2f} cap; {w.slug}",
+                notify=False,
+            )
+            return
         fill = {
             "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
             "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
@@ -1336,7 +1816,6 @@ class TradingEngine:
             "taker_entry": "CLOB ask дешевле fair (Taker PAPER simulation)",
             "lockin": "lock-in по CLOB",
             "syn_tp": "добор пары по CLOB",
-            "pair_arb": "пара CLOB+fee < $1",
         }.get(reason, reason)
         fee_s = f" · fee ${fee:.3f}" if fee > 0 else ""
         taker_event_key = f"paper-clob-{time.time_ns()}"
@@ -1377,7 +1856,7 @@ class TradingEngine:
 
     async def _try_merge(self, w: WindowState) -> None:
         pairs = w.mergeable_pairs
-        if pairs < 5 and not (pairs >= 1 and abs(w.net_shares) < 0.5):
+        if pairs < 1.0:
             return
         if w.merge_in_flight:
             return
@@ -1451,9 +1930,67 @@ class TradingEngine:
                     if w.remain_sec > -3:
                         continue
                     await self._resolve(w)
+                await self._reconcile_pending_anchors()
             except Exception as e:
                 log.warning("resolve: %s", e)
             await asyncio.sleep(3)
+
+    async def _reconcile_pending_anchors(self) -> None:
+        """Retry RTDS-vs-Gamma checks after official resolution if Gamma lagged."""
+        now_mono = time.monotonic()
+        pending = self.ledger.unverified_resolutions(self.cfg.trading_mode, limit=100)
+        if not pending:
+            return
+        start = self._anchor_reconcile_cursor % len(pending)
+        batch = [pending[(start + index) % len(pending)] for index in range(min(5, len(pending)))]
+        self._anchor_reconcile_cursor = (start + len(batch)) % len(pending)
+        for row in batch:
+            slug = str(row["slug"])
+            if now_mono - self._anchor_reconcile_last.get(slug, 0.0) < 60.0:
+                continue
+            self._anchor_reconcile_last[slug] = now_mono
+            try:
+                meta = await self._gamma(slug)
+                gamma_value = (meta or {}).get("price_to_beat")
+                if gamma_value is None:
+                    continue
+                rtds_value = float(row["price_to_beat"])
+                gamma_price = float(gamma_value)
+                delta = abs(rtds_value - gamma_price)
+                verified = delta <= 0.01
+                self.ledger.record_anchor_check(
+                    mode=self.cfg.trading_mode,
+                    slug=slug,
+                    price_to_beat=rtds_value,
+                    price_to_beat_source=str(row["price_to_beat_source"] or ""),
+                    gamma_price_to_beat=gamma_price,
+                    anchor_delta=delta,
+                    anchor_verified=verified,
+                )
+                if verified:
+                    log.info(
+                        "PAPER settlement anchor reconciled · slug=%s · verified=true · delta=$%.4f",
+                        slug, delta,
+                    )
+                else:
+                    self.paused = True
+                    self._pause_reason = "risk"
+                    self._risk_halt_active = True
+                    self._risk_halt_reason = (
+                        f"Chainlink/Gamma settlement-anchor mismatch: {slug}, delta ${delta:.4f}"
+                    )
+                    if self.executor is not None:
+                        await self.executor.cancel_all()
+                    self._log_event(
+                        "ALERT",
+                        f"Поздняя сверка Chainlink/Gamma выявила несовпадение Δ ${delta:.4f} · "
+                        f"торговля поставлена на паузу · {slug}",
+                        notify=True,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Delayed settlement-anchor audit failed for %s: %s", slug, exc)
 
     async def _resolve(self, w: WindowState) -> None:
         # Preserve the closest real settlement-feed observation for diagnostics.
@@ -1466,6 +2003,9 @@ class TradingEngine:
         # A market is resolved only by Polymarket's official resolution endpoint.
         # Never infer the winner from Coinbase/Binance spot or the bot's inventory.
         winner = None
+        resolution_reason = "no_resolution_rows"
+        response_status = None
+        rows_count = 0
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1474,31 +2014,50 @@ class TradingEngine:
                     f"?condition_id={w.condition_id}"
                 )
                 async with session.get(url) as response:
-                    if response.status == 200:
+                    response_status = response.status
+                    if response.status != 200:
+                        resolution_reason = f"http_{response.status}"
+                    else:
                         payload = await response.json()
                         rows = payload.get("data") if isinstance(payload, dict) else None
                         if isinstance(rows, dict):
                             rows = [rows]
-                        for item in rows or []:
-                            if str(item.get("status", "")).lower() != "resolved":
+                        rows = rows or []
+                        rows_count = len(rows)
+                        for item in rows:
+                            status = str(item.get("status", "")).lower()
+                            if status != "resolved":
+                                resolution_reason = f"status_{status or 'missing'}"
                                 continue
                             payouts = item.get("payouts") or []
                             if len(payouts) < 2:
+                                resolution_reason = "missing_payouts"
                                 continue
                             up_payout, down_payout = float(payouts[0]), float(payouts[1])
                             if up_payout > down_payout:
                                 winner = "Up"
                             elif down_payout > up_payout:
                                 winner = "Down"
+                            else:
+                                resolution_reason = "equal_payouts"
                             break
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("official resolution lookup failed for %s: %s", w.slug, exc)
+            resolution_reason = f"request_error_{type(exc).__name__}"
 
         if winner is None:
             # Data API can lag settlement. Keep the market pending; never book a
             # guessed winner or manufacture PnL while the authoritative result is absent.
+            now_mono = time.monotonic()
+            if now_mono - self._resolution_diag_last.get(w.slug, 0.0) >= 60.0:
+                self._resolution_diag_last[w.slug] = now_mono
+                self._log_event(
+                    "WARNING",
+                    f"PAPER resolution pending · slug={w.slug} · http={response_status} "
+                    f"rows={rows_count} · reason={resolution_reason}",
+                    notify=False,
+                )
             return
         # Once Gamma publishes the settled priceToBeat, compare it with the
         # RTDS boundary sample used for trading. A material mismatch is a data
@@ -1520,6 +2079,7 @@ class TradingEngine:
                 anchor_verified = anchor_delta <= 0.01
                 if not anchor_verified:
                     self.paused = True
+                    self._pause_reason = "risk"
                     self._risk_halt_active = True
                     self._risk_halt_reason = (
                         f"Chainlink/Gamma settlement-anchor mismatch: {w.slug}, "
@@ -1606,6 +2166,13 @@ class TradingEngine:
         except Exception:
             stats = {}
         try:
+            session_stats = self.ledger.get_session_stats(
+                self.cfg.trading_mode, self.cfg.paper_stats_since_ts
+            )
+        except Exception as exc:
+            log.error("Unable to calculate clean PAPER session stats: %s", exc)
+            session_stats = {"enabled": False, "reason": "session stats unavailable"}
+        try:
             portfolio = self.ledger.portfolio_state(self.cfg.trading_mode, self.cfg.bankroll_usd)
             inv = float(portfolio["inventory_cost"])
             equity = float(portfolio["equity"])
@@ -1619,6 +2186,9 @@ class TradingEngine:
             inv = 0.0
             equity = 0.0
             cash = 0.0
+        mtm_state = self._mark_to_market_state()
+        if mtm_state["complete"]:
+            equity = cash + float(mtm_state["market_value"])
         reserved_orders = self.executor.get_open_orders() if self.executor is not None else []
         reserved_orders_usd = sum(order.price * order.remaining for order in reserved_orders)
         available_cash = max(0.0, cash - reserved_orders_usd)
@@ -1657,6 +2227,13 @@ class TradingEngine:
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
             "cash": round(cash, 2),
+            "mark_to_market_complete": bool(mtm_state["complete"]),
+            "market_value": round(float(mtm_state["market_value"]), 2) if mtm_state["complete"] else None,
+            "unrealized_pnl": round(float(mtm_state["unrealized_pnl"]), 2) if mtm_state["complete"] else None,
+            "unpaired_exposure_usd": round(float(mtm_state["unpaired_exposure_usd"]), 2) if mtm_state["complete"] else None,
+            "unpaired_exposure_limit_usd": round(self.cfg.max_unpaired_exposure_usd, 2),
+            "unpaired_exposure_with_orders_usd": round(self._unpaired_exposure_usd(), 2),
+            "mark_to_market_reason": str(mtm_state.get("reason") or ""),
             "available_cash": round(available_cash, 2),
             "reserved_maker_orders_usd": round(reserved_orders_usd, 2),
             "maker_orders_open": len(reserved_orders),
@@ -1665,13 +2242,14 @@ class TradingEngine:
             "fees_paid": round(self.fees_paid, 4),
             "total_exposure": round(inv, 2),
             "stats": stats,
+            "session_stats": session_stats,
             "windows": windows,
             "events": self.events[-40:],
             "fee_regime": fee_regime_label(),
             "assets": self.cfg.enabled_assets,
             "streams_ok": self._oracle_fresh(),
             "oracle_connected": self._oracle_fresh(),
-            "model_ready": all(t._vol_samples >= 60 for t in self.trackers.values()),
+            "model_ready": all(self.trackers[a]._vol_samples >= 60 for a in self.cfg.enabled_assets),
             "oracle_source": "Polymarket RTDS Chainlink spot + 60s TWAP",
             "strike_source": "RTDS Chainlink TWAP60 within 0.5s of window start; Gamma priceToBeat only after close; crypto-price.openPrice is diagnostic only",
             "clob_feed_connected": self._market_feed_connected,
@@ -1682,6 +2260,7 @@ class TradingEngine:
             "risk_halt_active": self._risk_halt_active,
             "risk_halt_reason": self._risk_halt_reason,
             "oracle_last_event_ts": self._oracle_last_event_ts,
+            "oracle_diagnostics": self._oracle_diagnostics(),
             "fill_history": self.ledger.recent_fills(self.cfg.trading_mode, 20),
             "merge_history": self.ledger.recent_merges(self.cfg.trading_mode, 10),
             "resolve_history": self.ledger.recent_resolutions(self.cfg.trading_mode, 10),

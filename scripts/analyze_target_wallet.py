@@ -85,7 +85,20 @@ def build_analysis(
     asset_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {
         "fills": 0, "notional_usdc": Decimal("0"), "maker_fills": 0, "taker_fills": 0
     })
+    timeframe_stats: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "fills": 0, "notional_usdc": Decimal("0"), "maker_fills": 0, "taker_fills": 0
+    })
+    price_buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "fills": 0, "shares": Decimal("0"), "notional_usdc": Decimal("0"),
+        "maker_fills": 0, "taker_fills": 0
+    })
+    # Net token inventory per market/outcome: BUY adds shares, SELL removes them.
+    # Gross buys alone are not a position and can falsely suggest paired inventory.
     market_sides: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    fill_sizes: list[float] = []
+    fill_timestamps: list[int] = []
+    market_fill_counts: Counter[str] = Counter()
+    market_notional: Counter[str] = Counter()
     market_info: dict[str, dict[str, str]] = {}
 
     for row in classified:
@@ -93,6 +106,14 @@ def build_analysis(
         size = _decimal(row.get("size"))
         price = _decimal(row.get("price"))
         notional = size * price
+        if size > 0:
+            fill_sizes.append(float(size))
+        try:
+            timestamp = int(row.get("timestamp") or 0)
+            if timestamp > 0:
+                fill_timestamps.append(timestamp)
+        except (TypeError, ValueError):
+            pass
         role_count[role] += 1
         role_notional[role] += notional
         side_count[str(row.get("side") or "UNKNOWN").upper()] += 1
@@ -100,11 +121,34 @@ def build_analysis(
         asset_stats[asset]["fills"] += 1
         asset_stats[asset]["notional_usdc"] += notional
         asset_stats[asset][f"{role.lower()}_fills"] += 1
+        timeframe_stats[timeframe]["fills"] += 1
+        timeframe_stats[timeframe]["notional_usdc"] += notional
+        timeframe_stats[timeframe][f"{role.lower()}_fills"] += 1
+        # Price distribution is reported separately from profitability: a fill
+        # price alone says nothing about whether the position later won.
+        price_bucket = (
+            "0.00-0.10" if price < Decimal("0.10") else
+            "0.10-0.20" if price < Decimal("0.20") else
+            "0.20-0.30" if price < Decimal("0.30") else
+            "0.30-0.40" if price < Decimal("0.40") else
+            "0.40-0.50" if price < Decimal("0.50") else
+            "0.50-0.60" if price < Decimal("0.60") else
+            "0.60-0.70" if price < Decimal("0.70") else
+            "0.70-0.80" if price < Decimal("0.80") else
+            "0.80-0.90" if price < Decimal("0.90") else
+            "0.90-1.00"
+        )
+        price_buckets[price_bucket]["fills"] += 1
+        price_buckets[price_bucket]["shares"] += size
+        price_buckets[price_bucket]["notional_usdc"] += notional
+        price_buckets[price_bucket][f"{role.lower()}_fills"] += 1
         slug = str(row.get("slug") or row.get("condition_id") or "UNKNOWN")
+        market_fill_counts[slug] += 1
+        market_notional[slug] += notional
         outcome = str(row.get("outcome") or "").lower()
         side = str(row.get("side") or "").upper()
-        if side == "BUY" and outcome in ("up", "down"):
-            market_sides[slug][outcome] += size
+        if side in ("BUY", "SELL") and outcome in ("up", "down"):
+            market_sides[slug][outcome] += size if side == "BUY" else -size
         market_info[slug] = {
             "asset": asset,
             "timeframe": timeframe,
@@ -113,17 +157,26 @@ def build_analysis(
 
     paired_markets = []
     for slug, sides in market_sides.items():
-        up = sides.get("up", Decimal("0"))
-        down = sides.get("down", Decimal("0"))
+        up_net = sides.get("up", Decimal("0"))
+        down_net = sides.get("down", Decimal("0"))
+        up = max(Decimal("0"), up_net)
+        down = max(Decimal("0"), down_net)
         total = up + down
-        if total > 0:
+        if total > 0 or up_net < 0 or down_net < 0:
             paired_markets.append({
                 "slug": slug,
                 **market_info.get(slug, {}),
-                "up_buy_shares": float(up),
-                "down_buy_shares": float(down),
+                "up_net_shares": float(up_net),
+                "down_net_shares": float(down_net),
+                "up_net_long_shares": float(up),
+                "down_net_long_shares": float(down),
                 "paired_shares": float(min(up, down)),
-                "paired_share_ratio": float((Decimal(2) * min(up, down)) / total),
+                "paired_share_ratio": float((Decimal(2) * min(up, down)) / total) if total > 0 else 0.0,
+                "unpaired_shares": float(abs(up - down)),
+                "one_sided_share_pct": round(100 * float(abs(up - down) / total), 3) if total > 0 else 0.0,
+                "negative_net_share_anomaly": up_net < 0 or down_net < 0,
+                "fill_rows": int(market_fill_counts[slug]),
+                "notional_usdc": float(market_notional[slug]),
             })
     paired_markets.sort(key=lambda x: x["paired_shares"], reverse=True)
 
@@ -133,6 +186,8 @@ def build_analysis(
         activity_usdc[str(row.get("type") or "UNKNOWN").upper()] += _decimal(row.get("usdc_size"))
 
     total = len(classified)
+    ordered_timestamps = sorted(fill_timestamps)
+    fill_gaps = [float(b - a) for a, b in zip(ordered_timestamps, ordered_timestamps[1:]) if b >= a]
     total_notional = sum(role_notional.values(), Decimal("0"))
     maker_count = role_count["MAKER"]
     maker_notional = role_notional["MAKER"]
@@ -144,6 +199,7 @@ def build_analysis(
             "classified_rows": total,
             "unmatched_taker_rows": unmatched_taker,
             "pagination_pages": page_counts,
+            "maker_taker_classification_valid": unmatched_taker == 0 and len(taker_rows) <= len(all_rows),
             "classification_note": (
                 "MAKER rows are the multiset difference between taker_only=false and "
                 "taker_only=true feeds. Review unmatched_taker_rows and raw files before "
@@ -161,6 +217,18 @@ def build_analysis(
             "taker_notional_usdc": float(role_notional["TAKER"]),
             "maker_notional_pct": round(100 * float(maker_notional / total_notional), 3) if total_notional else 0.0,
             "side_counts": dict(side_count),
+            "fill_size_shares": {
+                "count": len(fill_sizes),
+                "mean": round(statistics.mean(fill_sizes), 6) if fill_sizes else None,
+                "median": round(statistics.median(fill_sizes), 6) if fill_sizes else None,
+                "min": min(fill_sizes) if fill_sizes else None,
+                "max": max(fill_sizes) if fill_sizes else None,
+            },
+            "fill_cadence_seconds": {
+                "interval_count": len(fill_gaps),
+                "median_inter_fill_seconds": round(statistics.median(fill_gaps), 3) if fill_gaps else None,
+                "mean_inter_fill_seconds": round(statistics.mean(fill_gaps), 3) if fill_gaps else None,
+            },
         },
         "by_asset": {
             asset: {
@@ -171,7 +239,28 @@ def build_analysis(
             }
             for asset, values in sorted(asset_stats.items())
         },
-        "paired_up_down_buy_markets": paired_markets,
+        "by_timeframe": {
+            timeframe: {
+                "fills": values["fills"],
+                "notional_usdc": float(values["notional_usdc"]),
+                "maker_fills": values["maker_fills"],
+                "taker_fills": values["taker_fills"],
+                "maker_fill_pct": round(100 * values["maker_fills"] / values["fills"], 3)
+                    if values["fills"] else 0.0,
+            }
+            for timeframe, values in sorted(timeframe_stats.items())
+        },
+        "by_entry_price_bucket": {
+            bucket: {
+                "fills": values["fills"],
+                "shares": float(values["shares"]),
+                "notional_usdc": float(values["notional_usdc"]),
+                "maker_fills": values["maker_fills"],
+                "taker_fills": values["taker_fills"],
+            }
+            for bucket, values in sorted(price_buckets.items())
+        },
+        "net_up_down_inventory_markets": paired_markets,
         "activity": {
             "event_counts": dict(activity_types),
             "usdc_by_type": {k: float(v) for k, v in activity_usdc.items()},
@@ -308,7 +397,9 @@ def main() -> None:
         "data_quality": result.get("data_quality"),
         "trade_summary": result.get("trade_summary"),
         "by_asset": result.get("by_asset"),
-        "top_paired_markets": (result.get("paired_up_down_buy_markets") or [])[:30],
+        "by_timeframe": result.get("by_timeframe"),
+        "by_entry_price_bucket": result.get("by_entry_price_bucket"),
+        "top_net_inventory_markets": (result.get("net_up_down_inventory_markets") or [])[:30],
         "activity": result.get("activity"),
         "official_user_stats": result.get("official_user_stats"),
         "official_user_pnl": {

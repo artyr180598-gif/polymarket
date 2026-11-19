@@ -21,7 +21,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .fees import calc_taker_fee_usdc
 
@@ -64,6 +64,38 @@ class PaperExecutor:
         self.fills: List[PaperFill] = []
         self.positions: Dict[str, float] = {}  # asset_id -> shares
         self._latency_sec = 0.120
+        self._order_event_callback: Optional[Callable[[dict[str, Any]], None]] = None
+
+    def set_order_event_callback(
+        self, callback: Optional[Callable[[dict[str, Any]], None]]
+    ) -> None:
+        self._order_event_callback = callback
+
+    def _emit_order_event(self, action: str, order: PaperOrder, **extra: Any) -> None:
+        callback = self._order_event_callback
+        if callback is None:
+            return
+        event = {
+            "type": "paper_order",
+            "action": action,
+            "event_ts": time.time(),
+            "order_id": order.order_id,
+            "asset_id": order.asset_id,
+            "side": order.side,
+            "price": order.price,
+            "size": order.size,
+            "remaining": order.remaining,
+            "post_only": order.post_only,
+            "created_ts": order.created_ts,
+            "queue_ahead": order.queue_ahead,
+            "status": order.status,
+            **extra,
+        }
+        try:
+            callback(event)
+        except Exception:
+            # Research capture must never interrupt PAPER execution.
+            log.exception("PAPER order-event capture callback failed")
 
     @property
     def equity(self) -> float:
@@ -111,7 +143,7 @@ class PaperExecutor:
         oid = str(uuid.uuid4())[:12]
         # Queue position: volume of bids at better or equal price
         queue_ahead = max(0.0, bid_size_at_or_better)
-        self.orders[oid] = PaperOrder(
+        order = PaperOrder(
             order_id=oid,
             asset_id=asset_id,
             side="BUY",
@@ -122,7 +154,9 @@ class PaperExecutor:
             created_ts=time.time(),
             queue_ahead=queue_ahead,
         )
+        self.orders[oid] = order
         self.cash -= cost  # reserve
+        self._emit_order_event("placed", order)
         return oid
 
     async def place_market_buy(
@@ -165,6 +199,7 @@ class PaperExecutor:
         last_trade_price: Optional[float] = None,
         last_trade_size: float = 0.0,
         last_trade_side: str = "",
+        trade_ts: Optional[float] = None,
     ) -> List[PaperFill]:
         """Progress queue and generate maker fills when tape eats through us."""
         now = time.time()
@@ -182,6 +217,14 @@ class PaperExecutor:
                 continue
             if now - o.created_ts < self._latency_sec:
                 continue
+            # Use the exchange event timestamp, not local receive time: delayed
+            # WebSocket prints must never fill an order that did not yet exist.
+            if (
+                trade_ts is None
+                or not math.isfinite(trade_ts)
+                or trade_ts < o.created_ts + self._latency_sec
+            ):
+                continue
             # If market moved through our price against us while resting — still maker if we were resting
             if o.post_only and o.price >= best_ask - 1e-9:
                 # Book crossed us; cancel rather than take
@@ -198,7 +241,9 @@ class PaperExecutor:
                 or not 0 < last_trade_price < 1
                 or not math.isfinite(last_trade_size)
                 or last_trade_size <= 0
-                or last_trade_price > o.price + 1e-9
+                # A print below our limit does not reveal how much traded at
+                # our exact price during the sweep. Do not infer a fill from it.
+                or abs(last_trade_price - o.price) > 1e-6
             ):
                 continue
             # First consume the visible queue that was ahead when we joined.
@@ -230,6 +275,11 @@ class PaperExecutor:
             if o.remaining < 0.01:
                 o.status = "filled"
                 o.remaining = 0.0
+            self._emit_order_event(
+                "fill", o, fill_size=fill_size, trade_ts=trade_ts,
+                trade_price=last_trade_price, trade_size=last_trade_size,
+                trade_side=last_trade_side,
+            )
         return new_fills
 
     def confirm_fill(self, fill: PaperFill) -> None:
@@ -254,6 +304,7 @@ class PaperExecutor:
             if fill.queue_ahead_before is not None:
                 order.queue_ahead = fill.queue_ahead_before
             order.status = "open"
+            self._emit_order_event("rollback", order, rollback_size=fill.size)
         return True
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -261,8 +312,10 @@ class PaperExecutor:
         if not o or o.status != "open":
             return False
         o.status = "canceled"
+        canceled_remaining = o.remaining
         self.cash += o.price * o.remaining
         o.remaining = 0.0
+        self._emit_order_event("canceled", o, canceled_remaining=canceled_remaining)
         return True
 
     async def cancel_all(self, asset_ids: Optional[List[str]] = None) -> int:

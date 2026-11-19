@@ -124,15 +124,22 @@ class AssetPriceTracker:
         if self.cl_spot is not None and self.basis_ema is None and abs(ts - self.cl_spot_ts) <= 5.0:
             self.basis_ema = price - self.cl_spot
 
-    def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
-        # Use source timestamps, not rounded dictionary keys, to select the
-        # closest sample to the exact market boundary.
+    def nearest_twap_sample(self, epoch_sec: float) -> Optional[Tuple[float, float, float]]:
+        """Return (source timestamp, value, absolute distance) for diagnostics."""
         nearest = min(
             self.cl_twap_hist,
             key=lambda item: abs(item[0] - epoch_sec),
             default=None,
         )
-        if nearest is not None and abs(nearest[0] - epoch_sec) <= max_diff_sec:
+        if nearest is None:
+            return None
+        return nearest[0], nearest[1], abs(nearest[0] - epoch_sec)
+
+    def lookup_twap_at(self, epoch_sec: float, max_diff_sec: float = 45.0) -> Optional[float]:
+        # Use source timestamps, not rounded dictionary keys, to select the
+        # closest sample to the exact market boundary.
+        nearest = self.nearest_twap_sample(epoch_sec)
+        if nearest is not None and nearest[2] <= max_diff_sec:
             return nearest[1]
         return None
 
@@ -144,7 +151,14 @@ class AssetPriceTracker:
         hi = MAX_SIGMA_1S.get(self.asset, 0.0006)
         return max(lo, min(hi, s))
 
-    def compute_fair_value(self, price_to_beat: float, end_ts: float) -> FairValueQuote:
+    def compute_fair_value(
+        self,
+        price_to_beat: float,
+        end_ts: float,
+        *,
+        sigma_multiplier: float = 1.0,
+        jump_weight: float = 0.12,
+    ) -> FairValueQuote:
         now = time.time()
         tau = max(0.0, end_ts - now)
         if self.cl_spot is None or price_to_beat <= 0:
@@ -161,7 +175,7 @@ class AssetPriceTracker:
             lead_bps = 10000.0 * residual / s_cl if s_cl else 0.0
             s_hat = s_cl + 0.55 * residual
 
-        sig = self.sigma_1s
+        sig = self.sigma_1s * max(0.1, min(5.0, float(sigma_multiplier)))
         if tau >= 60.0:
             mean_final = s_hat
             var = (s_cl * sig) ** 2 * (tau - 40.0)
@@ -176,7 +190,7 @@ class AssetPriceTracker:
             prob = 1.0 if mean_final >= price_to_beat else 0.0
         else:
             z = (mean_final - price_to_beat) / std
-            prob = fat_tail_cdf(z)
+            prob = fat_tail_cdf(z, jump_weight=max(0.0, min(0.8, float(jump_weight))))
 
         prob = max(0.01, min(0.99, prob))
         return FairValueQuote(

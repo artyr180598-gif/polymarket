@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import sys
+from pathlib import Path
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -36,6 +39,27 @@ def main() -> None:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        archive_task: asyncio.Task | None = None
+        archive_from = os.getenv("POLYTICKTAPE_ARCHIVE_FROM", "").strip()
+        archive_to = os.getenv("POLYTICKTAPE_ARCHIVE_TO", "").strip()
+        archive_key = os.getenv("POLYTICKTAPE_KEY", "").strip()
+        archive_dir = Path(cfg.db_path).parent / "market-data" / "polyticktape"
+        cached_report = None
+        if archive_key and archive_from and archive_to:
+            from bot.historical_data import load_cached_calibration_report
+
+            cached_report = load_cached_calibration_report(
+                str(archive_dir), archive_from, archive_to
+            )
+            if cached_report is not None:
+                # Load the verified shadow parameters before engine.start() creates
+                # market tasks, so the first eligible window cannot miss diagnostics.
+                engine.set_shadow_calibration(cached_report)
+                log.info(
+                    "Poly Tick Tape verified calibration report loaded from cache · "
+                    "range=%s..%s · raw archive download skipped",
+                    archive_from, archive_to,
+                )
         log.info(
             "Boot mode=%s bankroll=%s tg_token=%s tg_chat=%s",
             cfg.trading_mode,
@@ -43,6 +67,8 @@ def main() -> None:
             "yes" if cfg.telegram_bot_token else "NO",
             cfg.telegram_chat_id or "NO",
         )
+        if cfg.trading_mode == "paper":
+            log.info("PAPER experiment session starts at unix_ts=%.0f", cfg.paper_stats_since_ts)
         # Attach the notifier before engine.start(): startup can discover and fill
         # PAPER orders before Telegram's polling session is fully initialized.
         engine.set_notifier(tg.notify)
@@ -55,15 +81,38 @@ def main() -> None:
             await tg.start()
             engine._notification_channel_ready = bool(tg.enabled and tg._delivery_ready)
             if not engine._notification_channel_ready:
-                engine.pause()
+                engine.pause(reason="telegram_delivery", notify=False)
                 log.error("Telegram is not configured; PAPER trading is paused until trade notifications are available")
         except Exception:
             engine._notification_channel_ready = False
             log.exception("telegram.start failed; pausing PAPER trading")
-            engine.pause()
+            engine.pause(reason="telegram_delivery", notify=False)
+        if archive_key and archive_from and archive_to and cached_report is None:
+            from bot.historical_data import download_and_calibrate
+
+            async def run_archive_job() -> None:
+                try:
+                    report = await download_and_calibrate(
+                        archive_key, str(archive_dir), archive_from, archive_to
+                    )
+                    engine.set_shadow_calibration(report)
+                except Exception:
+                    log.exception("Poly Tick Tape archive download/calibration failed")
+
+            archive_task = asyncio.create_task(
+                run_archive_job(), name="polyticktape_archive_calibration"
+            )
+            log.info(
+                "Poly Tick Tape archive job scheduled for %s..%s",
+                archive_from, archive_to,
+            )
         try:
             yield
         finally:
+            if archive_task is not None:
+                if not archive_task.done():
+                    archive_task.cancel()
+                await asyncio.gather(archive_task, return_exceptions=True)
             try:
                 await tg.stop()
             except Exception:
