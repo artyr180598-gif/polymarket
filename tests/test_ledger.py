@@ -689,3 +689,64 @@ def test_timeframe_stats_separate_completed_markets_from_partial_merges_and_open
     assert fifteen["open_inventory_cost"] == 1.2
     assert fifteen["open_fees"] == 0.025
     ledger.conn.close()
+
+def test_session_stats_excludes_later_fills_on_markets_started_before_epoch(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "session-epoch.db"))
+
+    def fill(slug: str, ts: float, outcome: str, price: float) -> None:
+        ledger.record_fill(
+            mode="paper",
+            slug=slug,
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome=outcome,
+            role="MAKER_CLOB",
+            reason="session-test",
+            shares=10,
+            price=price,
+            fee=0.01,
+            fair_prob=0.5,
+            ts=ts,
+        )
+
+    # This market existed before the experiment. A later fill must not leak
+    # into the clean-session execution counters or volume.
+    fill("old-market", 100.0, "Up", 0.40)
+    fill("old-market", 250.0, "Down", 0.50)
+
+    # This market began after the experiment epoch and is fully in scope.
+    fill("new-market", 250.0, "Up", 0.40)
+    fill("new-market", 251.0, "Down", 0.50)
+
+    stats = ledger.get_session_stats("paper", 200.0)
+    assert stats["total_fills"] == 2
+    assert stats["maker_fills"] == 2
+    assert stats["notional"] == 9.0
+    assert stats["fees"] == 0.02
+    assert stats["completed_markets"] == 0
+    ledger.close()
+
+
+def test_timeframe_maker_and_taker_volume_reconcile_after_rounding(tmp_path) -> None:
+    ledger = Ledger(str(tmp_path / "timeframe-rounding.db"))
+    for role in ("MAKER_CLOB", "TAKER_CLOB"):
+        ledger.record_fill(
+            mode="paper",
+            slug="rounding-market",
+            condition_id="0x" + "1" * 64,
+            asset="BTC",
+            timeframe="5m",
+            outcome="Up",
+            role=role,
+            reason="rounding-test",
+            shares=1,
+            price=0.3333,
+            fee=0.0,
+            fair_prob=0.5,
+        )
+
+    row = ledger.get_timeframe_stats("paper")[0]
+    assert row["maker_notional"] + row["taker_notional"] == row["total_notional"]
+    assert row["total_notional"] == 0.67
+    ledger.close()
