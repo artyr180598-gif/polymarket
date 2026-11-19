@@ -202,6 +202,18 @@ def _scores(samples: list[tuple[int, int, float, float, int]], indices: set[int]
             "accuracy": round(correct / n, 6)}
 
 
+def _holdout_accepts(
+    default_scores: dict[str, float | int],
+    fitted_scores: dict[str, float | int],
+    at_search_boundary: bool = False,
+) -> bool:
+    return (
+        not at_search_boundary
+        and float(fitted_scores["brier"]) < float(default_scores["brier"])
+        and float(fitted_scores["logloss"]) < float(default_scores["logloss"])
+    )
+
+
 def _constant_scores(samples: list[tuple[int, int, float, float, int]], indices: set[int],
                     probability: float = 0.5, horizon: int | None = None
                     ) -> dict[str, float | int]:
@@ -341,6 +353,10 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
             "at_search_boundary": (
                 horizon_best[1] in (0.5, 2.5) or horizon_best[2] in (0.0, 0.3)
             ),
+            "accepted_for_shadow_research": _holdout_accepts(
+                default_horizon, fitted_horizon,
+                horizon_best[1] in (0.5, 2.5) or horizon_best[2] in (0.0, 0.3),
+            ),
         }
     return {
         "method": "chronological_holdout; 21 train days / remaining test days; forecasts at 240s, 180s, 120s, 60s, 30s, 15s",
@@ -361,6 +377,10 @@ def _calibrate(directory: Path, days: list[str]) -> dict[str, Any]:
             "automatic_strategy_parameter_update": False,
             "per_horizon_parameters_are_exploratory_only": True,
             "per_horizon_acceptance_requires_both_metrics_and_no_search_boundary": True,
+            "accepted_horizons_for_shadow_research": [
+                int(horizon) for horizon, metrics in horizon_scores.items()
+                if metrics["accepted_for_shadow_research"]
+            ],
         },
         "feature_scope": "Chainlink price + TWAP60 only; historical Binance basis and Polymarket CLOB book/trade replay are not included.",
         "warning": "Forecast calibration only; not a CLOB execution backtest or profitability estimate."
@@ -395,7 +415,7 @@ async def download_and_calibrate(
         existing_report: dict[str, Any] | None = None
         try:
             candidate = json.loads(report_path.read_text(encoding="utf-8"))
-            if candidate.get("calibration_version") == 4 and candidate.get("range_utc") == {"from": start, "to": end}:
+            if candidate.get("calibration_version") == 5 and candidate.get("range_utc") == {"from": start, "to": end}:
                 existing_report = candidate
         except (OSError, ValueError, TypeError):
             existing_report = None
@@ -440,7 +460,7 @@ async def download_and_calibrate(
 
     report = {
         "source": "Poly Tick Tape",
-        "calibration_version": 4,
+        "calibration_version": 5,
         "range_utc": {"from": start, "to": end},
         "days": len(days_expected),
         "files": len(files),
