@@ -171,9 +171,10 @@ def build_analysis(
                 "up_net_long_shares": float(up),
                 "down_net_long_shares": float(down),
                 "paired_shares": float(min(up, down)),
-                "paired_share_ratio": float((Decimal(2) * min(up, down)) / total),
+                "paired_share_ratio": float((Decimal(2) * min(up, down)) / total) if total > 0 else 0.0,
                 "unpaired_shares": float(abs(up - down)),
-                "one_sided_share_pct": round(100 * float(abs(up - down) / total), 3),
+                "one_sided_share_pct": round(100 * float(abs(up - down) / total), 3) if total > 0 else 0.0,
+                "negative_net_share_anomaly": up_net < 0 or down_net < 0,
                 "fill_rows": int(market_fill_counts[slug]),
                 "notional_usdc": float(market_notional[slug]),
             })
