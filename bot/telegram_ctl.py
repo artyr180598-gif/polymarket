@@ -358,12 +358,22 @@ class TelegramController:
             self._notification_wakeup.clear()
             await self._drain_pending_notifications()
             try:
+                timeout = None
+                if self._pending_notifications:
+                    # Use the absolute retry deadline. Repeated event wakeups must
+                    # not restart the full delay and starve delivery indefinitely.
+                    remaining = self._notification_retry_at - time.monotonic()
+                    timeout = (
+                        max(0.01, remaining)
+                        if remaining > 0
+                        else self._notification_retry_interval
+                    )
                 await asyncio.wait_for(
                     self._notification_wakeup.wait(),
-                    timeout=self._notification_retry_interval if self._pending_notifications else None,
+                    timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                # A failed delivery is retried after a short bounded delay.
+                # A failed delivery is retried when its absolute deadline expires.
                 continue
             except asyncio.CancelledError:
                 raise
