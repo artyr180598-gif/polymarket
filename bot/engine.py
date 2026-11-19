@@ -9,11 +9,13 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 
 from .config import BotConfig, PRESETS, StrategyParams
+from .clob_recorder import CLOBRecorder
 from .execution import PaperExecutor, LiveExecutor
 from .fees import calc_taker_fee_usdc, fee_regime_label
 from .ledger import Ledger
@@ -161,6 +163,11 @@ class TradingEngine:
         # None preserves library/test embedding behavior; False blocks resuming
         # an auto-started engine when the required trade-notification channel failed.
         self._notification_channel_ready: Optional[bool] = None
+        self._clob_recorder = (
+            CLOBRecorder(Path(cfg.db_path).parent / "market-data" / "clob")
+            if cfg.clob_capture_enabled and cfg.trading_mode == "paper"
+            else None
+        )
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -244,6 +251,11 @@ class TradingEngine:
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
         ]
+        if self._clob_recorder is not None:
+            self._tasks.append(
+                asyncio.create_task(self._clob_recorder.run(), name="clob_recorder")
+            )
+            log.info("PAPER CLOB capture enabled · retention=7d · cap=120MiB")
         self._log_event("INFO", "Старт · honest paper (best-ask fix)", notify=True)
 
     async def stop(self) -> None:
@@ -251,8 +263,11 @@ class TradingEngine:
         self._market_feed_connected = False
         if self.executor is not None:
             await self.executor.cancel_all()
+        if self._clob_recorder is not None:
+            self._clob_recorder.request_stop()
         for t in self._tasks:
-            t.cancel()
+            if t.get_name() != "clob_recorder":
+                t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
@@ -842,17 +857,19 @@ class TradingEngine:
             {"bids": {}, "asks": {}, "best_bid": 0.0, "best_ask": 1.0, "tick_size": 0.01, "min_order_size": 0.0},
         )
         kind = event.get("type")
+        active_window = next(
+            (
+                candidate for candidate in self.windows.values()
+                if candidate.up_token == token or candidate.down_token == token
+            ),
+            None,
+        )
+        if self._clob_recorder is not None and active_window is not None:
+            self._clob_recorder.enqueue(event, active_window)
         if self.paused or self._risk_halt_active:
             await self.executor.cancel_all()
             return
         if kind == "last_trade":
-            active_window = next(
-                (
-                    candidate for candidate in self.windows.values()
-                    if candidate.up_token == token or candidate.down_token == token
-                ),
-                None,
-            )
             if (
                 active_window is None
                 or active_window.price_to_beat is None
