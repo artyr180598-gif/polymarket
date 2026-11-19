@@ -343,6 +343,8 @@ def test_telegram_trade_notification_stays_queued_until_api_confirms_delivery():
 
     recovered = RecoveredSession()
     controller._session = recovered
+    # Simulate the retry deadline having elapsed before the recovered API is used.
+    controller._notification_retry_at = 0.0
     asyncio.run(controller._flush_pending_notifications())
 
     assert controller._pending_notifications == []
