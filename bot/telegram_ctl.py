@@ -507,12 +507,15 @@ class TelegramController:
             try:
                 for row in ledger.get_timeframe_stats(self.engine.cfg.trading_mode):
                     taker_pct = max(0.0, 100.0 - float(row["maker_fill_pct"])) if row["total_fills"] else 0.0
+                    maker_volume_pct = float(row.get("maker_notional_pct", 0.0) or 0.0)
+                    open_up_shares = float(row.get("open_up_shares", 0.0) or 0.0)
+                    open_down_shares = float(row.get("open_down_shares", 0.0) or 0.0)
                     timeframe_lines.append(
                         f"· <b>{row['timeframe']}</b>: fills {row['total_fills']} "
                         f"(M {row['maker_fills']}/{row['maker_fill_pct']:.1f}% · "
                         f"T {row['taker_fills']}/{taker_pct:.1f}%) · "
                         f"объём M/T ${row['maker_notional']:.2f}/${row['taker_notional']:.2f} "
-                        f"({row['maker_notional_pct']:.1f}/{100.0-row['maker_notional_pct']:.1f}%) · "
+                        f"({maker_volume_pct:.1f}/{max(0.0, 100.0-maker_volume_pct):.1f}%) · "
                         f"fees −${row['fees']:.2f}\n"
                         f"  закрыто {row['completed_markets']} "
                         f"(+{row['wins']}/−{row['losses']}/={row['breakeven']}) · "
@@ -520,7 +523,7 @@ class TelegramController:
                         f"  MERGE {row['merge_count']} / {row['merged_pairs']:.2f} пар · "
                         f"gross ${row['merge_gross_pnl']:+.2f} · "
                         f"открыто {row['open_markets']} рынков · "
-                        f"остаток ↑{row['open_up_shares']:.2f}/↓{row['open_down_shares']:.2f} · "
+                        f"остаток ↑{open_up_shares:.2f}/↓{open_down_shares:.2f} · "
                         f"инвентарь ${row['open_inventory_cost']:.2f} · "
                         f"комиссии входа −${row['open_fees']:.2f}"
                     )
