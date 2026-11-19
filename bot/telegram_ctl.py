@@ -509,12 +509,12 @@ class TelegramController:
             session_block = (
                 f"· Fill-ног: {session_fills} · Maker {session_maker} ({session_maker_pct:.1f}%) · "
                 f"Taker {max(0, session_fills-session_maker)} ({max(0.0, 100.0-session_maker_pct) if session_fills else 0.0:.1f}%)\n"
-                f"· Объём: \${float(session.get('notional', 0) or 0):.2f} · "
-                f"комиссии −\${float(session.get('fees', 0) or 0):.2f}\n"
+                f"· Объём: ${float(session.get('notional', 0) or 0):.2f} · "
+                f"комиссии −${float(session.get('fees', 0) or 0):.2f}\n"
                 f"· Завершено рынков: {int(session.get('completed_markets', 0) or 0)} · "
                 f"прибыльных {int(session.get('winning_markets', 0) or 0)} / "
                 f"убыточных {int(session.get('losing_markets', 0) or 0)}\n"
-                f"· Реализованный net PnL: \${float(session.get('realized_net_pnl', 0) or 0):+.2f}"
+                f"· Реализованный net PnL: ${float(session.get('realized_net_pnl', 0) or 0):+.2f}"
             )
         else:
             session_block = (
