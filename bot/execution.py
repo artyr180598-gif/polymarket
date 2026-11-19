@@ -165,6 +165,7 @@ class PaperExecutor:
         last_trade_price: Optional[float] = None,
         last_trade_size: float = 0.0,
         last_trade_side: str = "",
+        trade_ts: Optional[float] = None,
     ) -> List[PaperFill]:
         """Progress queue and generate maker fills when tape eats through us."""
         now = time.time()
@@ -182,6 +183,14 @@ class PaperExecutor:
                 continue
             if now - o.created_ts < self._latency_sec:
                 continue
+            # Use the exchange event timestamp, not local receive time: delayed
+            # WebSocket prints must never fill an order that did not yet exist.
+            if (
+                trade_ts is None
+                or not math.isfinite(trade_ts)
+                or trade_ts < o.created_ts + self._latency_sec
+            ):
+                continue
             # If market moved through our price against us while resting — still maker if we were resting
             if o.post_only and o.price >= best_ask - 1e-9:
                 # Book crossed us; cancel rather than take
@@ -198,7 +207,9 @@ class PaperExecutor:
                 or not 0 < last_trade_price < 1
                 or not math.isfinite(last_trade_size)
                 or last_trade_size <= 0
-                or last_trade_price > o.price + 1e-9
+                # A print below our limit does not reveal how much traded at
+                # our exact price during the sweep. Do not infer a fill from it.
+                or abs(last_trade_price - o.price) > 1e-6
             ):
                 continue
             # First consume the visible queue that was ahead when we joined.

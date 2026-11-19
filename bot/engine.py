@@ -25,6 +25,18 @@ log = logging.getLogger(__name__)
 NotifyFn = Callable[..., Any]
 
 
+def _clob_timestamp_seconds(value: Any) -> Optional[float]:
+    """Normalize CLOB event timestamps (Unix ms) to local Unix seconds."""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        return None
+    # Polymarket CLOB WebSocket timestamps are epoch milliseconds.
+    return timestamp / 1000.0 if timestamp >= 100_000_000_000 else timestamp
+
+
 @dataclass
 class WindowState:
     slug: str
@@ -887,6 +899,11 @@ class TradingEngine:
         trade_price = float(event["price"]) if kind == "last_trade" else None
         trade_size = float(event.get("size") or 0.0) if kind == "last_trade" else 0.0
         trade_side = str(event.get("side") or "") if kind == "last_trade" else ""
+        raw_trade_ts = event.get("timestamp") if kind == "last_trade" else None
+        try:
+            trade_ts = _clob_timestamp_seconds(raw_trade_ts)
+        except (TypeError, ValueError):
+            trade_ts = None
         fills = self.executor.on_book_and_tape(
             token,
             best_bid=best_bid,
@@ -894,6 +911,7 @@ class TradingEngine:
             last_trade_price=trade_price,
             last_trade_size=trade_size,
             last_trade_side=trade_side,
+            trade_ts=trade_ts,
         )
         for fill in fills:
             await self._record_maker_fill(fill)

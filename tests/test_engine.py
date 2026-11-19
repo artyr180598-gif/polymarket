@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from bot.config import BotConfig
-from bot.engine import TradingEngine, WindowState, _paper_reset_marker_path, _select_closed_gamma_strike
+from bot.engine import TradingEngine, WindowState, _clob_timestamp_seconds, _paper_reset_marker_path, _select_closed_gamma_strike
 
 
 def test_expired_window_reports_negative_remaining_time(monkeypatch) -> None:
@@ -865,3 +865,14 @@ def test_paper_reset_marker_is_unique_and_filesystem_safe() -> None:
     unsafe_marker = _paper_reset_marker_path("/data/polybot.db", "../../unsafe/reset")
     assert "/" not in unsafe_marker.rsplit(".paper-reset-", 1)[1]
     assert _paper_reset_marker_path("/data/polybot.db") == "/data/polybot.db.paper-reset-v2.done"
+
+
+
+def test_clob_timestamp_milliseconds_are_normalized_to_seconds() -> None:
+    assert _clob_timestamp_seconds("1795096055123") == 1795096055.123
+
+
+def test_clob_timestamp_rejects_invalid_values() -> None:
+    assert _clob_timestamp_seconds(None) is None
+    assert _clob_timestamp_seconds("not-a-timestamp") is None
+    assert _clob_timestamp_seconds(float("nan")) is None
