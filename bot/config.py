@@ -151,7 +151,7 @@ class BotConfig:
         if preset not in PRESETS:
             preset = "mo_money"
 
-        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL") if a.upper() in ("BTC", "ETH", "SOL")]
+        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC") if a.upper() in ("BTC", "ETH", "SOL")]
         if not assets:
             assets = ["BTC"]
 
