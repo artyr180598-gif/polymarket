@@ -537,14 +537,12 @@ class Ledger:
                 SELECT r.mode, r.slug,
                        r.gross_pnl + COALESCE(m.merge_pnl, 0) - COALESCE(f.fees, 0) AS net_pnl
                 FROM resolutions r
-                JOIN eligible e ON e.mode = r.mode AND e.slug = r.slug
                 LEFT JOIN merge_stats m ON m.mode = r.mode AND m.slug = r.slug
                 LEFT JOIN fill_stats f ON f.mode = r.mode AND f.slug = r.slug
                 UNION ALL
                 SELECT m.mode, m.slug,
                        m.merge_pnl - COALESCE(f.fees, 0) AS net_pnl
                 FROM merge_stats m
-                JOIN eligible e ON e.mode = m.mode AND e.slug = m.slug
                 JOIN fill_stats f ON f.mode = m.mode AND f.slug = m.slug
                 WHERE NOT EXISTS (
                     SELECT 1 FROM resolutions r
