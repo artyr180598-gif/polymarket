@@ -1133,6 +1133,32 @@ class TradingEngine:
                 log.warning("strategy: %s", e)
             await asyncio.sleep(1.5)
 
+    @staticmethod
+    def _unpaired_cost(up_shares: float, down_shares: float, up_cost: float, down_cost: float, up_fees: float = 0.0, down_fees: float = 0.0) -> float:
+        """Cost basis and entry fees allocated only to unmatched shares."""
+        up = max(0.0, float(up_shares))
+        down = max(0.0, float(down_shares))
+        up_residual = max(0.0, up - min(up, down))
+        down_residual = max(0.0, down - min(up, down))
+        up_value = (float(up_cost) + float(up_fees)) * up_residual / up if up > 0 else 0.0
+        down_value = (float(down_cost) + float(down_fees)) * down_residual / down if down > 0 else 0.0
+        return max(0.0, up_value + down_value)
+
+    def _unpaired_exposure_usd(self, exclude_slug: Optional[str] = None) -> float:
+        """Portfolio unmatched inventory cost plus all outstanding Maker reserves."""
+        exposure = 0.0
+        for position in self.ledger.open_positions(self.cfg.trading_mode):
+            if exclude_slug and str(position["slug"]) == exclude_slug:
+                continue
+            exposure += self._unpaired_cost(
+                position["up_shares"], position["down_shares"],
+                position["up_cost"], position["down_cost"],
+                position["up_fees"], position["down_fees"],
+            )
+        if self.executor is not None:
+            exposure += sum(max(0.0, float(order.price)) * max(0.0, float(order.remaining))
+                            for order in self.executor.get_open_orders())
+        return exposure
     def _mark_to_market_state(self) -> Dict[str, Any]:
         """Conservatively value open inventory using fresh CLOB bids."""
         positions = self.ledger.open_positions(self.cfg.trading_mode)
@@ -1288,6 +1314,15 @@ class TradingEngine:
         # Historical probability calibration is telemetry-only. Do not use the
         # unvalidated directional fair-value estimate to select a Maker leg.
         _ = fair_up, fair_down
+        unpaired_exposure = self._unpaired_exposure_usd()
+        if unpaired_exposure > self.cfg.max_unpaired_exposure_usd + 1e-9:
+            self._log_maker_skip(
+                window, "portfolio", "unpaired_exposure_cap",
+                exposure=round(unpaired_exposure, 4),
+                cap=self.cfg.max_unpaired_exposure_usd,
+            )
+            await self.executor.cancel_all()
+            return
         pair_max_cost = min(0.999, max(0.50, float(self.params.maker_pair_max_cost)))
         max_unpaired = min(12.0, max(5.0, float(self.params.maker_max_unpaired_shares)))
         now_mono = time.monotonic()
@@ -1467,6 +1502,15 @@ class TradingEngine:
             size = min(size, max(0.0, available_cash / quote_price))
             size = math.floor(size * 100.0) / 100.0
             cost = quote_price * size
+            projected_unpaired_with_order = self._unpaired_exposure_usd() + cost
+            if projected_unpaired_with_order > self.cfg.max_unpaired_exposure_usd + 1e-9:
+                self._log_maker_skip(
+                    window, outcome, "unpaired_exposure_cap",
+                    exposure=round(projected_unpaired_with_order, 4),
+                    cap=self.cfg.max_unpaired_exposure_usd,
+                    order_cost=round(cost, 4),
+                )
+                continue
             if (
                 size < min_size
                 or window_exposure + cost > self.cfg.max_window_risk_usd
@@ -1817,6 +1861,27 @@ class TradingEngine:
             )
             cost = price * size + fee
         if cost > available_cash + 1e-9:
+            return
+        # Enforce the portfolio cap on Taker paths too; opposite-side completion
+        # reduces unmatched exposure, while a new directional leg increases it.
+        projected_up_shares = w.up_shares + (size if outcome == "Up" else 0.0)
+        projected_down_shares = w.down_shares + (size if outcome == "Down" else 0.0)
+        projected_up_cost = w.up_cost + (price * size if outcome == "Up" else 0.0)
+        projected_down_cost = w.down_cost + (price * size if outcome == "Down" else 0.0)
+        projected_up_fees = w.up_fees + (fee if outcome == "Up" else 0.0)
+        projected_down_fees = w.down_fees + (fee if outcome == "Down" else 0.0)
+        other_unpaired = self._unpaired_exposure_usd(exclude_slug=w.slug)
+        pending_reserve = sum(order.price * order.remaining for order in self.executor.get_open_orders()) if self.executor is not None else 0.0
+        projected_unpaired = other_unpaired + pending_reserve + self._unpaired_cost(
+            projected_up_shares, projected_down_shares,
+            projected_up_cost, projected_down_cost, projected_up_fees, projected_down_fees,
+        )
+        if projected_unpaired > self.cfg.max_unpaired_exposure_usd + 1e-9:
+            self._log_event(
+                "WARNING",
+                f"Taker skipped: unmatched exposure ${projected_unpaired:.2f} exceeds ${self.cfg.max_unpaired_exposure_usd:.2f} cap; {w.slug}",
+                notify=False,
+            )
             return
         fill = {
             "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
@@ -2244,6 +2309,8 @@ class TradingEngine:
             "market_value": round(float(mtm_state["market_value"]), 2) if mtm_state["complete"] else None,
             "unrealized_pnl": round(float(mtm_state["unrealized_pnl"]), 2) if mtm_state["complete"] else None,
             "unpaired_exposure_usd": round(float(mtm_state["unpaired_exposure_usd"]), 2) if mtm_state["complete"] else None,
+            "unpaired_exposure_limit_usd": round(self.cfg.max_unpaired_exposure_usd, 2),
+            "unpaired_exposure_with_orders_usd": round(self._unpaired_exposure_usd(), 2),
             "mark_to_market_reason": str(mtm_state.get("reason") or ""),
             "available_cash": round(available_cash, 2),
             "reserved_maker_orders_usd": round(reserved_orders_usd, 2),
