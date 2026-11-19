@@ -9,6 +9,7 @@ import pytest
 
 from bot.historical_data import (
     _date_range,
+    _is_current_calibration_report,
     _fit_parameters,
     _load_day,
     _norm_cdf,
@@ -166,3 +167,15 @@ def test_fit_parameters_requires_joint_train_improvement() -> None:
     assert result["candidate_found"] is True
     assert result["sigma_multiplier"] == 0.5
     assert result["at_search_boundary"] is True
+
+
+
+def test_calibration_report_cache_requires_current_algorithm_version() -> None:
+    current = {
+        "calibration_version": 7,
+        "range_utc": {"from": "2026-10-14", "to": "2026-11-13"},
+    }
+    stale = {**current, "calibration_version": 6}
+    assert _is_current_calibration_report(current, "2026-10-14", "2026-11-13")
+    assert not _is_current_calibration_report(stale, "2026-10-14", "2026-11-13")
+    assert not _is_current_calibration_report(current, "2026-10-15", "2026-11-13")
