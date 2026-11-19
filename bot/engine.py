@@ -157,6 +157,7 @@ class TradingEngine:
         self._market_tokens_changed = asyncio.Event()
         self._market_feed_connected = False
         self._market_feed_last_event_mono = 0.0
+        self._maker_diag_last: Dict[str, float] = {}
         self._risk_halt_active = False
         self._risk_halt_reason = ""
         # Set by the application after Telegram's delivery session initializes.
@@ -192,6 +193,22 @@ class TradingEngine:
                         loop.create_task(result)
             except Exception:
                 pass
+
+    def _log_maker_skip(self, window: WindowState, key: str, reason: str, **details: Any) -> None:
+        """Rate-limited diagnostics for silent Maker quote eligibility gates."""
+        now = time.monotonic()
+        throttle_key = f"{window.slug}:{key}"
+        if now - self._maker_diag_last.get(throttle_key, 0.0) < 30.0:
+            return
+        self._maker_diag_last[throttle_key] = now
+        detail_text = " ".join(
+            f"{name}={value}" for name, value in details.items()
+            if value is not None
+        )
+        log.info(
+            "PAPER maker gate · slug=%s · gate=%s · reason=%s%s",
+            window.slug, key, reason, f" · {detail_text}" if detail_text else "",
+        )
 
     async def start(self) -> None:
         # SAFETY INTERLOCK: live execution is not implemented end-to-end yet.
@@ -1127,13 +1144,22 @@ class TradingEngine:
     ) -> None:
         if self.executor is None:
             return
-        if (
-            not self.params.enable_maker
-            or not self._market_feed_connected
-            or window.price_to_beat is None
-            or window.remain_sec <= 15
-            or time.time() - window.start_ts < float(self.params.maker_start_sec)
-        ):
+        gate_reason = None
+        if not self.params.enable_maker:
+            gate_reason = "maker_disabled"
+        elif not self._market_feed_connected:
+            gate_reason = "clob_feed_disconnected"
+        elif window.price_to_beat is None:
+            gate_reason = "missing_settlement_anchor"
+        elif window.remain_sec <= 15:
+            gate_reason = "inside_last_15_seconds"
+        elif time.time() - window.start_ts < float(self.params.maker_start_sec):
+            gate_reason = "maker_start_delay"
+        if gate_reason is not None:
+            self._log_maker_skip(window, "window", gate_reason,
+                                 remain_sec=round(window.remain_sec, 1),
+                                 market_feed_connected=self._market_feed_connected,
+                                 anchor_source=window.price_to_beat_source or "none")
             await self._cancel_window_maker_orders(window)
             return
 
@@ -1151,7 +1177,10 @@ class TradingEngine:
             ("Down", window.down_token, fair_down),
         ):
             book = self._market_books.get(token)
-            if not book or now_mono - float(book.get("recv_mono", 0.0)) > 5.0:
+            book_age = now_mono - float(book.get("recv_mono", 0.0)) if book else None
+            if not book or book_age is None or book_age > 5.0:
+                self._log_maker_skip(window, outcome, "missing_or_stale_book",
+                                     book_age_sec=round(book_age, 2) if book_age is not None else None)
                 await self.executor.cancel_all([token])
                 continue
             min_size = max(
@@ -1166,6 +1195,8 @@ class TradingEngine:
                 or best_ask >= 1
                 or best_bid >= best_ask
             ):
+                self._log_maker_skip(window, outcome, "invalid_book",
+                                     best_bid=best_bid, best_ask=best_ask, tick=tick)
                 await self.executor.cancel_all([token])
                 continue
 
@@ -1179,6 +1210,12 @@ class TradingEngine:
                 or quote_price >= best_ask - 1e-9
                 or fair_prob - quote_price < min_edge
             ):
+                self._log_maker_skip(
+                    window, outcome, "price_or_edge_filter",
+                    fair_prob=round(fair_prob, 5), quote_price=quote_price,
+                    edge=round(fair_prob - quote_price, 5), min_edge=min_edge,
+                    best_bid=best_bid, best_ask=best_ask,
+                )
                 await self.executor.cancel_all([token])
                 continue
 
@@ -1211,8 +1248,14 @@ class TradingEngine:
                 for item in self.windows.values() if not item.resolved
             ) + reserved_total
             if window_exposure >= self.cfg.max_window_risk_usd:
+                self._log_maker_skip(window, outcome, "window_exposure_cap",
+                                     exposure=round(window_exposure, 2),
+                                     cap=self.cfg.max_window_risk_usd)
                 continue
             if total_exposure >= self.cfg.max_total_exposure_usd:
+                self._log_maker_skip(window, outcome, "total_exposure_cap",
+                                     exposure=round(total_exposure, 2),
+                                     cap=self.cfg.max_total_exposure_usd)
                 continue
 
             size = min(
@@ -1228,6 +1271,9 @@ class TradingEngine:
                 or window_exposure + cost > self.cfg.max_window_risk_usd
                 or total_exposure + cost > self.cfg.max_total_exposure_usd
             ):
+                self._log_maker_skip(window, outcome, "size_or_risk_filter",
+                                     size=round(size, 3), min_size=min_size,
+                                     cost=round(cost, 2), available_cash=round(available_cash, 2))
                 continue
 
             queue_ahead = sum(
@@ -1256,18 +1302,29 @@ class TradingEngine:
         tr = self.trackers[w.asset]
         spot = getattr(tr, "cl_spot", None)
         now_mono = time.monotonic()
-        if (
-            spot is None
-            or tr.cl_twap60 is None
-            or now_mono - tr.cl_recv_mono > 5.0
-            or now_mono - tr.cl_twap_recv_mono > 5.0
-            or time.time() - tr.cl_spot_ts > 5.0
-            or time.time() - tr.cl_twap60_ts > 5.0
-            or tr._vol_samples < 60
-        ):
+        oracle_reasons = []
+        spot_age = now_mono - tr.cl_recv_mono if tr.cl_recv_mono else None
+        twap_age = now_mono - tr.cl_twap_recv_mono if tr.cl_twap_recv_mono else None
+        if spot is None:
+            oracle_reasons.append("spot_missing")
+        if tr.cl_twap60 is None:
+            oracle_reasons.append("twap60_missing")
+        if spot_age is None or spot_age > 5.0 or time.time() - tr.cl_spot_ts > 5.0:
+            oracle_reasons.append("spot_stale")
+        if twap_age is None or twap_age > 5.0 or time.time() - tr.cl_twap60_ts > 5.0:
+            oracle_reasons.append("twap60_stale")
+        if tr._vol_samples < 60:
+            oracle_reasons.append("volatility_warmup")
+        if oracle_reasons:
+            self._log_maker_skip(w, "oracle", ",".join(oracle_reasons),
+                                 spot_age_sec=round(spot_age, 2) if spot_age is not None else None,
+                                 twap_age_sec=round(twap_age, 2) if twap_age is not None else None,
+                                 volatility_samples=tr._vol_samples)
             await self._cancel_window_maker_orders(w)
             return
         if w.price_to_beat is None:
+            self._log_maker_skip(w, "anchor", "missing_settlement_anchor",
+                                 anchor_source=w.price_to_beat_source or "none")
             await self._cancel_window_maker_orders(w)
             return
         try:
