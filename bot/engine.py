@@ -1194,6 +1194,7 @@ class TradingEngine:
         fair_up: float,
         fair_down: float,
     ) -> None:
+        """Place conservative pair-first Maker quotes; fair-value is not an entry trigger."""
         if self.executor is None:
             return
         gate_reason = None
@@ -1208,33 +1209,38 @@ class TradingEngine:
         elif time.time() - window.start_ts < float(self.params.maker_start_sec):
             gate_reason = "maker_start_delay"
         if gate_reason is not None:
-            self._log_maker_skip(window, "window", gate_reason,
-                                 remain_sec=round(window.remain_sec, 1),
-                                 market_feed_connected=self._market_feed_connected,
-                                 anchor_source=window.price_to_beat_source or "none")
+            self._log_maker_skip(
+                window, "window", gate_reason,
+                remain_sec=round(window.remain_sec, 1),
+                market_feed_connected=self._market_feed_connected,
+                anchor_source=window.price_to_beat_source or "none",
+            )
             await self._cancel_window_maker_orders(window)
             return
 
-        # Empirical median maker fill sizes from the target wallet's 5m history.
-        # These are conservative PAPER seed sizes, not a claim of exact wallet sizing.
-        size_caps = {"BTC": 12.0, "ETH": 11.0, "SOL": 8.0}
-        min_edge = float(self.params.min_maker_edge)
-        min_price = float(self.params.maker_min_price)
-        max_price = float(self.params.maker_max_price)
+        # Historical probability calibration is telemetry-only. Do not use the
+        # unvalidated directional fair-value estimate to select a Maker leg.
+        _ = fair_up, fair_down
+        pair_max_cost = min(0.999, max(0.50, float(self.params.maker_pair_max_cost)))
+        max_unpaired = min(12.0, max(5.0, float(self.params.maker_max_unpaired_shares)))
         now_mono = time.monotonic()
         now_wall = time.time()
+        candidates: Dict[str, Dict[str, Any]] = {}
 
-        for outcome, token, fair_prob in (
-            ("Up", window.up_token, fair_up),
-            ("Down", window.down_token, fair_down),
+        # Both books must be fresh and valid before either side can be quoted.
+        for outcome, token in (
+            ("Up", window.up_token),
+            ("Down", window.down_token),
         ):
             book = self._market_books.get(token)
             book_age = now_mono - float(book.get("recv_mono", 0.0)) if book else None
             if not book or book_age is None or book_age > 5.0:
-                self._log_maker_skip(window, outcome, "missing_or_stale_book",
-                                     book_age_sec=round(book_age, 2) if book_age is not None else None)
-                await self.executor.cancel_all([token])
-                continue
+                self._log_maker_skip(
+                    window, outcome, "missing_or_stale_book",
+                    book_age_sec=round(book_age, 2) if book_age is not None else None,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
             min_size = max(
                 float(self.params.maker_min_size),
                 float(book.get("min_order_size") or 0.0),
@@ -1247,47 +1253,116 @@ class TradingEngine:
                 or best_ask >= 1
                 or best_bid >= best_ask
             ):
-                self._log_maker_skip(window, outcome, "invalid_book",
-                                     best_bid=best_bid, best_ask=best_ask, tick=tick)
-                await self.executor.cancel_all([token])
-                continue
+                self._log_maker_skip(
+                    window, outcome, "invalid_book",
+                    best_bid=best_bid, best_ask=best_ask, tick=tick,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
 
-            # Improve the best bid by one tick where the spread permits, but
-            # never cross the ask. This is a post-only quote, not a taker fill.
             raw_quote = min(best_bid + tick, best_ask - tick)
             quote_price = round(math.floor((raw_quote + 1e-12) / tick) * tick, 6)
             if (
-                quote_price < min_price
-                or quote_price > max_price
+                quote_price < float(self.params.maker_min_price)
+                or quote_price > float(self.params.maker_max_price)
                 or quote_price >= best_ask - 1e-9
-                or fair_prob - quote_price < min_edge
             ):
                 self._log_maker_skip(
-                    window, outcome, "price_or_edge_filter",
-                    fair_prob=round(fair_prob, 5), quote_price=quote_price,
-                    edge=round(fair_prob - quote_price, 5), min_edge=min_edge,
-                    best_bid=best_bid, best_ask=best_ask,
+                    window, outcome, "pair_quote_price_filter",
+                    quote_price=quote_price, best_bid=best_bid,
+                    best_ask=best_ask, tick=tick,
                 )
+                await self._cancel_window_maker_orders(window)
+                return
+            if min_size > max_unpaired + 1e-9:
+                self._log_maker_skip(
+                    window, outcome, "minimum_size_exceeds_unpaired_cap",
+                    min_size=min_size, max_unpaired=max_unpaired,
+                )
+                await self._cancel_window_maker_orders(window)
+                return
+            candidates[outcome] = {
+                "token": token,
+                "book": book,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "tick": tick,
+                "quote_price": quote_price,
+                "min_size": min_size,
+            }
+
+        imbalance = window.up_shares - window.down_shares
+        if imbalance > 0.01:
+            avg_up_cost = (window.up_cost + window.up_fees) / max(window.up_shares, 1e-9)
+            pair_cost = avg_up_cost + candidates["Down"]["quote_price"]
+            allowed_outcomes = {"Down"}
+            pair_gate = "unpaired_up"
+        elif imbalance < -0.01:
+            avg_down_cost = (window.down_cost + window.down_fees) / max(window.down_shares, 1e-9)
+            pair_cost = avg_down_cost + candidates["Up"]["quote_price"]
+            allowed_outcomes = {"Up"}
+            pair_gate = "unpaired_down"
+        else:
+            pair_cost = candidates["Up"]["quote_price"] + candidates["Down"]["quote_price"]
+            allowed_outcomes = {"Up", "Down"}
+            pair_gate = "balanced_pair"
+
+        if pair_cost > pair_max_cost + 1e-9:
+            self._log_maker_skip(
+                window, "pair", "pair_cost_filter",
+                pair_gate=pair_gate, pair_cost=round(pair_cost, 5),
+                max_pair_cost=pair_max_cost,
+            )
+            await self._cancel_window_maker_orders(window)
+            return
+
+        for outcome in ("Up", "Down"):
+            candidate = candidates[outcome]
+            token = candidate["token"]
+            quote_price = float(candidate["quote_price"])
+            tick = float(candidate["tick"])
+            book = candidate["book"]
+            min_size = float(candidate["min_size"])
+
+            if outcome not in allowed_outcomes:
                 await self.executor.cancel_all([token])
+                self._log_maker_skip(
+                    window, outcome, "unpaired_side_blocked",
+                    imbalance=round(imbalance, 4),
+                )
                 continue
 
             existing = self.executor.get_open_orders(token)
             if existing:
                 order = existing[0]
-                stale_edge = fair_prob - order.price < min_edge
+                if imbalance > 0.01 and outcome == "Down":
+                    existing_pair_cost = (
+                        (window.up_cost + window.up_fees)
+                        / max(window.up_shares, 1e-9)
+                        + order.price
+                    )
+                elif imbalance < -0.01 and outcome == "Up":
+                    existing_pair_cost = (
+                        (window.down_cost + window.down_fees)
+                        / max(window.down_shares, 1e-9)
+                        + order.price
+                    )
+                else:
+                    other = "Down" if outcome == "Up" else "Up"
+                    existing_pair_cost = order.price + float(candidates[other]["quote_price"])
                 moved = abs(order.price - quote_price) >= tick * 2 - 1e-9
                 aged = now_wall - order.created_ts > 20.0
-                if stale_edge or moved or aged:
+                if moved or aged or existing_pair_cost > pair_max_cost + 1e-9:
                     for stale in existing:
                         await self.executor.cancel_order(stale.order_id)
                 else:
-                    # Keep queue priority while the quote remains competitive.
                     for extra in existing[1:]:
                         await self.executor.cancel_order(extra.order_id)
                     continue
 
             reserved_total = sum(
-                order.price * order.remaining for order in self.executor.get_open_orders()
+                order.price * order.remaining
+                for order in self.executor.get_open_orders()
             )
             window_reserved = sum(
                 order.price * order.remaining
@@ -1300,20 +1375,21 @@ class TradingEngine:
                 for item in self.windows.values() if not item.resolved
             ) + reserved_total
             if window_exposure >= self.cfg.max_window_risk_usd:
-                self._log_maker_skip(window, outcome, "window_exposure_cap",
-                                     exposure=round(window_exposure, 2),
-                                     cap=self.cfg.max_window_risk_usd)
+                self._log_maker_skip(
+                    window, outcome, "window_exposure_cap",
+                    exposure=round(window_exposure, 2),
+                    cap=self.cfg.max_window_risk_usd,
+                )
                 continue
             if total_exposure >= self.cfg.max_total_exposure_usd:
-                self._log_maker_skip(window, outcome, "total_exposure_cap",
-                                     exposure=round(total_exposure, 2),
-                                     cap=self.cfg.max_total_exposure_usd)
+                self._log_maker_skip(
+                    window, outcome, "total_exposure_cap",
+                    exposure=round(total_exposure, 2),
+                    cap=self.cfg.max_total_exposure_usd,
+                )
                 continue
 
-            size = min(
-                size_caps.get(window.asset, 8.0),
-                float(self.cfg.order_clip_usd) / quote_price,
-            )
+            size = min(max_unpaired, float(self.cfg.order_clip_usd) / quote_price)
             available_cash = min(self.cash, self.executor.cash)
             size = min(size, max(0.0, available_cash / quote_price))
             size = math.floor(size * 100.0) / 100.0
@@ -1323,9 +1399,11 @@ class TradingEngine:
                 or window_exposure + cost > self.cfg.max_window_risk_usd
                 or total_exposure + cost > self.cfg.max_total_exposure_usd
             ):
-                self._log_maker_skip(window, outcome, "size_or_risk_filter",
-                                     size=round(size, 3), min_size=min_size,
-                                     cost=round(cost, 2), available_cash=round(available_cash, 2))
+                self._log_maker_skip(
+                    window, outcome, "size_or_risk_filter",
+                    size=round(size, 3), min_size=min_size,
+                    cost=round(cost, 2), available_cash=round(available_cash, 2),
+                )
                 continue
 
             queue_ahead = sum(
@@ -1337,17 +1415,18 @@ class TradingEngine:
                 asset_id=token,
                 price=quote_price,
                 size=size,
-                best_bid=best_bid,
-                best_ask=best_ask,
+                best_bid=float(candidate["best_bid"]),
+                best_ask=float(candidate["best_ask"]),
                 bid_size_at_or_better=queue_ahead,
                 tick_size=tick,
             )
             if order_id:
                 self._log_event(
                     "INFO",
-                    f"📌 PAPER post-only {window.asset} {outcome}: "
-                    f"{size:.2f} шт. по ${quote_price:.4f}; очередь впереди {queue_ahead:.2f}; "
-                    f"slug={window.slug}",
+                    f"📌 PAPER pair-maker {window.asset} {outcome}: "
+                    f"{size:.2f} шт. по ${quote_price:.4f}; "
+                    f"pair_cost={pair_cost:.4f}/{pair_max_cost:.4f}; "
+                    f"очередь впереди {queue_ahead:.2f}; slug={window.slug}",
                     notify=False,
                 )
 
