@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -583,6 +584,18 @@ class TradingEngine:
     def _handle_polybolt_frame(self, frame: Dict[str, Any]) -> None:
         if type(frame.get("v")) is not int or frame.get("v") != 1:
             return
+        seq = frame.get("seq")
+        dropped = frame.get("dropped", 0)
+        frame_ts = frame.get("ts")
+        if type(seq) is not int or seq < 0:
+            return
+        if type(dropped) is not int or dropped < 0:
+            return
+        if type(frame_ts) is not int or frame_ts <= 0:
+            return
+        if dropped:
+            log.warning("PolyBolt reports %s dropped frames before seq=%s", dropped, seq)
+
         raw_snapshot = frame.get("snapshot", False)
         if not isinstance(raw_snapshot, bool):
             return
@@ -591,51 +604,56 @@ class TradingEngine:
         payload = frame.get("payload") or {}
         if channel not in ("price.crypto", "price.crypto.twap") or not isinstance(payload, dict):
             return
-        if channel == "price.crypto.twap" and int(payload.get("window_seconds") or 0) != 60:
+        if channel == "price.crypto.twap" and (
+            type(payload.get("window_seconds")) is not int or payload["window_seconds"] != 60
+        ):
             return
         symbol = str(payload.get("symbol") or "").lower()
         source = str(payload.get("source") or "").lower()
         if symbol != "btcusd" or source != "chainlink":
             return
 
-        frame_ts = int(frame.get("ts") or 0)
         if snapshot:
             points = payload.get("data") or []
             if not isinstance(points, list) or not points:
                 return
             point = max(
-                (p for p in points if isinstance(p, dict)),
-                key=lambda p: int(p.get("timestamp") or 0),
+                (p for p in points if isinstance(p, dict) and type(p.get("timestamp")) is int),
+                key=lambda p: p["timestamp"],
                 default=None,
             )
             if point is None:
                 return
-            value_raw = point.get("full_accuracy_value", point.get("value"))
-            sample_ts = int(point.get("timestamp") or frame_ts)
+            value_raw = point.get("full_accuracy_value")
+            sample_ts = point.get("timestamp")
             received_ts = frame_ts
             carried_forward = False
         else:
-            value_raw = payload.get("full_accuracy_value", payload.get("value"))
-            sample_ts = int(payload.get("timestamp") or frame_ts)
-            received_ts = int(payload.get("received_at") or frame_ts)
-            carried_forward = bool(payload.get("is_carried_forward", False))
+            value_raw = payload.get("full_accuracy_value")
+            sample_ts = payload.get("timestamp")
+            received_ts = payload.get("received_at", frame_ts)
+            carried_forward = payload.get("is_carried_forward", False)
+            if not isinstance(carried_forward, bool):
+                return
 
+        # The approximate value is deliberately not a fallback: the exact
+        # decimal string is required for a settlement-aligned Chainlink feed.
+        if not isinstance(value_raw, str) or type(sample_ts) is not int or sample_ts <= 0:
+            return
+        if type(received_ts) is not int or received_ts <= 0:
+            received_ts = frame_ts
         try:
             price = float(value_raw)
         except (TypeError, ValueError):
             return
-        if price <= 0 or sample_ts <= 0:
+        if not math.isfinite(price) or price <= 0:
             return
 
         tracker = self.trackers.get("BTC")
         if tracker is None:
             return
         if channel == "price.crypto.twap":
-            if frame_ts <= 0:
-                return
-            tracker.on_chainlink_twap60(
-                price, sample_ts, received_at_ms=frame_ts if frame_ts > 0 else None,
-            )
+            tracker.on_chainlink_twap60(price, sample_ts)
             self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
             self._streams_ok = self._price_ok
             return
@@ -644,9 +662,9 @@ class TradingEngine:
             price,
             sample_ts,
             compute_twap=False,
-            received_at_ms=received_ts if received_ts > 0 else None,
+            received_at_ms=received_ts,
         )
-        event_ts = (received_ts if carried_forward and received_ts > 0 else sample_ts) / 1000.0
+        event_ts = (received_ts if carried_forward else sample_ts) / 1000.0
         self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
         self._streams_ok = self._price_ok
         for window in self.windows.values():
@@ -670,6 +688,7 @@ class TradingEngine:
                     )
                 except Exception as exc:
                     log.warning("persist PolyBolt closing price %s: %s", window.slug, exc)
+
 
     async def _polybolt_loop(self) -> None:
         delay = 1.0
