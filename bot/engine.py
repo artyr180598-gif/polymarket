@@ -345,11 +345,15 @@ class TradingEngine:
         self._log_event("INFO", "Торговля возобновлена", notify=True)
 
     def set_preset(self, key: str) -> bool:
-        if key not in PRESETS:
+        # This production PAPER instance is deliberately pinned to the audited
+        # mo-money ruleset; a UI/Telegram command must not silently change it.
+        if key != "mo_money" or key not in PRESETS:
             return False
         self.cfg.strategy_preset = key
         self.params = PRESETS[key]
-        self._log_event("INFO", f"Пресет → {PRESETS[key].title_ru}", notify=True)
+        self.cfg.enabled_assets = ["BTC"]
+        self.cfg.enabled_timeframes = ["5m", "15m"]
+        self._log_event("INFO", f"Пресет закреплён: {PRESETS[key].title_ru}", notify=True)
         return True
 
     async def emergency_kill(self) -> Dict[str, Any]:
