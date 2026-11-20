@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from bot.config import BotConfig
-from bot.engine import TradingEngine, WindowState
+from bot.engine import TradingEngine, WindowState, _resolution_payouts
 from bot.ledger import Ledger
 from bot.twap_model import AssetPriceTracker
 
@@ -34,6 +34,23 @@ class TwapTests(unittest.TestCase):
             tracker.on_chainlink_spot(100.0 + second, int((base + second) * 1000))
         self.assertIsNotNone(tracker.cl_twap60)
         self.assertAlmostEqual(tracker.cl_twap60, 129.5, places=6)
+
+
+class ResolutionPayoutTests(unittest.TestCase):
+    def test_normalized_winner_and_split_payouts(self):
+        self.assertEqual(
+            _resolution_payouts({"data": [{"status": "resolved", "payouts": [1000000, 0]}]}),
+            (1.0, 0.0),
+        )
+        self.assertEqual(
+            _resolution_payouts({"data": [{"status": "resolved", "payouts": [500000, 500000]}]}),
+            (0.5, 0.5),
+        )
+
+    def test_pending_or_invalid_resolution_is_not_settleable(self):
+        self.assertIsNone(_resolution_payouts({"data": [{"status": "proposed", "payouts": [1000000, 0]}]}))
+        self.assertIsNone(_resolution_payouts({"data": [{"status": "resolved", "payouts": [0, 0]}]}))
+        self.assertIsNone(_resolution_payouts({"data": [{"status": "resolved", "payouts": [1]}]}))
 
 
 class SettlementClockTests(unittest.TestCase):
