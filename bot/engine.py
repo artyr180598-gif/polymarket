@@ -479,6 +479,7 @@ class TradingEngine:
             exposure_cap=D(str(self.cfg.max_total_exposure_usd)),
             held_avg=held_avg,
             held_shares=held_shares,
+            hedge_cap=D(str(self.cfg.pair_sum_hedge)),
         )
         await self._sync_quotes(window, quotes, books)
         await self._merge(window)

@@ -241,7 +241,7 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertTrue(any(q.outcome == "Down" for q in quotes))
 
-    def test_hedge_allows_the_lagging_side_up_to_103_cents(self) -> None:
+    def test_hedge_defaults_to_a_dollar_and_can_be_opened_to_103(self) -> None:
         fresh = self._quote("0.60", "0.42")
         if fresh:
             tops = {}
@@ -249,6 +249,8 @@ class StrategyTests(unittest.TestCase):
                 tops[q.outcome] = max(tops.get(q.outcome, q.price), q.price)
             if len(tops) == 2:
                 self.assertLessEqual(tops["Up"] + tops["Down"], Decimal("0.99"))
+        # Default hedge is $1.00. A 42¢ touch against a 60¢ holding is shaded
+        # down to 40¢, not filled at 42¢.
         hedged = self._quote(
             "0.60", "0.42",
             held_avg={"Up": Decimal("0.60")},
@@ -256,14 +258,17 @@ class StrategyTests(unittest.TestCase):
         )
         down = [q for q in hedged if q.outcome == "Down"]
         self.assertTrue(down)
-        self.assertLessEqual(max(q.price for q in down) + Decimal("0.60"), Decimal("1.03"))
-        # 0.60 already held plus a 0.50 touch is 1.10. Shading stops at 5¢, so Down is dropped.
-        too_rich = self._quote(
-            "0.60", "0.50",
+        self.assertLessEqual(max(q.price for q in down), Decimal("0.40"))
+        opened = self._quote(
+            "0.60", "0.42",
             held_avg={"Up": Decimal("0.60")},
             held_shares={"Up": Decimal("12")},
+            hedge_cap=Decimal("1.03"),
         )
-        self.assertTrue(all(q.outcome != "Down" for q in too_rich))
+        down = [q for q in opened if q.outcome == "Down"]
+        self.assertTrue(down)
+        self.assertGreaterEqual(max(q.price for q in down), Decimal("0.42"))
+        self.assertLessEqual(max(q.price for q in down) + Decimal("0.60"), Decimal("1.03"))
 
     def test_four_hour_windows_follow_us_eastern(self) -> None:
         from bot.engine import _window_bases

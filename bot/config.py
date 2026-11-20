@@ -53,6 +53,10 @@ class BotConfig:
     max_daily_loss_usd: float = 160.0
     max_consecutive_losses: int = 10
     min_merge_shares: float = 1.0
+    # After one side is held, the other side's average may reach this.
+    # 1.00 means the pair does not lock a loss. The wallet's median is 1.03,
+    # which only pays if a maker rebate we cannot see in advance covers it.
+    pair_sum_hedge: float = 1.0
     onchain_gas_usd: float = 0.0
     # Kept so old Railway variables still parse. They never delete the ledger.
     paper_reset_once: bool = False
@@ -122,6 +126,7 @@ class BotConfig:
             max_daily_loss_usd=max(5.0, float(os.getenv("MAX_DAILY_LOSS_USD", "160"))),
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
             min_merge_shares=max(0.01, float(os.getenv("MIN_MERGE_SHARES", "1"))),
+            pair_sum_hedge=min(1.20, max(0.99, float(os.getenv("PAIR_SUM_HEDGE", "1")))),
             onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),

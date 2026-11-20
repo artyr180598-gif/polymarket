@@ -22,8 +22,11 @@ BID_MIN = Decimal("0.01")
 BID_MAX = Decimal("0.98")
 # Matched shares pay $1. With nothing held, both bids stay under this so we
 # do not open a locked loss. After one side has filled, the lagging side may
-# cost up to PAIR_SUM_HEDGE: over 6 days the wallet's two-sided windows had
-# a median pair of $1.03, and the second leg arrived about 100s later.
+# a median pair of $1.03. That extra 3¢ is a locked loss. The maker rebate
+# is a share of a daily fee pool (docs.polymarket.com/programs/maker-rebates),
+# not cash we can book on the fill, and it is worth well under 1¢ a share.
+# The hedge therefore defaults to $1.00. PAIR_SUM_HEDGE is only the wallet's
+# observed median, used when the operator sets PAIR_SUM_HEDGE=1.03.
 PAIR_SUM_MAX = Decimal("0.99")
 PAIR_SUM_HEDGE = Decimal("1.03")
 # How far we will improve a touch so the two sides still sum to <= 0.99.
@@ -120,12 +123,13 @@ def plan_quotes(
     exposure_cap: Decimal,
     held_avg: dict[str, Decimal] | None = None,
     held_shares: dict[str, Decimal] | None = None,
+    hedge_cap: Decimal | None = None,
 ) -> list[Quote]:
     """Up to three resting bids per outcome.
 
     With a flat book the two sides stay under $0.99. Once one side is held,
-    the other may be bid up to $1.03 so the hedge can land instead of the
-    window staying one-sided. The cap is on the average after the fill.
+    the other may be bid up to ``hedge_cap`` (default $1.00, so the pair
+    does not lock a loss). The cap is on the average after the fill.
     """
     tick = D(tick)
     if tick <= 0:
@@ -151,7 +155,7 @@ def plan_quotes(
     if not touches:
         return []
 
-    pair_cap = _pair_cap(held_shares)
+    pair_cap = _pair_cap(held_shares, D(hedge_cap) if hedge_cap is not None else PAIR_SUM_MAX)
     # Two touches that already sum past the cap: shade the expensive one,
     # or drop it and keep the cheaper side.
     if "Up" in touches and "Down" in touches:
@@ -217,9 +221,9 @@ def plan_quotes(
     return quotes
 
 
-def _pair_cap(held_shares: dict[str, Decimal]) -> Decimal:
+def _pair_cap(held_shares: dict[str, Decimal], hedge_cap: Decimal) -> Decimal:
     if held_shares.get("Up", 0) > 0 or held_shares.get("Down", 0) > 0:
-        return PAIR_SUM_HEDGE
+        return max(PAIR_SUM_MAX, D(hedge_cap))
     return PAIR_SUM_MAX
 
 
