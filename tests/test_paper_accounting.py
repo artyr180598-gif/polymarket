@@ -178,6 +178,14 @@ class SettlementClockTests(unittest.TestCase):
         self.assertGreaterEqual(window.seconds_after_end, 9.0)
 
 
+class RailwayVolumeSafetyTests(unittest.TestCase):
+    def test_missing_railway_data_mount_fails_closed_before_creating_database(self):
+        with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_NAME": "production"}):
+            with patch("bot.ledger.os.path.ismount", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "volume is not mounted"):
+                    Ledger("/data/polybot.db")
+
+
 class LedgerStatsTests(unittest.TestCase):
     def test_realized_stats_include_net_merge_pnl(self):
         with tempfile.TemporaryDirectory() as tmp:
