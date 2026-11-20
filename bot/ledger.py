@@ -24,10 +24,18 @@ class Ledger:
         absolute_db_path = os.path.abspath(db_path)
         parent = os.path.dirname(absolute_db_path)
         marker = f"{db_path}.initialized"
+        railway_runtime = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME"))
+        mounted_data = os.path.join(os.sep, "data")
+        app_local_data = os.path.join(os.getcwd(), "data") + os.sep
+        if railway_runtime and absolute_db_path.startswith(app_local_data):
+            raise RuntimeError(
+                "Railway DB_PATH resolves to the app-local data directory, not the persistent volume. "
+                "Set DB_PATH=/data/polybot.db."
+            )
         if (
-            os.getenv("RAILWAY_ENVIRONMENT_NAME")
-            and absolute_db_path.startswith(os.path.join(os.sep, "data") + os.sep)
-            and not os.path.ismount(os.path.join(os.sep, "data"))
+            railway_runtime
+            and absolute_db_path.startswith(mounted_data + os.sep)
+            and not os.path.ismount(mounted_data)
         ):
             raise RuntimeError("Railway /data volume is not mounted; refusing to use an ephemeral PAPER ledger")
         db_exists = os.path.isfile(db_path)
