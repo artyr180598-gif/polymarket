@@ -33,6 +33,8 @@ class WindowState:
     end_ts: float
     price_to_beat: Optional[float] = None
     final_price: Optional[float] = None
+    fee_rate: Optional[float] = None
+    fee_exponent: Optional[float] = None
     up_shares: float = 0.0
     down_shares: float = 0.0
     up_cost: float = 0.0
@@ -333,6 +335,10 @@ class TradingEngine:
                             w.price_to_beat = meta.get("price_to_beat")
                         if not w.condition_id:
                             w.condition_id = meta.get("condition_id") or ""
+                        if meta.get("fee_rate") is not None:
+                            w.fee_rate = float(meta["fee_rate"])
+                        if meta.get("fee_exponent") is not None:
+                            w.fee_exponent = float(meta["fee_exponent"])
                 except Exception as exc:
                     log.warning("PAPER recovery market metadata %s: %s", slug, exc)
             w.last_trade_mono = time.monotonic()
@@ -542,6 +548,7 @@ class TradingEngine:
                         up_token=meta["up_token"], down_token=meta["down_token"],
                         start_ts=float(start), end_ts=float(end),
                         price_to_beat=meta.get("price_to_beat"),
+                        fee_rate=meta.get("fee_rate"), fee_exponent=meta.get("fee_exponent"),
                     )
                     # Strike is the open of THIS window. Never stamp spot
                     # onto a window that has not started yet.
@@ -574,6 +581,16 @@ class TradingEngine:
                     if not ids or len(ids) < 2:
                         return None
                     ptb = None
+                    fee_rate = None
+                    fee_exponent = None
+                    fee_schedule = m.get("feeSchedule") or {}
+                    try:
+                        if fee_schedule.get("rate") is not None:
+                            fee_rate = float(fee_schedule["rate"])
+                        if fee_schedule.get("exponent") is not None:
+                            fee_exponent = float(fee_schedule["exponent"])
+                    except (TypeError, ValueError):
+                        fee_rate = fee_exponent = None
                     md = ev.get("eventMetadata") or {}
                     if md.get("priceToBeat"):
                         try:
@@ -585,6 +602,8 @@ class TradingEngine:
                         "up_token": str(ids[0]),
                         "down_token": str(ids[1]),
                         "price_to_beat": ptb,
+                        "fee_rate": fee_rate,
+                        "fee_exponent": fee_exponent,
                     }
         except Exception:
             return None
@@ -811,13 +830,19 @@ class TradingEngine:
             return
         # Recalculate the exact fee after price/size rounding; the caller's estimate
         # may be stale if the available cash forced a smaller clip.
-        fee = calc_taker_fee_usdc(size, price, w.asset, w.timeframe)
+        fee = calc_taker_fee_usdc(
+            size, price, w.asset, w.timeframe,
+            market_override_rate=w.fee_rate, market_override_exponent=w.fee_exponent,
+        )
         cost = price * size + fee
         if cost > self.cash:
             size = round(size * max(0.0, self.cash * 0.95) / cost, 2)
             if size < 5.0:
                 return
-            fee = calc_taker_fee_usdc(size, price, w.asset, w.timeframe)
+            fee = calc_taker_fee_usdc(
+                size, price, w.asset, w.timeframe,
+                market_override_rate=w.fee_rate, market_override_exponent=w.fee_exponent,
+            )
             cost = price * size + fee
         if cost > self.cash:
             return
