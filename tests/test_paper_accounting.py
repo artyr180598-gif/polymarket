@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from bot.config import BotConfig
-from bot.engine import TradingEngine, WindowState, _resolution_payouts
+from bot.engine import TradingEngine, WindowState, _market_fee_params, _resolution_payouts
 from bot.ledger import Ledger
 from bot.fees import calc_taker_fee_usdc
 from bot.twap_model import AssetPriceTracker
@@ -121,6 +121,27 @@ class PolyBoltFrameTests(unittest.TestCase):
             })
             self.assertIsNone(engine.trackers["BTC"].cl_spot)
             engine.ledger.conn.close()
+
+
+class MarketFeeScheduleTests(unittest.TestCase):
+    def test_nested_gamma_fee_schedule_is_authoritative(self):
+        self.assertEqual(
+            _market_fee_params({"feeSchedule": {"rate": "0.031", "exponent": "1.5"}}),
+            (0.031, 1.5),
+        )
+
+    def test_json_string_fee_schedule_is_parsed(self):
+        self.assertEqual(
+            _market_fee_params({"feeSchedule": '{"rate":0.04,"exponent":2}'}),
+            (0.04, 2.0),
+        )
+
+    def test_zero_fee_schedule_is_not_replaced_by_category_fallback(self):
+        self.assertEqual(_market_fee_params({"feeSchedule": {"rate": 0, "exponent": 1}}), (0.0, 1.0))
+        self.assertEqual(_market_fee_params({"feesEnabled": False}), (0.0, 1.0))
+
+    def test_legacy_direct_fee_fields_remain_supported(self):
+        self.assertEqual(_market_fee_params({"feeRate": 0.05, "feeExponent": 1}), (0.05, 1.0))
 
 
 class ResolutionPayoutTests(unittest.TestCase):
