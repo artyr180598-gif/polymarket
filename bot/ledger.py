@@ -219,10 +219,11 @@ class Ledger:
                 COALESCE(SUM(notional), 0) AS total_notional,
                 COALESCE(SUM(CASE WHEN role='MAKER' THEN notional ELSE 0 END), 0) AS maker_notional,
                 COALESCE(SUM(fee), 0) AS total_fees,
+                COALESCE(SUM(CASE WHEN ts >= ? THEN fee ELSE 0 END), 0) AS today_fees,
                 COALESCE(SUM(shares * price * (1.0 - price)), 0) AS weighted_vol
             FROM fills WHERE mode = ?
             """,
-            (mode,),
+            (today_start, mode),
         ).fetchone()
 
         r_row = self.conn.execute(
@@ -232,7 +233,7 @@ class Ledger:
                 COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS win_mkts,
                 COALESCE(SUM(gross_pnl), 0) AS gross_pnl,
                 COALESCE(SUM(net_pnl), 0) AS net_pnl,
-                COALESCE(SUM(CASE WHEN ts >= ? THEN net_pnl ELSE 0 END), 0) AS today_net_pnl
+                COALESCE(SUM(CASE WHEN ts >= ? THEN gross_pnl ELSE 0 END), 0) AS today_gross_pnl
             FROM resolutions WHERE mode = ?
             """,
             (today_start, mode),
@@ -244,7 +245,7 @@ class Ledger:
                    COALESCE(SUM(locked_pnl), 0) AS merged_pnl,
                    COALESCE(SUM(fees), 0) AS merged_fees,
                    COALESCE(SUM(locked_pnl - fees), 0) AS merged_net_pnl,
-                   COALESCE(SUM(CASE WHEN ts >= ? THEN locked_pnl - fees ELSE 0 END), 0) AS today_merged_net_pnl
+                   COALESCE(SUM(CASE WHEN ts >= ? THEN locked_pnl ELSE 0 END), 0) AS today_merged_gross_pnl
             FROM merges WHERE mode = ?
             """,
             (today_start, mode),
@@ -266,8 +267,8 @@ class Ledger:
             "win_markets": int(r_row["win_mkts"]),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
             "realized_gross_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]), 2),
-            "realized_net_pnl": round(float(r_row["net_pnl"]) + float(m_row["merged_net_pnl"]), 2),
-            "today_net_pnl": round(float(r_row["today_net_pnl"]) + float(m_row["today_merged_net_pnl"]), 2),
+            "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
+            "today_net_pnl": round(float(r_row["today_gross_pnl"]) + float(m_row["today_merged_gross_pnl"]) - float(f_row["today_fees"]), 2),
             "merge_count": int(m_row["merge_count"]),
             "merged_usd": round(float(m_row["merged_usd"]), 2),
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
