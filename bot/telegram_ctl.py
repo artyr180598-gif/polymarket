@@ -171,7 +171,10 @@ class TelegramController:
         state_txt = "торгует" if running else ("пауза" if paused else "остановлен")
         equity = st.get("equity", 0) or 0
         cash = st.get("cash", 0) or 0
-        day = st.get("day_pnl", 0) or stats.get("today_net_pnl", 0) or 0
+        day = st.get("day_pnl")
+        if day is None:
+            day = stats.get("today_net_pnl", 0)
+        day = float(day or 0)
         day_s = f"+${day:.2f}" if day >= 0 else f"-${abs(day):.2f}"
         fees = float(st.get("fees_paid", 0) or 0)
         lines = [
