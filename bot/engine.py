@@ -374,7 +374,7 @@ class TradingEngine:
                             pair = symbols.get(asset)
                             if pair:
                                 subscriptions.append({"topic": "crypto_prices_chainlink", "type": "*", "filters": json.dumps({"symbol": pair[0]})})
-                                subscriptions.append({"topic": "crypto_prices", "type": "update", "filters": pair[1]})
+                                subscriptions.append({"topic": "crypto_prices", "type": "update", "filters": json.dumps({"symbol": pair[1].upper()})})
                         await ws.send_json({"action": "subscribe", "subscriptions": subscriptions})
                         self._rtds_ok = True
                         delay = 1.0
