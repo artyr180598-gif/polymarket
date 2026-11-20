@@ -297,9 +297,11 @@ class TradingEngine:
             self.executor = PaperExecutor(self.cfg.bankroll_usd)
             self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
             self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · CLOB depth + taker fee", notify=True)
+        if self.cfg.trading_mode == "paper":
+            await self._restore_paper_state()
         self.running = True
         self._tasks = [
-            asyncio.create_task(self._rest_price_loop(), name="prices"),
+            asyncio.create_task(self._rtds_loop(), name="rtds"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
@@ -375,49 +377,85 @@ class TradingEngine:
                 pass
         return None
 
-    async def _rest_price_loop(self) -> None:
-        notified = False
+    async def _rtds_loop(self) -> None:
+        """Consume actual Polymarket RTDS Chainlink/Binance feeds."""
+        delay = 1.0
+        symbols = {"BTC": ("btc/usd", "btcusdt"), "ETH": ("eth/usd", "ethusdt"), "SOL": ("sol/usd", "solusdt")}
         while self.running:
             try:
-                now = time.time()
-                ok_any = False
-                for asset in list(self.cfg.enabled_assets):
-                    tr = self.trackers.get(asset)
-                    if not tr:
-                        continue
-                    px = await self._fetch_spot(asset)
-                    if not px:
-                        continue
-                    ok_any = True
-                    ts_ms = int(now * 1000)
-                    tr.on_binance_spot(px, ts_ms)
-                    tr.on_chainlink_spot(px, ts_ms)
-                    tr.on_chainlink_twap60(px, ts_ms)
-                    for w in self.windows.values():
-                        if w.asset != asset:
-                            continue
-                        if w.price_to_beat is None and -5 <= (now - w.start_ts) <= 30:
-                            w.price_to_beat = px
-                        if w.final_price is None and -5 <= (now - w.end_ts) <= 30:
-                            w.final_price = px
-                for w in list(self.windows.values()):
-                    if w.resolved or w.price_to_beat is not None:
-                        continue
-                    tr = self.trackers.get(w.asset)
-                    if not tr:
-                        continue
-                    ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
-                    if ptb:
-                        w.price_to_beat = float(ptb)
-                if ok_any:
-                    self._price_ok = True
-                    self._streams_ok = True
-                    if not notified:
-                        self._log_event("INFO", "Spot + CLOB book OK", notify=True)
-                        notified = True
-            except Exception as e:
-                log.warning("prices: %s", e)
-            await asyncio.sleep(2.0)
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
+                    async with session.ws_connect("wss://ws-live-data.polymarket.com", heartbeat=20) as ws:
+                        subscriptions = []
+                        for asset in self.cfg.enabled_assets:
+                            pair = symbols.get(asset)
+                            if pair:
+                                subscriptions.append({"topic": "crypto_prices_chainlink", "type": "*", "filters": json.dumps({"symbol": pair[0]})})
+                                subscriptions.append({"topic": "crypto_prices", "type": "update", "filters": pair[1]})
+                        await ws.send_json({"action": "subscribe", "subscriptions": subscriptions})
+                        self._rtds_ok = True
+                        delay = 1.0
+                        self._log_event("INFO", "Polymarket RTDS connected · Chainlink + Binance", notify=True)
+                        while self.running:
+                            try:
+                                msg = await ws.receive(timeout=5.0)
+                            except asyncio.TimeoutError:
+                                await ws.send_str("PING")
+                                continue
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    messages = json.loads(msg.data)
+                                except (TypeError, ValueError):
+                                    continue
+                                if not isinstance(messages, list):
+                                    messages = [messages]
+                                for item in messages:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    topic = str(item.get("topic") or "")
+                                    payload = item.get("payload") or {}
+                                    if not isinstance(payload, dict):
+                                        continue
+                                    symbol = str(payload.get("symbol") or "").lower()
+                                    try:
+                                        price = float(payload.get("value") or 0.0)
+                                        feed_ts_ms = int(payload.get("timestamp") or item.get("timestamp") or 0)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if price <= 0 or feed_ts_ms <= 0:
+                                        continue
+                                    asset = next((a for a, pair in symbols.items() if symbol in pair), None)
+                                    if asset not in self.trackers:
+                                        continue
+                                    tracker = self.trackers[asset]
+                                    if topic == "crypto_prices_chainlink" and symbol == symbols[asset][0]:
+                                        tracker.on_chainlink_spot(price, feed_ts_ms)
+                                        self._price_ok = tracker.cl_twap60 is not None
+                                        self._streams_ok = self._price_ok
+                                        event_ts = feed_ts_ms / 1000.0
+                                        for window in self.windows.values():
+                                            if window.asset != asset:
+                                                continue
+                                            elapsed = event_ts - window.start_ts
+                                            after_end = event_ts - window.end_ts
+                                            if window.price_to_beat is None and 0 <= elapsed <= 20:
+                                                window.price_to_beat = price
+                                            if window.final_price is None and 0 <= after_end <= 30:
+                                                window.final_price = price
+                                    elif topic == "crypto_prices" and symbol == symbols[asset][1]:
+                                        tracker.on_binance_spot(price, feed_ts_ms)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                        self._rtds_ok = False
+            except asyncio.CancelledError:
+                self._rtds_ok = False
+                raise
+            except Exception as exc:
+                self._rtds_ok = False
+                self._price_ok = False
+                self._streams_ok = False
+                log.warning("RTDS disconnected: %s", exc)
+            await asyncio.sleep(delay)
+            delay = min(30.0, delay * 2.0)
 
     async def _discovery_loop(self) -> None:
         while self.running:
