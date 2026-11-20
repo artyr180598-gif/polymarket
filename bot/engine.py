@@ -96,6 +96,7 @@ class TradingEngine:
         self._last_equity_ts = 0.0
         self._live_prices: dict[str, Decimal] = {}
         self._live_left: dict[str, Decimal] = {}
+        self._live_original: dict[str, Decimal] = {}
         self._stuck_noted: set[str] = set()
         self._preset_note = ""
         if cfg.strategy_preset not in ("mo_money",):
@@ -139,7 +140,22 @@ class TradingEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("persist: %s", exc)
 
+    def _delete_legacy_files(self) -> None:
+        paths = list(self.cfg.legacy_db_delete or [])
+        if not paths:
+            return
+        from .cleanup import delete_legacy_files, volume_root_from_env
+
+        for item in delete_legacy_files(
+            paths,
+            volume_root=volume_root_from_env(),
+            db_path=self.cfg.db_path,
+        ):
+            detail = f" — {item.reason}" if item.reason else ""
+            self._note("INFO", f"LEGACY_DB_DELETE {item.status}: {item.path}{detail}")
+
     async def start(self) -> None:
+        self._delete_legacy_files()
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
         if self._preset_note:
             self._note("INFO", self._preset_note, notify=True)
@@ -247,6 +263,7 @@ class TradingEngine:
                     self.portfolio.unlock(order_id)
                     self._live_prices.pop(order_id, None)
                     self._live_left.pop(order_id, None)
+                    self._live_original.pop(order_id, None)
             window.orders.clear()
 
     async def _discover_loop(self) -> None:
@@ -445,7 +462,18 @@ class TradingEngine:
 
         wanted = {f"{q.outcome}@{q.price}": q for q in quotes}
         for key, order_id in list(window.orders.items()):
-            if key not in wanted:
+            quote = wanted.get(key)
+            resting = self.paper.orders.get(order_id) if self.mode == "paper" else None
+            # A price that moved from the top rung to a lower one must be
+            # resized. Leaving the old size in place stacks a full clip one
+            # cent behind the touch. A partial fill is left alone.
+            stale_size = False
+            if quote is not None and resting is not None and resting.remaining == resting.original:
+                stale_size = abs(resting.original - quote.shares) >= Decimal("0.01")
+            if self.mode == "live" and quote is not None and order_id in self._live_original:
+                if self._live_left.get(order_id) == self._live_original[order_id]:
+                    stale_size = abs(self._live_original[order_id] - quote.shares) >= Decimal("0.01")
+            if quote is None or stale_size:
                 await self._cancel_order(order_id)
                 window.orders.pop(key, None)
         for key, quote in wanted.items():
@@ -477,6 +505,7 @@ class TradingEngine:
                     continue
                 self._live_prices[order_id] = quote.price
                 self._live_left[order_id] = quote.shares
+                self._live_original[order_id] = quote.shares
                 if filled_now > 0:
                     self._apply_fill(
                         window,
@@ -492,6 +521,7 @@ class TradingEngine:
                     self.portfolio.unlock(order_id)
                     self._live_prices.pop(order_id, None)
                     self._live_left.pop(order_id, None)
+                    self._live_original.pop(order_id, None)
 
     def _resting(self, order_id: str) -> Resting | None:
         return self.paper.orders.get(order_id)
@@ -504,6 +534,7 @@ class TradingEngine:
             self.portfolio.unlock(order_id)
             self._live_prices.pop(order_id, None)
             self._live_left.pop(order_id, None)
+            self._live_original.pop(order_id, None)
 
     def _cancel_window(self, window: Window) -> None:
         for order_id in list(window.orders.values()):
@@ -581,6 +612,7 @@ class TradingEngine:
                 self.portfolio.unlock(order_id)
                 self._live_prices.pop(order_id, None)
                 self._live_left.pop(order_id, None)
+                self._live_original.pop(order_id, None)
 
     async def _recent_trades(self, condition_id: str) -> list[dict]:
         if self._session is None or not condition_id:
@@ -824,10 +856,20 @@ class TradingEngine:
                 })
         now = time.time()
         floor = float(self.cfg.paper_stats_since_ts or 0)
+        # A timestamp in the future would make every window start after "now"
+        # and hide fills that just happened. Ignore that. A past floor only
+        # drops history from before it; anything newer still counts.
+        if floor <= 0 or floor > now:
+            floor = 0.0
+
+        def _since(window_sec: float) -> float:
+            start = now - window_sec
+            return max(start, floor)
+
         edge = {
-            "d7": self.ledger.turnover(self.mode, max(floor, now - 7 * 86400)),
-            "d14": self.ledger.turnover(self.mode, max(floor, now - 14 * 86400)),
-            "d30": self.ledger.turnover(self.mode, max(floor, now - 30 * 86400)),
+            "d7": self.ledger.turnover(self.mode, _since(7 * 86400)),
+            "d14": self.ledger.turnover(self.mode, _since(14 * 86400)),
+            "d30": self.ledger.turnover(self.mode, _since(30 * 86400)),
         }
         try:
             series = self.ledger.equity_series(self.mode)
