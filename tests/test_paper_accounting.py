@@ -115,8 +115,13 @@ class LedgerStatsTests(unittest.TestCase):
 class StrategySafetyTests(unittest.TestCase):
     def test_mo_money_preset_cannot_be_switched_by_runtime_command(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "preset.db"))
+            cfg = BotConfig(
+                trading_mode="paper", strategy_preset="hybrid",
+                enabled_assets=["BTC", "ETH"], enabled_timeframes=["1h"],
+                db_path=str(Path(tmp) / "preset.db"),
+            )
             engine = TradingEngine(cfg)
+            self.assertEqual(engine.cfg.strategy_preset, "mo_money")
             self.assertFalse(engine.set_preset("hybrid"))
             self.assertEqual(engine.cfg.strategy_preset, "mo_money")
             self.assertEqual(engine.cfg.enabled_assets, ["BTC"])
