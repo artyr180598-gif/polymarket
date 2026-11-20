@@ -571,6 +571,8 @@ class TradingEngine:
             {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60}},
         ]
         while self.running:
+            last_seq: Dict[str, int] = {}
+            snapshot_seen = set()
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
                     async with session.ws_connect("wss://ws-live-v2.polymarket.com/ws", heartbeat=90) as ws:
@@ -612,6 +614,19 @@ class TradingEngine:
                                 if isinstance(frame, dict):
                                     if frame.get("op") == "error":
                                         raise RuntimeError(f"PolyBolt stream error: {frame.get('code')}")
+                                    channel = str(frame.get("channel") or "")
+                                    if channel in ("price.crypto", "price.crypto.twap") and frame.get("v") == 1:
+                                        dropped = int(frame.get("dropped") or 0)
+                                        seq = frame.get("seq")
+                                        if dropped > 0:
+                                            raise ConnectionError(f"PolyBolt dropped {dropped} {channel} updates")
+                                        if isinstance(seq, int):
+                                            previous = last_seq.get(channel)
+                                            if previous is not None and seq != previous + 1:
+                                                raise ConnectionError(f"PolyBolt {channel} sequence gap: {previous} -> {seq}")
+                                            last_seq[channel] = seq
+                                        if frame.get("snapshot") is True:
+                                            snapshot_seen.add(channel)
                                     try:
                                         self._handle_polybolt_frame(frame)
                                     except Exception as exc:
