@@ -432,8 +432,8 @@ class TradingEngine:
             self._streams_ok = False
             self._log_event(
                 "ERROR",
-                "PolyBolt CLOB API credentials are missing. Legacy RTDS reference-price topics are retired; "
-                "new entries remain blocked until credentials are configured.",
+                "PolyBolt CLOB API credentials are missing. Legacy RTDS reference-price topics are deprecated; "
+                "new entries remain blocked until authenticated Chainlink feeds are configured.",
                 notify=True,
             )
             while self.running:
