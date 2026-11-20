@@ -325,6 +325,26 @@ class BookTests(unittest.TestCase):
         )
         self.assertEqual(got, Decimal("0"))
         self.assertEqual(queue, Decimal("13"))
+        # Half a 0.001 tick: 0.966 and 0.9660004 are one level, 0.965 is the next.
+        _, got = apply_trade_print(
+            queue_ahead=Decimal("0"), remaining=Decimal("5"), our_price=Decimal("0.966"),
+            trade_price=Decimal("0.9660004"), trade_size=Decimal("3"), taker_side="SELL",
+        )
+        self.assertEqual(got, Decimal("3"))
+        _, got = apply_trade_print(
+            queue_ahead=Decimal("0"), remaining=Decimal("5"), our_price=Decimal("0.966"),
+            trade_price=Decimal("0.965"), trade_size=Decimal("3"), taker_side="SELL",
+        )
+        self.assertEqual(got, Decimal("0"))
+
+    def test_maker_buy_is_one_trade_even_when_the_sell_row_arrives_too(self) -> None:
+        from bot.books import queue_print_delta
+        buy, sell, delta = queue_print_delta(Decimal(0), Decimal(0), "BUY", Decimal("146.95"))
+        self.assertEqual(delta, Decimal("146.95"))
+        _, _, again = queue_print_delta(buy, sell, "SELL", Decimal("20"))
+        self.assertEqual(again, Decimal(0))
+        _, _, extra = queue_print_delta(buy, sell, "SELL", Decimal("200"))
+        self.assertEqual(extra, Decimal("200") - Decimal("146.95"))
 
     def test_paper_broker_fills_only_on_a_sell_print(self) -> None:
         port = Portfolio(initial_cash=Decimal("1000"), cash=Decimal("1000"))
@@ -393,21 +413,21 @@ class BookTests(unittest.TestCase):
         )
         window.orders["Up@0.57"] = order_id
 
-        async def failed(_cid):
+        async def failed(_cid, _seen):
             return None
 
         engine._recent_trades = failed  # type: ignore[method-assign]
         asyncio.run(engine._paper_prints(window))
         self.assertFalse(window.prints_seeded)
 
-        async def empty(_cid):
+        async def empty(_cid, _seen):
             return []
 
         engine._recent_trades = empty  # type: ignore[method-assign]
         asyncio.run(engine._paper_prints(window))
         self.assertTrue(window.prints_seeded)
 
-        async def late_history(_cid):
+        async def late_history(_cid, _seen):
             # The 11:20:06 cluster: sells below 0.57, timestamped before the order.
             return [
                 {"transaction_hash": "a", "token_id": "t", "price": "0.51", "size": "1", "timestamp": 100, "side": "SELL"},
@@ -421,7 +441,7 @@ class BookTests(unittest.TestCase):
         self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
         self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("12"))
 
-        async def real_print(_cid):
+        async def real_print(_cid, _seen):
             return [
                 {"transaction_hash": "e", "token_id": "t", "price": "0.57", "size": "20", "timestamp": 1000, "side": "SELL"},
             ]
@@ -430,6 +450,41 @@ class BookTests(unittest.TestCase):
         fills = asyncio.run(engine._paper_prints(window))
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].shares, Decimal("12"))
+
+    def test_a_maker_buy_print_fills_our_bid(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        window = Window(
+            slug="eth-updown-5m-1", asset="ETH", timeframe="5m", condition_id="c",
+            tokens={"Up": "u", "Down": "t"}, start_ts=0, end_ts=10**12,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        order_id = engine.paper.place(
+            outcome="Down", token_id="t", price=Decimal("0.83"), shares=Decimal("12"),
+            best_ask=Decimal("0.84"), bid_size_at_price=Decimal("0"),
+        )
+        window.prints_seeded = True
+        engine.paper.orders[order_id].placed_at = 1000
+
+        async def maker_buy(_cid, _seen):
+            return [
+                {"transaction_hash": "m", "token_id": "t", "price": "0.83", "size": "146.95", "timestamp": 1000, "side": "BUY"},
+                {"transaction_hash": "m", "token_id": "t", "price": "0.83", "size": "12", "timestamp": 1000, "side": "SELL"},
+            ]
+
+        engine._recent_trades = maker_buy  # type: ignore[method-assign]
+        fills = asyncio.run(engine._paper_prints(window))
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].shares, Decimal("12"))
+        self.assertEqual(engine.paper.orders.get(order_id), None)
 
 
 class ResolutionTests(unittest.TestCase):
