@@ -52,6 +52,7 @@ class TelegramController:
         self._session: Optional[aiohttp.ClientSession] = None
         self._send_lock = asyncio.Lock()
         self._last_send_mono = 0.0
+        self._rate_limit_until = 0.0
         self._startup_ts = time.time()
         self._poll_backoff = 1.0
 
@@ -116,7 +117,11 @@ class TelegramController:
         if not self.enabled or not self._session:
             return
         async with self._send_lock:
-            wait = 1.05 - (time.monotonic() - self._last_send_mono)
+            wait = max(
+                1.05 - (time.monotonic() - self._last_send_mono),
+                self._rate_limit_until - time.monotonic(),
+                0.0,
+            )
             if wait > 0:
                 await asyncio.sleep(wait)
             clean = (text or "").replace("\\", "")[:4090]
@@ -128,27 +133,54 @@ class TelegramController:
             }
             if keyboard:
                 payload["reply_markup"] = keyboard
+
+            async def post(data: Dict[str, Any]):
+                async with self._session.post(f"{self._base}/sendMessage", json=data) as response:
+                    return response.status, await response.text(), dict(response.headers)
+
+            def apply_retry_after(body: str, headers: Dict[str, Any]) -> float:
+                retry_after = headers.get("Retry-After")
+                try:
+                    parsed = json.loads(body)
+                    retry_after = (parsed.get("parameters") or {}).get("retry_after") or retry_after
+                except Exception:
+                    pass
+                try:
+                    seconds = float(retry_after) if retry_after is not None else 5.0
+                except (TypeError, ValueError):
+                    seconds = 5.0
+                seconds = min(60.0, max(1.0, seconds))
+                self._rate_limit_until = time.monotonic() + seconds
+                return seconds
+
             try:
-                async with self._session.post(f"{self._base}/sendMessage", json=payload) as response:
-                    if response.status != 200:
-                        body = await response.text()
-                        logger.warning("sendMessage %s: %s", response.status, body[:180])
-                        # Retry without HTML only for Telegram parse errors; never retry 429/5xx.
-                        if response.status == 400:
-                            plain = (
-                                clean.replace("<b>", "").replace("</b>", "")
-                                .replace("<i>", "").replace("</i>", "")
-                                .replace("<code>", "").replace("</code>", "")
-                            )
-                            payload["text"] = plain[:4090]
-                            payload.pop("parse_mode", None)
-                            async with self._session.post(f"{self._base}/sendMessage", json=payload) as fallback:
-                                if fallback.status != 200:
-                                    logger.warning("sendMessage plain %s", fallback.status)
+                status, body, headers = await post(payload)
+                if status == 429:
+                    wait = apply_retry_after(body, headers)
+                    logger.warning("sendMessage rate limited; retrying once after %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    status, body, headers = await post(payload)
+                    if status == 429:
+                        apply_retry_after(body, headers)
+                elif status == 400:
+                    logger.warning("sendMessage HTML parse error: %s", body[:180])
+                    plain_payload = dict(payload)
+                    plain_payload["text"] = (
+                        clean.replace("<b>", "").replace("</b>", "")
+                        .replace("<i>", "").replace("</i>", "")
+                        .replace("<code>", "").replace("</code>", "")
+                    )
+                    plain_payload.pop("parse_mode", None)
+                    status, body, headers = await post(plain_payload)
+                    if status == 429:
+                        apply_retry_after(body, headers)
+                if status != 200:
+                    logger.warning("sendMessage %s: %s", status, body[:180])
             except Exception as exc:
                 logger.warning("Telegram send failed: %s", exc)
             finally:
                 self._last_send_mono = time.monotonic()
+
 
     async def notify(self, text: str) -> None:
         msg = (text or "").strip()
