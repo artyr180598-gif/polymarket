@@ -73,7 +73,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             )
             ledger.record_merge(
                 mode="paper", slug=slug, condition_id="condition",
-                pairs=5, cost_basis=4.5, locked_pnl=0.5, fees=0.075, ts=now - 10
+                pairs=5, cost_basis=4.5, locked_pnl=0.5, ts=now - 10
             )
             ledger.conn.close()
 
@@ -88,6 +88,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(engine.cash, 2745.85, places=2)
             self.assertAlmostEqual(engine.fees_paid, 0.15, places=5)
             self.assertAlmostEqual(engine.realized_pnl, 0.35, places=2)
+            self.assertAlmostEqual(engine.ledger.get_stats("paper")["merged_fees"], 0.075, places=4)
             self.assertEqual(len(engine.windows), 1)
             restored = engine.windows[slug]
             self.assertAlmostEqual(restored.up_shares, 5.0, places=4)
