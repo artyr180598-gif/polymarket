@@ -308,6 +308,14 @@ class Ledger:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def update_merge_fees(self, merge_id: int, fees: float) -> None:
+        """Backfill fee allocation for legacy merge rows without changing their PnL basis."""
+        self.conn.execute(
+            "UPDATE merges SET fees = ? WHERE id = ? AND (fees IS NULL OR fees = 0)",
+            (round(max(0.0, fees), 5), int(merge_id)),
+        )
+        self.conn.commit()
+
     def recovery_events(self, mode: str) -> List[Dict[str, Any]]:
         """Return immutable paper-ledger events in replay order for crash recovery."""
         events: List[Dict[str, Any]] = []
