@@ -71,8 +71,13 @@ class TelegramController:
         await self._discard_pending_updates()
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
+        feed_status = (
+            "PolyBolt Chainlink · CLOB REST"
+            if self.engine.cfg.has_polybolt_credentials
+            else "PolyBolt: нет CLOB API credentials · новые входы заблокированы"
+        )
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: PolyBolt Chainlink (CLOB API auth) + CLOB REST",
+            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: {feed_status}",
             keyboard=_kb_main(),
         )
 
@@ -152,7 +157,6 @@ class TelegramController:
                     seconds = 5.0
                 seconds = min(60.0, max(1.0, seconds))
                 self._rate_limit_until = time.monotonic() + seconds
-                self._min_send_interval = max(self._min_send_interval, seconds)
                 return seconds
 
             try:
@@ -164,8 +168,11 @@ class TelegramController:
                     status, body, headers = await post(payload)
                     if status == 429:
                         apply_retry_after(body, headers)
-                elif status == 400:
-                    logger.warning("sendMessage HTML parse error: %s", body[:180])
+                elif status == 400 and (
+                    "can't parse entities" in body.lower()
+                    or "can't find end of the entity" in body.lower()
+                ):
+                    logger.warning("sendMessage HTML parse error; retrying as plain text")
                     plain_payload = dict(payload)
                     plain_payload["text"] = (
                         clean.replace("<b>", "").replace("</b>", "")
@@ -176,6 +183,16 @@ class TelegramController:
                     status, body, headers = await post(plain_payload)
                     if status == 429:
                         apply_retry_after(body, headers)
+                elif 500 <= status < 600:
+                    for retry_delay in (1.0, 2.0):
+                        logger.warning("sendMessage HTTP %s; retrying in %.1fs", status, retry_delay)
+                        await asyncio.sleep(retry_delay)
+                        status, body, headers = await post(payload)
+                        if status == 429:
+                            apply_retry_after(body, headers)
+                            break
+                        if status < 500:
+                            break
                 if status != 200:
                     logger.warning("sendMessage %s: %s", status, body[:180])
             except Exception as exc:
