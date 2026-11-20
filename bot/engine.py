@@ -41,6 +41,7 @@ class WindowState:
     last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
+    last_resolve_attempt_mono: float = 0.0
     up_fees: float = 0.0
     down_fees: float = 0.0
 
@@ -446,6 +447,8 @@ class TradingEngine:
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
                         self._rtds_ok = False
+                        self._price_ok = False
+                        self._streams_ok = False
             except asyncio.CancelledError:
                 self._rtds_ok = False
                 raise
@@ -886,6 +889,9 @@ class TradingEngine:
                         continue
                     if w.seconds_after_end < 3:
                         continue
+                    if time.monotonic() - w.last_resolve_attempt_mono < 15.0:
+                        continue
+                    w.last_resolve_attempt_mono = time.monotonic()
                     await self._resolve(w)
             except Exception as e:
                 log.warning("resolve: %s", e)
