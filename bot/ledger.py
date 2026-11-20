@@ -321,6 +321,14 @@ class Ledger:
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
             "realized_gross_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]), 2),
             "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
+            "resolved_net_pnl": round(float(r_row["net_pnl"]), 2),
+            "resolved_gross_pnl": round(float(r_row["gross_pnl"]), 2),
+            "resolved_fees": round(float(self.conn.execute(
+                "SELECT COALESCE(SUM(total_fees), 0) FROM resolutions WHERE mode = ?", (mode,)
+            ).fetchone()[0]), 4),
+            "open_fees": round(max(0.0, float(f_row["total_fees"]) - float(m_row["merged_fees"]) - float(self.conn.execute(
+                "SELECT COALESCE(SUM(total_fees), 0) FROM resolutions WHERE mode = ?", (mode,)
+            ).fetchone()[0])), 4),
             "today_net_pnl": round(float(r_row["today_gross_pnl"]) + float(m_row["today_merged_gross_pnl"]) - float(f_row["today_fees"]), 2),
             "merge_count": int(m_row["merge_count"]),
             "merged_usd": round(float(m_row["merged_usd"]), 2),
