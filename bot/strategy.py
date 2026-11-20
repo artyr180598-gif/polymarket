@@ -20,8 +20,15 @@ from .accounting import D, floor_to_step
 # under the ask, so 0.99 is not a price we can rest against a 0.99 ask.
 BID_MIN = Decimal("0.01")
 BID_MAX = Decimal("0.98")
-# Matched shares pay $1. A pair bought for more than this locks a loss.
+# Matched shares pay $1. With nothing held, both bids stay under this so we
+# do not open a locked loss. After one side has filled, the lagging side may
+# a median pair of $1.03. That extra 3¢ is a locked loss. The maker rebate
+# is a share of a daily fee pool (docs.polymarket.com/programs/maker-rebates),
+# not cash we can book on the fill, and it is worth well under 1¢ a share.
+# The hedge therefore defaults to $1.00. PAIR_SUM_HEDGE is only the wallet's
+# observed median, used when the operator sets PAIR_SUM_HEDGE=1.03.
 PAIR_SUM_MAX = Decimal("0.99")
+PAIR_SUM_HEDGE = Decimal("1.03")
 # How far we will improve a touch so the two sides still sum to <= 0.99.
 # Further than this we are no longer at the market, so we quote one side.
 MAX_SHADE = Decimal("0.05")
@@ -31,8 +38,9 @@ MAX_SHADE = Decimal("0.05")
 START_AFTER_SEC = 1
 STOP_BEFORE_END_SEC = 3
 LADDER_LEVELS = 3
-# Wallet: median 3 distinct prices per outcome. A cent apart, not one tick.
-LADDER_GAP = Decimal("0.01")
+# Last 6 days: median 2 distinct prices per side, p75 is 4. The smallest
+# gap between those prices has median 2¢.
+LADDER_GAP = Decimal("0.02")
 SIDE_BUDGET_FRACTION = Decimal("0.80")
 _LEVEL_WEIGHTS = (Decimal("0.50"), Decimal("0.30"), Decimal("0.20"))
 
@@ -115,11 +123,13 @@ def plan_quotes(
     exposure_cap: Decimal,
     held_avg: dict[str, Decimal] | None = None,
     held_shares: dict[str, Decimal] | None = None,
+    hedge_cap: Decimal | None = None,
 ) -> list[Quote]:
-    """Up to three resting bids per outcome, both outcomes when they fit under $0.99.
+    """Up to three resting bids per outcome.
 
-    The cap is on the average cost of shares we would actually hold after
-    each of these bids filled, not on a single simultaneous quote.
+    With a flat book the two sides stay under $0.99. Once one side is held,
+    the other may be bid up to ``hedge_cap`` (default $1.00, so the pair
+    does not lock a loss). The cap is on the average after the fill.
     """
     tick = D(tick)
     if tick <= 0:
@@ -145,20 +155,21 @@ def plan_quotes(
     if not touches:
         return []
 
+    pair_cap = _pair_cap(held_shares, D(hedge_cap) if hedge_cap is not None else PAIR_SUM_MAX)
     # Two touches that already sum past the cap: shade the expensive one,
-    # or drop it and keep the cheaper side (one-sided markets returned +10.6%).
+    # or drop it and keep the cheaper side.
     if "Up" in touches and "Down" in touches:
         up, up_ask = touches["Up"]
         down, down_ask = touches["Down"]
-        if up + down > PAIR_SUM_MAX:
+        if up + down > pair_cap:
             if up >= down:
-                capped = _cap_price(up, PAIR_SUM_MAX - down, tick)
+                capped = _cap_price(up, pair_cap - down, tick)
                 if capped is None or (up_ask is not None and capped >= up_ask):
                     touches.pop("Up")
                 else:
                     touches["Up"] = (capped, up_ask)
             else:
-                capped = _cap_price(down, PAIR_SUM_MAX - up, tick)
+                capped = _cap_price(down, pair_cap - up, tick)
                 if capped is None or (down_ask is not None and capped >= down_ask):
                     touches.pop("Down")
                 else:
@@ -192,7 +203,7 @@ def plan_quotes(
                     continue
             if qty < min_shares:
                 continue
-            if not _pair_ok(outcome, px, qty, held_avg, held_shares, planned_high):
+            if not _pair_ok(outcome, px, qty, held_avg, held_shares, planned_high, pair_cap):
                 continue
             notional = (qty * px).quantize(Decimal("0.000001"))
             if notional > room or notional > side_room or notional <= 0:
@@ -210,6 +221,12 @@ def plan_quotes(
     return quotes
 
 
+def _pair_cap(held_shares: dict[str, Decimal], hedge_cap: Decimal) -> Decimal:
+    if held_shares.get("Up", 0) > 0 or held_shares.get("Down", 0) > 0:
+        return max(PAIR_SUM_MAX, D(hedge_cap))
+    return PAIR_SUM_MAX
+
+
 def _pair_ok(
     outcome: str,
     price: Decimal,
@@ -217,6 +234,7 @@ def _pair_ok(
     held_avg: dict[str, Decimal],
     held_shares: dict[str, Decimal],
     planned_high: dict[str, Decimal],
+    pair_cap: Decimal,
 ) -> bool:
     other = "Down" if outcome == "Up" else "Up"
     this_avg = projected_avg(held_shares.get(outcome, 0), held_avg.get(outcome, 0), shares, price)
@@ -227,7 +245,7 @@ def _pair_ok(
         other_marks.append(planned_high[other])
     if not other_marks:
         return True
-    return this_avg + max(other_marks) <= PAIR_SUM_MAX + Decimal("0.0000001")
+    return this_avg + max(other_marks) <= pair_cap + Decimal("0.0000001")
 
 
 def in_entry_window(seconds_from_start: float, seconds_to_end: float) -> bool:

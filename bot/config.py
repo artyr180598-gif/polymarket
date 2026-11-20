@@ -41,16 +41,22 @@ class BotConfig:
     dry_run: bool = False
     bankroll_usd: float = 2750.0
     strategy_preset: str = "mo_money"
-    enabled_assets: list[str] = field(default_factory=lambda: ["BTC"])
-    enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m"])
+    enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
+    enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
     auto_start: bool = True
 
     order_clip_usd: float = 16.0
-    max_window_risk_usd: float = 140.0
-    max_total_exposure_usd: float = 420.0
+    # Several windows are open at once (wallet median 4, sometimes 12).
+    # A lower per-window cap lets more of them exist inside the account cap.
+    max_window_risk_usd: float = 80.0
+    max_total_exposure_usd: float = 640.0
     max_daily_loss_usd: float = 160.0
     max_consecutive_losses: int = 10
     min_merge_shares: float = 1.0
+    # After one side is held, the other side's average may reach this.
+    # 1.00 means the pair does not lock a loss. The wallet's median is 1.03,
+    # which only pays if a maker rebate we cannot see in advance covers it.
+    pair_sum_hedge: float = 1.0
     onchain_gas_usd: float = 0.0
     # Kept so old Railway variables still parse. They never delete the ledger.
     paper_reset_once: bool = False
@@ -100,12 +106,12 @@ class BotConfig:
         if mode not in ("paper", "live"):
             mode = "paper"
         preset = os.getenv("STRATEGY_PRESET", "mo_money").strip().lower() or "mo_money"
-        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC") if a.upper() in ASSETS]
+        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL,XRP") if a.upper() in ASSETS]
         if not assets:
-            assets = ["BTC"]
-        frames = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m,15m") if t.lower() in TIMEFRAMES]
+            assets = ["BTC", "ETH", "SOL", "XRP"]
+        frames = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m,15m,1h,4h") if t.lower() in TIMEFRAMES]
         if not frames:
-            frames = ["5m", "15m"]
+            frames = ["5m", "15m", "1h", "4h"]
         return cls(
             trading_mode=mode,
             dry_run=_flag("DRY_RUN", "false"),
@@ -115,11 +121,12 @@ class BotConfig:
             enabled_timeframes=frames,
             auto_start=_flag("AUTO_START", "true"),
             order_clip_usd=max(1.0, float(os.getenv("ORDER_CLIP_USD", "16"))),
-            max_window_risk_usd=max(5.0, float(os.getenv("MAX_WINDOW_RISK_USD", "140"))),
-            max_total_exposure_usd=max(10.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "420"))),
+            max_window_risk_usd=max(5.0, float(os.getenv("MAX_WINDOW_RISK_USD", "80"))),
+            max_total_exposure_usd=max(10.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "640"))),
             max_daily_loss_usd=max(5.0, float(os.getenv("MAX_DAILY_LOSS_USD", "160"))),
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
             min_merge_shares=max(0.01, float(os.getenv("MIN_MERGE_SHARES", "1"))),
+            pair_sum_hedge=min(1.20, max(0.99, float(os.getenv("PAIR_SUM_HEDGE", "1")))),
             onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
