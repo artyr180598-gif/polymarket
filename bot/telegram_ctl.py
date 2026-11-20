@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -50,6 +51,8 @@ class TelegramController:
         self._running = False
         self._offset = 0
         self._session: Optional[aiohttp.ClientSession] = None
+        self._send_lock = asyncio.Lock()
+        self._last_send_mono = 0.0
 
     @property
     def _base(self) -> str:
@@ -62,6 +65,7 @@ class TelegramController:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40))
         if hasattr(self.engine, "set_notifier"):
             self.engine.set_notifier(self.notify)
+        await self._discard_pending_updates()
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
         await self.send(
@@ -81,42 +85,72 @@ class TelegramController:
             await self._session.close()
             self._session = None
 
+    async def _discard_pending_updates(self) -> None:
+        """Advance the Telegram offset so stale commands are never replayed after a restart."""
+        if not self._session:
+            return
+        try:
+            while True:
+                params = {
+                    "offset": self._offset,
+                    "timeout": 0,
+                    "limit": 100,
+                    "allowed_updates": ["message", "callback_query"],
+                }
+                async with self._session.get(f"{self._base}/getUpdates", params=params) as response:
+                    if response.status != 200:
+                        logger.warning("Telegram startup offset sync returned %s", response.status)
+                        return
+                    data = await response.json()
+                updates = data.get("result") or []
+                if not updates:
+                    return
+                self._offset = max(self._offset, max(int(update["update_id"]) + 1 for update in updates))
+                if len(updates) < 100:
+                    return
+        except Exception as exc:
+            logger.warning("Telegram startup offset sync failed: %s", exc)
+
     async def send(self, text: str, keyboard: Optional[Dict] = None, parse_mode: str = "HTML") -> None:
         if not self.enabled or not self._session:
             return
-        # strip backslashes that break Telegram HTML
-        clean = (text or "").replace("\\", "")[:4090]
-        payload: Dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "text": clean,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        if keyboard:
-            payload["reply_markup"] = keyboard
-        try:
-            async with self._session.post(f"{self._base}/sendMessage", json=payload) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    logger.warning("sendMessage %s: %s", r.status, body[:180])
-                    plain = (
-                        clean.replace("<b>", "").replace("</b>", "")
-                        .replace("<i>", "").replace("</i>", "")
-                        .replace("<code>", "").replace("</code>", "")
-                    )
-                    payload["text"] = plain[:4090]
-                    payload.pop("parse_mode", None)
-                    async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
-                        if r2.status != 200:
-                            logger.warning("sendMessage plain %s", r2.status)
-        except Exception as e:
-            logger.warning("Telegram send failed: %s", e)
+        async with self._send_lock:
+            wait = 1.05 - (time.monotonic() - self._last_send_mono)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            clean = (text or "").replace("\\", "")[:4090]
+            payload: Dict[str, Any] = {
+                "chat_id": self.chat_id,
+                "text": clean,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            }
+            if keyboard:
+                payload["reply_markup"] = keyboard
+            try:
+                async with self._session.post(f"{self._base}/sendMessage", json=payload) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        logger.warning("sendMessage %s: %s", response.status, body[:180])
+                        plain = (
+                            clean.replace("<b>", "").replace("</b>", "")
+                            .replace("<i>", "").replace("</i>", "")
+                            .replace("<code>", "").replace("</code>", "")
+                        )
+                        payload["text"] = plain[:4090]
+                        payload.pop("parse_mode", None)
+                        async with self._session.post(f"{self._base}/sendMessage", json=payload) as fallback:
+                            if fallback.status != 200:
+                                logger.warning("sendMessage plain %s", fallback.status)
+            except Exception as exc:
+                logger.warning("Telegram send failed: %s", exc)
+            finally:
+                self._last_send_mono = time.monotonic()
 
     async def notify(self, text: str) -> None:
         msg = (text or "").strip()
         if not msg:
             return
-        await asyncio.sleep(0.35)
         await self.send(f"🔔 {msg}", keyboard=_kb_main())
 
     async def _answer_callback(self, cq_id: str) -> None:
