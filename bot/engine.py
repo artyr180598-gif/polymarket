@@ -1257,6 +1257,7 @@ class TradingEngine:
             t.cl_spot is not None and t.cl_twap60 is not None
             and time.monotonic() - t.cl_recv_mono <= 5.0
             and time.monotonic() - t.cl_twap_recv_mono <= 5.0
+            and time.time() - t.cl_twap60_ts <= 5.0
             for t in self.trackers.values()
         ))
         if not self.running:
