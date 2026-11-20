@@ -165,7 +165,7 @@ class BotConfig:
     def has_polybolt_credentials(self) -> bool:
         return bool(
             self.polymarket_api_key and self.polymarket_api_secret
-            and self.polymarket_api_passphrase and self.chainlink_api_key
+            and self.polymarket_api_passphrase
         )
 
     @property
