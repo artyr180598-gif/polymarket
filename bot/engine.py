@@ -1,4 +1,4 @@
-"""PAPER-only engine: real Polymarket RTDS prices and CLOB REST quotes, virtual fills."""
+"""PAPER-only engine: authenticated PolyBolt Chainlink prices, CLOB REST quotes, virtual fills."""
 
 from __future__ import annotations
 
