@@ -81,6 +81,37 @@ def _max_pay(fair: float, late: bool) -> float:
     return 0.64
 
 
+def _market_fee_params(market: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    """Read Gamma's authoritative per-market feeSchedule before dated defaults."""
+    schedule = market.get("feeSchedule", market.get("fee_schedule"))
+    if isinstance(schedule, str):
+        try:
+            schedule = json.loads(schedule)
+        except (TypeError, ValueError):
+            schedule = None
+    if isinstance(schedule, dict):
+        raw_rate = schedule.get("rate")
+        raw_exponent = schedule.get("exponent")
+    else:
+        raw_rate = market.get("feeRate", market.get("fee_rate"))
+        raw_exponent = market.get("feeExponent", market.get("fee_exponent"))
+    if market.get("feesEnabled") is False or market.get("fees_enabled") is False:
+        return 0.0, 1.0
+    try:
+        rate = float(raw_rate) if raw_rate is not None else None
+        if rate is not None and (not (0.0 <= rate < float("inf"))):
+            rate = None
+    except (TypeError, ValueError):
+        rate = None
+    try:
+        exponent = float(raw_exponent) if raw_exponent is not None else None
+        if exponent is not None and (not (0.0 <= exponent < float("inf"))):
+            exponent = None
+    except (TypeError, ValueError):
+        exponent = None
+    return rate, exponent
+
+
 def _resolution_payouts(data: Any) -> Optional[tuple[float, float]]:
     """Return normalized binary payout weights only for an authoritative resolved row."""
     items = data.get("data") if isinstance(data, dict) else data
@@ -516,13 +547,14 @@ class TradingEngine:
                         price_to_beat = parsed_strike
                 except (TypeError, ValueError):
                     pass
+            fee_rate, fee_exponent = _market_fee_params(market)
             return {
                 "condition_id": str(market.get("conditionId") or ""),
                 "up_token": str(token_ids[0]),
                 "down_token": str(token_ids[1]),
                 "price_to_beat": price_to_beat,
-                "fee_rate": market.get("feeRate"),
-                "fee_exponent": market.get("feeExponent"),
+                "fee_rate": fee_rate,
+                "fee_exponent": fee_exponent,
             }
         except asyncio.CancelledError:
             raise
