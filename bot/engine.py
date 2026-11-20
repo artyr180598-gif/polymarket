@@ -664,9 +664,12 @@ class TradingEngine:
             compute_twap=False,
             received_at_ms=received_ts,
         )
-        event_ts = (received_ts if carried_forward else sample_ts) / 1000.0
+        # Boundary prices must be real oracle samples, never carried-forward values.
+        event_ts = sample_ts / 1000.0
         self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
         self._streams_ok = self._price_ok
+        if carried_forward:
+            return
         for window in self.windows.values():
             if window.asset != "BTC":
                 continue
@@ -880,8 +883,8 @@ class TradingEngine:
         if tr is None:
             return
         spot = getattr(tr, "cl_spot", None)
-        if w.price_to_beat is None and spot and 0 <= (tr.cl_received_ts - w.start_ts) <= 20:
-            w.price_to_beat = float(spot)
+        # The opening strike is set only by Gamma metadata or a non-carried-forward
+        # Chainlink sample captured in the window-open interval.
         if (
             w.price_to_beat is None or spot is None or tr.cl_twap60 is None
             or time.monotonic() - tr.cl_recv_mono > 5.0
