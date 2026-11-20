@@ -37,6 +37,7 @@ class WindowState:
     down_shares: float = 0.0
     up_cost: float = 0.0
     down_cost: float = 0.0
+    gross_buy: float = 0.0
     last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
@@ -54,10 +55,65 @@ class WindowState:
         return min(self.up_shares, self.down_shares)
 
 
+
+def _max_pay(fair: float, late: bool) -> float:
+    """Highest ask the tape-matching rule will cross for a given model fair."""
+    if late and fair >= 0.88:
+        return 0.99
+    if fair >= 0.93:
+        return 0.97
+    if fair >= 0.85:
+        return 0.94
+    if fair >= 0.72:
+        return 0.88
+    if fair >= 0.58:
+        return 0.76
+    return 0.64
+
+
+def _choose_entry(ask_up, ask_dn, fair_up: float, late: bool, min_fair: float = 0.52):
+    """Pick the side to lift. (outcome, reason) or None.
+
+    Favorite = book's expensive side. Mid = both legs near 50c and the model
+    has a lean. The cheap wing is bought later as a hedge, not here.
+    """
+    fair_dn = 1.0 - fair_up
+    cands = []
+    if ask_up is not None and ask_up > 0:
+        cands.append(("Up", float(ask_up), fair_up))
+    if ask_dn is not None and ask_dn > 0:
+        cands.append(("Down", float(ask_dn), fair_dn))
+    if not cands:
+        return None
+    cands.sort(key=lambda x: x[1], reverse=True)
+    outcome, ask, fair = cands[0]
+    other = cands[1][1] if len(cands) > 1 else 1.0 - ask
+    if fair < 0.40 and ask >= 0.60:
+        return None
+    if ask >= 0.52 and ask <= _max_pay(fair, late) and fair >= min_fair:
+        return outcome, "favorite"
+    if (
+        min_fair <= 0.60
+        and 0.35 <= ask <= 0.66
+        and other <= 0.68
+        and fair >= max(min_fair, 0.54)
+        and ask <= fair + 0.02
+    ):
+        return outcome, "mid"
+    return None
+
+
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
         self.params: StrategyParams = cfg.params
+        # Tape of 0x32ed… (@mo-money), 9h / 2164 buys / $86k: 98% BTC,
+        # 5m+15m, zero SELLs. This preset is locked to that universe.
+        if cfg.strategy_preset == "mo_money":
+            if "BTC" not in [a.upper() for a in cfg.enabled_assets]:
+                cfg.enabled_assets.insert(0, "BTC")
+            if "15m" not in cfg.enabled_timeframes:
+                cfg.enabled_timeframes.append("15m")
         self.ledger = Ledger(cfg.db_path)
         self.trackers = {a: AssetPriceTracker(a) for a in cfg.enabled_assets}
         self.windows: Dict[str, WindowState] = {}
@@ -112,6 +168,12 @@ class TradingEngine:
             asyncio.create_task(self._resolve_loop(), name="resolve"),
         ]
         self._log_event("INFO", "Старт · honest paper (best-ask fix)", notify=True)
+        if self.cfg.strategy_preset == "mo_money":
+            self._log_event(
+                "INFO",
+                "mo-money: только BTC 5m+15m · BUY фаворита · хедж ~22% · MERGE+REDEEM · без SELL",
+                notify=True,
+            )
 
     async def stop(self) -> None:
         self.running = False
@@ -236,7 +298,9 @@ class TradingEngine:
         now = time.time()
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
-                sec = 300 if tf == "5m" else 900
+                sec = {"5m": 300, "15m": 900}.get(tf)
+                if not sec:
+                    continue
                 base = int(now // sec) * sec
                 for offset in (0, 1):
                     start = base + offset * sec
@@ -256,9 +320,11 @@ class TradingEngine:
                         start_ts=float(start), end_ts=float(end),
                         price_to_beat=meta.get("price_to_beat"),
                     )
-                    if w.price_to_beat is None:
-                        tr = self.trackers[asset]
-                        ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
+                    # Strike is the open of THIS window. Never stamp spot
+                    # onto a window that has not started yet.
+                    if w.price_to_beat is None and -2 <= (now - float(start)) <= 20:
+                        tr = self.trackers.get(asset)
+                        ptb = getattr(tr, "cl_spot", None) if tr else None
                         if ptb:
                             w.price_to_beat = float(ptb)
                     self.windows[slug] = w
@@ -349,7 +415,10 @@ class TradingEngine:
             try:
                 if not self.paused and not self._risk_halted():
                     for w in list(self.windows.values()):
-                        if w.resolved or w.remain_sec < 15:
+                        if w.resolved:
+                            continue
+                        if w.remain_sec < 4:
+                            await self._try_merge(w)
                             continue
                         await self._run(w)
                         await self._try_merge(w)
@@ -364,11 +433,36 @@ class TradingEngine:
             return True
         return False
 
+    def _inventory_usd(self) -> float:
+        return sum((w.up_cost + w.down_cost) for w in self.windows.values() if not w.resolved)
+
+    def _window_cap(self, w: WindowState) -> float:
+        cap = float(self.cfg.max_window_risk_usd)
+        if w.timeframe == "15m":
+            cap *= 1.35
+        if w.asset != "BTC":
+            cap *= 0.25
+        return cap
+
     async def _run(self, w: WindowState) -> None:
-        tr = self.trackers[w.asset]
+        """Scaled copy of 0x32ed… (@mo-money).
+
+        Sample: 9.2h, 2164 buys, $86 304, 0 sells, 197 markets.
+        98% BTC (5m $60.6k, 15m $20.5k). Median hedge is 22% of the
+        dominant leg. Four bursts per window, gap ~19s, through the close.
+        Exit = MERGE + REDEEM. Dollar size is scaled to BANKROLL — that
+        wallet turns about $9k/hour, which a $2.7k account cannot copy.
+        """
+        if self.params.key == "mo_money" and w.asset != "BTC":
+            return
+        if time.time() < w.start_ts - 1:
+            return
+        tr = self.trackers.get(w.asset)
+        if tr is None:
+            return
         spot = getattr(tr, "cl_spot", None)
-        if w.price_to_beat is None:
-            w.price_to_beat = spot or getattr(tr, "cl_twap60", None)
+        if w.price_to_beat is None and spot and -2 <= (time.time() - w.start_ts) <= 25:
+            w.price_to_beat = float(spot)
         if w.price_to_beat is None or spot is None:
             return
         try:
@@ -377,108 +471,101 @@ class TradingEngine:
             return
 
         tau = w.remain_sec
+        dur = max(1.0, w.end_ts - w.start_ts)
+        late = (time.time() - w.start_ts) / dur >= 0.62
         fair_up = float(fv.prob_up)
-        fair_dn = 1.0 - fair_up
-        edge = 0.03
-        clip = max(8.0, float(self.cfg.order_clip_usd))
-        max_side = 25.0
-
-        if time.monotonic() - w.last_trade_mono < 12.0:
+        cooldown = float(getattr(self.params, "burst_cooldown_sec", 18.0) or 18.0)
+        if w.timeframe == "15m":
+            cooldown += 6.0
+        if time.monotonic() - w.last_trade_mono < cooldown:
             return
-        if tau < 15:
+        if tau < 4:
+            return
+
+        cap = self._window_cap(w)
+        if w.gross_buy >= cap * 0.98:
+            return
+        base_clip = max(5.0, float(self.cfg.order_clip_usd))
+        if w.asset != "BTC":
+            base_clip *= 0.30
+        if self.cash < max(3.0, base_clip * 0.35):
             return
 
         up_info = await self._clob_ask_info(w.up_token)
         dn_info = await self._clob_ask_info(w.down_token)
         if not up_info and not dn_info:
             return
-
         ask_up, depth_up = up_info if up_info else (None, 0.0)
         ask_dn, depth_dn = dn_info if dn_info else (None, 0.0)
 
         if ask_up is not None and ask_dn is not None and int(time.time()) % 30 < 2:
             log.info(
-                "CLOB %s ask_up=%.3f(d=%.0f) ask_dn=%.3f(d=%.0f) sum=%.3f",
-                w.asset, ask_up, depth_up, ask_dn, depth_dn, ask_up + ask_dn,
+                "CLOB %s %s ask_up=%.3f ask_dn=%.3f fair_up=%.3f gross=%.1f/%.0f",
+                w.asset, w.timeframe, ask_up, ask_dn, fair_up, w.gross_buy, cap,
             )
 
-        # Pair arb after fees
-        if ask_up is not None and ask_dn is not None and abs(w.net_shares) < 5:
-            max_by_book = min(depth_up, depth_dn) * 0.45
-            sz = min(clip / max(ask_up, ask_dn, 0.05), max_by_book, 20.0)
-            sz = round(max(0.0, sz), 2)
-            if sz >= 5.0 and (ask_up + ask_dn) <= 0.985:
-                fee_up = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
-                fee_dn = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
-                total = sz * (ask_up + ask_dn) + fee_up + fee_dn
-                if total < sz * 0.998:
-                    await self._open(w, "Up", float(ask_up), sz, "pair_arb", fee=fee_up)
-                    await self._open(w, "Down", float(ask_dn), sz, "pair_arb", fee=fee_dn)
-                    await self._try_merge(w)
-                    return
+        spot_up = float(spot) >= float(w.price_to_beat)
+        min_fair = float(getattr(self.params, "min_fair", 0.52) or 0.52)
+        choice = _choose_entry(ask_up, ask_dn, fair_up, late, min_fair=min_fair)
+        if choice is not None:
+            outcome, reason = choice
+            ask = float(ask_up if outcome == "Up" else ask_dn)
+            depth = float(depth_up if outcome == "Up" else depth_dn)
+            fair_side = fair_up if outcome == "Up" else (1.0 - fair_up)
+            agrees = spot_up if outcome == "Up" else (not spot_up)
+            if fair_side >= 0.80 or agrees or fair_side >= 0.60:
+                await self._lift(w, outcome, ask, depth, base_clip, cap, reason)
 
-        if w.up_shares >= 6 and w.down_shares < w.up_shares and ask_dn is not None:
-            need = round(min(w.up_shares - w.down_shares, depth_dn * 0.45, 18.0), 2)
-            if need >= 5:
-                vwap_up = w.up_cost / max(w.up_shares, 1e-9)
-                fee = calc_taker_fee_usdc(need, ask_dn, w.asset, w.timeframe)
-                if need * ask_dn + fee + need * vwap_up < need * 0.998:
-                    await self._open(w, "Down", float(ask_dn), need, "syn_tp", fee=fee)
-                    await self._try_merge(w)
-                    return
-        if w.down_shares >= 6 and w.up_shares < w.down_shares and ask_up is not None:
-            need = round(min(w.down_shares - w.up_shares, depth_up * 0.45, 18.0), 2)
-            if need >= 5:
-                vwap_dn = w.down_cost / max(w.down_shares, 1e-9)
-                fee = calc_taker_fee_usdc(need, ask_up, w.asset, w.timeframe)
-                if need * ask_up + fee + need * vwap_dn < need * 0.998:
-                    await self._open(w, "Up", float(ask_up), need, "syn_tp", fee=fee)
-                    await self._try_merge(w)
-                    return
+        await self._hedge(w, ask_up, ask_dn, depth_up, depth_dn, base_clip, cap)
 
-        if tau <= 90:
-            if fair_up >= 0.96 and ask_up is not None and ask_up <= 0.97 and w.up_shares < max_side:
-                sz = round(min(clip / ask_up, depth_up * 0.45, 15.0), 2)
-                if sz >= 5:
-                    fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
-                    await self._open(w, "Up", float(ask_up), sz, "lockin", fee=fee)
-                    return
-            if fair_dn >= 0.96 and ask_dn is not None and ask_dn <= 0.97 and w.down_shares < max_side:
-                sz = round(min(clip / ask_dn, depth_dn * 0.45, 15.0), 2)
-                if sz >= 5:
-                    fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
-                    await self._open(w, "Down", float(ask_dn), sz, "lockin", fee=fee)
-                    return
+    async def _lift(self, w, outcome, ask, depth, base_clip, cap, reason) -> None:
+        room = cap - w.gross_buy
+        if room < 1.0 or ask <= 0.02 or ask >= 0.995 or depth < 5:
+            return
+        if ask >= 0.90:
+            mult = 2.15
+        elif ask >= 0.80:
+            mult = 1.55
+        elif ask >= 0.65:
+            mult = 1.05
+        else:
+            mult = 0.65
+        usd = min(base_clip * mult, room * 0.55)
+        side_cost = w.up_cost if outcome == "Up" else w.down_cost
+        usd = min(usd, max(0.0, cap * 0.78 - side_cost))
+        usd = min(usd, max(0.0, float(self.cfg.max_total_exposure_usd) - self._inventory_usd()))
+        if usd < 1.0:
+            return
+        sz = round(min(usd / ask, depth * 0.35), 2)
+        if sz < 5.0:
+            return
+        fee = calc_taker_fee_usdc(sz, ask, w.asset, w.timeframe)
+        await self._open(w, outcome, ask, sz, reason, fee=fee)
 
-        want_up = (
-            ask_up is not None and fair_up >= 0.56
-            and ask_up <= fair_up - edge
-            and 0.20 <= ask_up <= 0.90
-            and w.up_shares < max_side and depth_up >= 5
-        )
-        want_dn = (
-            ask_dn is not None and fair_dn >= 0.56
-            and ask_dn <= fair_dn - edge
-            and 0.20 <= ask_dn <= 0.90
-            and w.down_shares < max_side and depth_dn >= 5
-        )
-        if want_up and want_dn:
-            if fair_up >= fair_dn:
-                want_dn = False
-            else:
-                want_up = False
-        if want_up:
-            sz = round(min(clip / ask_up, depth_up * 0.4, 15.0), 2)
-            if sz >= 5:
-                fee = calc_taker_fee_usdc(sz, ask_up, w.asset, w.timeframe)
-                await self._open(w, "Up", float(ask_up), sz, "maker_entry", fee=fee)
-                return
-        if want_dn:
-            sz = round(min(clip / ask_dn, depth_dn * 0.4, 15.0), 2)
-            if sz >= 5:
-                fee = calc_taker_fee_usdc(sz, ask_dn, w.asset, w.timeframe)
-                await self._open(w, "Down", float(ask_dn), sz, "maker_entry", fee=fee)
-                return
+    async def _hedge(self, w, ask_up, ask_dn, depth_up, depth_dn, base_clip, cap) -> None:
+        ratio = float(getattr(self.params, "hedge_ratio", 0.22) or 0.0)
+        max_ask = float(getattr(self.params, "hedge_max_ask", 0.30) or 0.30)
+        if ratio <= 0:
+            return
+        if w.up_cost >= w.down_cost + 0.8 and ask_dn is not None and float(ask_dn) <= max_ask:
+            outcome, ask, depth, fav_cost, have = "Down", float(ask_dn), float(depth_dn), w.up_cost, w.down_cost
+        elif w.down_cost >= w.up_cost + 0.8 and ask_up is not None and float(ask_up) <= max_ask:
+            outcome, ask, depth, fav_cost, have = "Up", float(ask_up), float(depth_up), w.down_cost, w.up_cost
+        else:
+            return
+        need = ratio * fav_cost - have
+        if need < 0.40 or ask <= 0.01 or depth < 5:
+            return
+        room = cap - w.gross_buy
+        inv_room = float(self.cfg.max_total_exposure_usd) - self._inventory_usd()
+        usd = min(need, base_clip * 0.40, room, max(0.0, inv_room))
+        if usd < 0.40:
+            return
+        sz = round(min(usd / ask, depth * 0.50, 80.0), 2)
+        if sz < 5.0:
+            return
+        fee = calc_taker_fee_usdc(sz, ask, w.asset, w.timeframe)
+        await self._open(w, outcome, ask, sz, "hedge", fee=fee)
 
     async def _open(self, w, outcome, price, size, reason, fee: float = 0.0) -> None:
         price = round(max(0.01, min(0.99, float(price))), 2)
@@ -498,6 +585,7 @@ class TradingEngine:
         else:
             w.down_shares += size
             w.down_cost += price * size
+        w.gross_buy += price * size
         w.last_trade_mono = time.monotonic()
         fill = {
             "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
@@ -517,6 +605,9 @@ class TradingEngine:
             log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
         why = {
+            "favorite": "фаворит книги, как mo-money",
+            "mid": "перевес модели у 50¢",
+            "hedge": "дешёвый хедж второй ноги (~22%)",
             "maker_entry": "CLOB ask дешевле fair",
             "lockin": "lock-in по CLOB",
             "syn_tp": "добор пары по CLOB",
@@ -530,16 +621,16 @@ class TradingEngine:
         )
 
     async def _try_merge(self, w: WindowState) -> None:
+        """Burn matched Up+Down back into $1.
+
+        PnL equals holding both legs to resolution, but cash comes back now.
+        The wallet merged $42k in the same 9h and never sold.
+        """
         pairs = w.mergeable_pairs
-        if pairs < 5 and not (pairs >= 1 and abs(w.net_shares) < 0.5):
+        if pairs < 1.0 or w.merge_in_flight:
             return
-        if w.merge_in_flight:
+        if pairs < 5.0 and abs(w.net_shares) >= 0.5:
             return
-        if w.up_shares > 0 and w.down_shares > 0 and w.remain_sec > 20:
-            up_part = (pairs / w.up_shares) * w.up_cost
-            dn_part = (pairs / w.down_shares) * w.down_cost
-            if (up_part + dn_part) > pairs * 0.99:
-                return
         await self._execute_merge(w)
 
     async def _execute_merge(self, w: WindowState) -> float:

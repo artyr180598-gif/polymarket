@@ -42,8 +42,11 @@ class StrategyParams:
     min_taker_net_edge_alt: float = 0.024
     taker_min_price: float = 0.45
     taker_max_price: float = 0.92
-    taker_start_sec: float = 5.0
-    taker_cutoff_remain_sec: float = 12.0
+    # Hedge: mo-money buys the cheap wing for ~22% of the dominant leg's cost, then MERGEs.
+    hedge_ratio: float = 0.22
+    hedge_max_ask: float = 0.30
+    burst_cooldown_sec: float = 18.0
+    min_fair: float = 0.52
 
 
 PRESETS: Dict[str, StrategyParams] = {
@@ -51,9 +54,10 @@ PRESETS: Dict[str, StrategyParams] = {
         key="mo_money",
         title_ru="mo-money (Maker + Merge)",
         description_ru=(
-            "Рекомендуемый режим для банка €2 500: 95%+ Post-Only Maker (0% комиссии), "
-            "синтетический TP/SL через покупку противоположного исхода + авто-MERGE в pUSD, "
-            "плюс сбор 95–98¢ TWAP Lock-In и редкие снайперские Taker-входы с перевесом >3.8¢."
+            "Копия ленты @mo-money (0x32ed…): только BTC 5m и 15m, без SELL. "
+            "Бот снимает фаворита книги (основной объём на 65–97¢, клип растёт с ценой), "
+            "добирает дешёвую ногу ~22% и сразу MERGE в pUSD. Остаток — REDEEM. "
+            "Размер сделок масштабируется под BANKROLL, не под $9k/час этого кошелька."
         ),
         enable_maker=True,
         enable_lockin=True,
@@ -61,6 +65,10 @@ PRESETS: Dict[str, StrategyParams] = {
         min_maker_edge=0.024,
         min_taker_net_edge_btc=0.040,
         min_taker_net_edge_alt=0.026,
+        hedge_ratio=0.22,
+        hedge_max_ask=0.30,
+        burst_cooldown_sec=18.0,
+        min_fair=0.52,
     ),
     "lockin": StrategyParams(
         key="lockin",
@@ -80,6 +88,10 @@ PRESETS: Dict[str, StrategyParams] = {
         lockin_min_net_edge=0.011,
         lockin_size_mult=2.0,
         enable_taker=False,
+        hedge_ratio=0.08,
+        hedge_max_ask=0.15,
+        burst_cooldown_sec=30.0,
+        min_fair=0.90,
     ),
     "hybrid": StrategyParams(
         key="hybrid",
@@ -99,6 +111,10 @@ PRESETS: Dict[str, StrategyParams] = {
         enable_taker=True,
         min_taker_net_edge_btc=0.034,
         min_taker_net_edge_alt=0.020,
+        hedge_ratio=0.28,
+        hedge_max_ask=0.32,
+        burst_cooldown_sec=14.0,
+        min_fair=0.50,
     ),
 }
 
@@ -108,15 +124,15 @@ class BotConfig:
     trading_mode: str = "paper"
     bankroll_usd: float = 2750.0
     strategy_preset: str = "mo_money"
-    enabled_assets: List[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
-    enabled_timeframes: List[str] = field(default_factory=lambda: ["5m"])
+    enabled_assets: List[str] = field(default_factory=lambda: ["BTC"])
+    enabled_timeframes: List[str] = field(default_factory=lambda: ["5m", "15m"])
     auto_start: bool = True
 
-    order_clip_usd: float = 18.0
-    max_window_risk_usd: float = 60.0
-    max_total_exposure_usd: float = 350.0
-    max_daily_loss_usd: float = 95.0
-    max_consecutive_losses: int = 6
+    order_clip_usd: float = 16.0
+    max_window_risk_usd: float = 140.0
+    max_total_exposure_usd: float = 420.0
+    max_daily_loss_usd: float = 160.0
+    max_consecutive_losses: int = 10
 
     private_key: str = ""
     wallet_address: str = ""
@@ -164,13 +180,13 @@ class BotConfig:
         if preset not in PRESETS:
             preset = "mo_money"
 
-        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL") if a.upper() in ("BTC", "ETH", "SOL")]
+        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC") if a.upper() in ("BTC", "ETH", "SOL")]
         if not assets:
             assets = ["BTC"]
 
-        tfs = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m") if t.lower() in ("5m", "15m")]
+        tfs = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m,15m") if t.lower() in ("5m", "15m")]
         if not tfs:
-            tfs = ["5m"]
+            tfs = ["5m", "15m"]
 
         return cls(
             trading_mode=mode,
@@ -179,11 +195,11 @@ class BotConfig:
             enabled_assets=assets,
             enabled_timeframes=tfs,
             auto_start=os.getenv("AUTO_START", "true").strip().lower() in ("1", "true", "yes"),
-            order_clip_usd=max(5.0, float(os.getenv("ORDER_CLIP_USD", "18"))),
-            max_window_risk_usd=max(10.0, float(os.getenv("MAX_WINDOW_RISK_USD", "60"))),
-            max_total_exposure_usd=max(25.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "350"))),
-            max_daily_loss_usd=max(10.0, float(os.getenv("MAX_DAILY_LOSS_USD", "95"))),
-            max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "6"))),
+            order_clip_usd=max(5.0, float(os.getenv("ORDER_CLIP_USD", "16"))),
+            max_window_risk_usd=max(10.0, float(os.getenv("MAX_WINDOW_RISK_USD", "140"))),
+            max_total_exposure_usd=max(25.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "420"))),
+            max_daily_loss_usd=max(10.0, float(os.getenv("MAX_DAILY_LOSS_USD", "160"))),
+            max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
             wallet_address=os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip(),
             relayer_api_key=os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip(),
