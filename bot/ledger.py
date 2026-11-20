@@ -21,8 +21,15 @@ class Ledger:
                     f"Persistent PAPER ledger {db_path!r} is missing; refusing to create a fresh database. "
                     "Preserve the volume and restore the existing ledger."
                 )
-        parent = os.path.dirname(os.path.abspath(db_path))
+        absolute_db_path = os.path.abspath(db_path)
+        parent = os.path.dirname(absolute_db_path)
         marker = f"{db_path}.initialized"
+        if (
+            os.getenv("RAILWAY_ENVIRONMENT_NAME")
+            and absolute_db_path.startswith(os.path.join(os.sep, "data") + os.sep)
+            and not os.path.ismount(os.path.join(os.sep, "data"))
+        ):
+            raise RuntimeError("Railway /data volume is not mounted; refusing to use an ephemeral PAPER ledger")
         db_exists = os.path.isfile(db_path)
         if not db_exists and os.path.exists(marker):
             raise RuntimeError(f"Persistent PAPER ledger is missing at {db_path!r}; refusing to recreate an empty history")
