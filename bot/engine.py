@@ -78,6 +78,30 @@ def _max_pay(fair: float, late: bool) -> float:
     return 0.64
 
 
+def _resolution_payouts(data: Any) -> Optional[tuple[float, float]]:
+    """Return normalized binary payout weights only for an authoritative resolved row."""
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict) or str(item.get("status") or "").lower() != "resolved":
+            continue
+        values = item.get("payouts")
+        if not isinstance(values, list) or len(values) != 2:
+            continue
+        try:
+            up_value, down_value = float(values[0]), float(values[1])
+        except (TypeError, ValueError):
+            continue
+        if not (0.0 <= up_value < float("inf") and 0.0 <= down_value < float("inf")):
+            continue
+        total = up_value + down_value
+        if total <= 0:
+            continue
+        return up_value / total, down_value / total
+    return None
+
+
 def _choose_entry(ask_up, ask_dn, fair_up: float, late: bool, min_fair: float = 0.52):
     """Pick the side to lift. (outcome, reason) or None.
 
@@ -931,7 +955,7 @@ class TradingEngine:
             await asyncio.sleep(3)
 
     async def _resolve(self, w: WindowState) -> None:
-        winner = None
+        payout_weights = None
         if w.condition_id:
             try:
                 async with self._resolve_sem:
@@ -940,34 +964,25 @@ class TradingEngine:
                         url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
                         async with session.get(url) as response:
                             if response.status == 200:
-                                data = await response.json()
-                                items = data.get("data") if isinstance(data, dict) else data
-                                if items:
-                                    candidates = items if isinstance(items, list) else [items]
-                                    for item in candidates:
-                                        if item.get("status") != "resolved":
-                                            continue
-                                        payouts = item.get("payouts") or []
-                                        if len(payouts) >= 2:
-                                            up_payout, down_payout = float(payouts[0]), float(payouts[1])
-                                            if up_payout > down_payout:
-                                                winner = "Up"
-                                                break
-                                            if down_payout > up_payout:
-                                                winner = "Down"
-                                                break
+                                payout_weights = _resolution_payouts(await response.json())
             except Exception as exc:
                 log.debug("resolution API not ready for %s: %s", w.slug, exc)
 
-        # Chainlink samples around the boundary are retained for audit only.
-        # They are not a substitute for Polymarket's authoritative resolution.
-        if winner is None:
+        # Boundary prices are retained for audit, never used to guess a winner.
+        if payout_weights is None:
             return
+        up_weight, down_weight = payout_weights
+        if up_weight > down_weight:
+            winner = "Up"
+        elif down_weight > up_weight:
+            winner = "Down"
+        else:
+            winner = "Split"
         if w.up_shares < 0.01 and w.down_shares < 0.01:
             w.resolved = True
             return
 
-        payout = float(w.up_shares if winner == "Up" else w.down_shares)
+        payout = float(w.up_shares * up_weight + w.down_shares * down_weight)
         gross_cost = float(w.up_cost + w.down_cost)
         total_fees = float(w.up_fees + w.down_fees)
         gross = payout - gross_cost
@@ -992,18 +1007,24 @@ class TradingEngine:
         self._resolve_history.insert(0, {
             "ts": time.time(), "slug": w.slug, "winner": winner,
             "gross": gross, "fees": total_fees, "pnl": net,
+            "up_payout_weight": up_weight, "down_payout_weight": down_weight,
         })
         self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.up_fees = w.down_fees = 0.0
         w.resolved = True
-        side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
+        side = (
+            "ВВЕРХ" if winner == "Up" else
+            "ВНИЗ" if winner == "Down" else
+            f"разделённый исход ({up_weight:.0%}/{down_weight:.0%})"
+        )
         msg = (
-            f"✅ Окно закрылось · победил {side}\n"
+            f"✅ Окно закрылось · {side}\n"
             f"Gross: ${gross:+.2f} · fees: ${total_fees:.2f}\n"
             f"Net: ${net:+.2f}\n<code>{w.slug}</code>"
         )
         self._log_event("INFO", msg, notify=True)
+
 
     def snapshot(self) -> Dict[str, Any]:
         try:
