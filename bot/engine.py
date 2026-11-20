@@ -266,8 +266,14 @@ class TradingEngine:
         for _, pnl in sorted(outcomes, key=lambda item: item[0]):
             self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
         self._fill_history = self.ledger.recent_fills(self.cfg.trading_mode, 80)
-        self._merge_history = self.ledger.recent_merges(self.cfg.trading_mode, 40)
-        self._resolve_history = self.ledger.recent_resolutions(self.cfg.trading_mode, 40)
+        self._merge_history = [
+            {**row, "net_pnl": float(row.get("locked_pnl") or 0.0) - float(row.get("fees") or 0.0)}
+            for row in self.ledger.recent_merges(self.cfg.trading_mode, 40)
+        ]
+        self._resolve_history = [
+            {**row, "gross": float(row.get("gross_pnl") or 0.0), "pnl": float(row.get("net_pnl") or 0.0)}
+            for row in self.ledger.recent_resolutions(self.cfg.trading_mode, 40)
+        ]
 
         for slug, w in windows.items():
             if w.resolved or (w.up_shares < 0.01 and w.down_shares < 0.01):
