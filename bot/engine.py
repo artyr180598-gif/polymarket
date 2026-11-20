@@ -462,7 +462,7 @@ class TradingEngine:
             try:
                 await self._discover()
                 now = time.time()
-                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 180)]
+                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 180 and w.up_shares < 0.01 and w.down_shares < 0.01)]
                 for s in dead:
                     del self.windows[s]
             except Exception as e:
@@ -497,7 +497,7 @@ class TradingEngine:
                     )
                     # Strike is the open of THIS window. Never stamp spot
                     # onto a window that has not started yet.
-                    if w.price_to_beat is None and -2 <= (now - float(start)) <= 20:
+                    if w.price_to_beat is None and 0 <= (now - float(start)) <= 20:
                         tr = self.trackers.get(asset)
                         ptb = getattr(tr, "cl_spot", None) if tr else None
                         if ptb:
@@ -602,6 +602,7 @@ class TradingEngine:
             await asyncio.sleep(1.5)
 
     def _risk_halted(self) -> bool:
+        self._roll_day()
         if self.day_pnl <= -self.cfg.max_daily_loss_usd:
             return True
         if self.cfg.max_consecutive_losses > 0 and self.consecutive_losses >= self.cfg.max_consecutive_losses:
@@ -636,9 +637,13 @@ class TradingEngine:
         if tr is None:
             return
         spot = getattr(tr, "cl_spot", None)
-        if w.price_to_beat is None and spot and -2 <= (time.time() - w.start_ts) <= 25:
+        if w.price_to_beat is None and spot and 0 <= (time.time() - w.start_ts) <= 20:
             w.price_to_beat = float(spot)
-        if w.price_to_beat is None or spot is None:
+        if (
+            w.price_to_beat is None or spot is None or tr.cl_twap60 is None
+            or time.monotonic() - tr.cl_recv_mono > 5.0
+            or time.monotonic() - tr.cl_twap_recv_mono > 5.0
+        ):
             return
         try:
             fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
@@ -754,12 +759,17 @@ class TradingEngine:
                 return
         self.cash -= cost
         self.fees_paid += fee
+        self._roll_day()
+        self.realized_pnl -= fee
+        self.day_pnl -= fee
         if outcome == "Up":
             w.up_shares += size
             w.up_cost += price * size
+            w.up_fees += fee
         else:
             w.down_shares += size
             w.down_cost += price * size
+            w.down_fees += fee
         w.gross_buy += price * size
         w.last_trade_mono = time.monotonic()
         fill = {
