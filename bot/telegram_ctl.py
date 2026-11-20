@@ -69,7 +69,7 @@ class TelegramController:
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: CLOB + fee",
+            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: Chainlink RTDS + CLOB REST",
             keyboard=_kb_main(),
         )
 
@@ -207,7 +207,7 @@ class TelegramController:
         pnl = equity - bank
         day = float(st.get("day_pnl", 0) or 0)
         res_pnl = float(stats.get("realized_net_pnl", 0) or 0)
-        merge_pnl = float(st.get("merge_profit", 0) or stats.get("merged_locked_pnl", 0) or 0)
+        merge_pnl = float(st.get("merge_profit", stats.get("merged_net_pnl", 0)) or 0)
         wins = int(stats.get("win_markets", 0) or st.get("wins") or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
         losses = max(0, resolved - wins)
