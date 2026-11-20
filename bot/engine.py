@@ -202,6 +202,7 @@ class TradingEngine:
                         timeframe=timeframe, condition_id=str(event.get("condition_id") or ""),
                         up_token="", down_token="", start_ts=start_ts, end_ts=end_ts,
                         price_to_beat=float(saved_strike) if saved_strike is not None else None,
+                        final_price=float(event["final_price"]) if event.get("final_price") is not None else None,
                     )
                     windows[slug] = w
                 shares = float(event.get("shares") or 0.0)
@@ -215,6 +216,8 @@ class TradingEngine:
                     day_fees += fee
                 if w.price_to_beat is None and event.get("price_to_beat") is not None:
                     w.price_to_beat = float(event["price_to_beat"])
+                if event.get("final_price") is not None:
+                    w.final_price = float(event["final_price"])
                 if event.get("window_start_ts") is not None:
                     w.start_ts = float(event["window_start_ts"])
                 if event.get("window_end_ts") is not None:
@@ -444,10 +447,22 @@ class TradingEngine:
                                                 continue
                                             elapsed = event_ts - window.start_ts
                                             after_end = event_ts - window.end_ts
+                                            changed_boundary = False
                                             if window.price_to_beat is None and 0 <= elapsed <= 20:
                                                 window.price_to_beat = price
+                                                changed_boundary = True
                                             if window.final_price is None and 0 <= after_end <= 30:
                                                 window.final_price = price
+                                                changed_boundary = True
+                                            if changed_boundary:
+                                                try:
+                                                    self.ledger.update_window_prices(
+                                                        mode=self.cfg.trading_mode, slug=window.slug,
+                                                        price_to_beat=window.price_to_beat,
+                                                        final_price=window.final_price,
+                                                    )
+                                                except Exception as exc:
+                                                    log.warning("persist oracle boundary %s: %s", window.slug, exc)
                                     elif topic == "crypto_prices" and symbol == symbols[asset][1]:
                                         tracker.on_binance_spot(price, feed_ts_ms)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -790,7 +805,8 @@ class TradingEngine:
                 asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
                 reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
                 tx_or_order_id=f"paper-clob-{int(time.time() * 1000)}",
-                price_to_beat=w.price_to_beat, window_start_ts=w.start_ts, window_end_ts=w.end_ts,
+                price_to_beat=w.price_to_beat, final_price=w.final_price,
+                window_start_ts=w.start_ts, window_end_ts=w.end_ts,
             )
         except Exception as exc:
             log.error("record_fill failed; PAPER fill rejected: %s", exc)
