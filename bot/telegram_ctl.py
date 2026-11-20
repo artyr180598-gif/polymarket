@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -28,9 +30,7 @@ def _kb_main() -> Dict[str, Any]:
 def _kb_presets() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "⭐ mo-money", "callback_data": "preset:mo_money"}],
-            [{"text": "🛡️ Lock-In", "callback_data": "preset:lockin"}],
-            [{"text": "⚡ Гибрид", "callback_data": "preset:hybrid"}],
+            [{"text": "⭐ mo-money · закреплён", "callback_data": "preset:mo_money"}],
             [{"text": "« Назад", "callback_data": "status"}],
         ]
     }
@@ -50,6 +50,12 @@ class TelegramController:
         self._running = False
         self._offset = 0
         self._session: Optional[aiohttp.ClientSession] = None
+        self._send_lock = asyncio.Lock()
+        self._last_send_mono = 0.0
+        self._min_send_interval = 1.05
+        self._rate_limit_until = 0.0
+        self._startup_ts = time.time()
+        self._poll_backoff = 1.0
 
     @property
     def _base(self) -> str:
@@ -62,10 +68,16 @@ class TelegramController:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40))
         if hasattr(self.engine, "set_notifier"):
             self.engine.set_notifier(self.notify)
+        await self._discard_pending_updates()
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
+        feed_status = (
+            "PolyBolt Chainlink · CLOB REST"
+            if self.engine.cfg.has_polybolt_credentials
+            else "PolyBolt: нет CLOB API credentials · новые входы заблокированы"
+        )
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: CLOB + fee",
+            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: {feed_status}",
             keyboard=_kb_main(),
         )
 
@@ -81,42 +93,118 @@ class TelegramController:
             await self._session.close()
             self._session = None
 
+    async def _discard_pending_updates(self) -> None:
+        """Advance the Telegram offset so stale commands are never replayed after a restart."""
+        if not self._session:
+            return
+        try:
+            while True:
+                params = {
+                    "offset": self._offset,
+                    "timeout": 0,
+                    "limit": 100,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                }
+                async with self._session.get(f"{self._base}/getUpdates", params=params) as response:
+                    if response.status != 200:
+                        logger.warning("Telegram startup offset sync returned %s", response.status)
+                        return
+                    data = await response.json()
+                updates = data.get("result") or []
+                if not updates:
+                    return
+                self._offset = max(self._offset, max(int(update["update_id"]) + 1 for update in updates))
+                if len(updates) < 100:
+                    return
+        except Exception as exc:
+            logger.warning("Telegram startup offset sync failed: %s", exc)
+
     async def send(self, text: str, keyboard: Optional[Dict] = None, parse_mode: str = "HTML") -> None:
         if not self.enabled or not self._session:
             return
-        # strip backslashes that break Telegram HTML
-        clean = (text or "").replace("\\", "")[:4090]
-        payload: Dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "text": clean,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }
-        if keyboard:
-            payload["reply_markup"] = keyboard
-        try:
-            async with self._session.post(f"{self._base}/sendMessage", json=payload) as r:
-                if r.status != 200:
-                    body = await r.text()
-                    logger.warning("sendMessage %s: %s", r.status, body[:180])
-                    plain = (
+        async with self._send_lock:
+            wait = max(
+                self._min_send_interval - (time.monotonic() - self._last_send_mono),
+                self._rate_limit_until - time.monotonic(),
+                0.0,
+            )
+            if wait > 0:
+                await asyncio.sleep(wait)
+            clean = (text or "").replace("\\", "")[:4090]
+            payload: Dict[str, Any] = {
+                "chat_id": self.chat_id,
+                "text": clean,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            }
+            if keyboard:
+                payload["reply_markup"] = keyboard
+
+            async def post(data: Dict[str, Any]):
+                async with self._session.post(f"{self._base}/sendMessage", json=data) as response:
+                    return response.status, await response.text(), dict(response.headers)
+
+            def apply_retry_after(body: str, headers: Dict[str, Any]) -> float:
+                retry_after = headers.get("Retry-After")
+                try:
+                    parsed = json.loads(body)
+                    retry_after = (parsed.get("parameters") or {}).get("retry_after") or retry_after
+                except Exception:
+                    pass
+                try:
+                    seconds = float(retry_after) if retry_after is not None else 5.0
+                except (TypeError, ValueError):
+                    seconds = 5.0
+                seconds = min(60.0, max(1.0, seconds))
+                self._rate_limit_until = time.monotonic() + seconds
+                return seconds
+
+            try:
+                status, body, headers = await post(payload)
+                if status == 429:
+                    wait = apply_retry_after(body, headers)
+                    logger.warning("sendMessage rate limited; retrying once after %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    status, body, headers = await post(payload)
+                    if status == 429:
+                        apply_retry_after(body, headers)
+                elif status == 400 and (
+                    "can't parse entities" in body.lower()
+                    or "can't find end of the entity" in body.lower()
+                ):
+                    logger.warning("sendMessage HTML parse error; retrying as plain text")
+                    plain_payload = dict(payload)
+                    plain_payload["text"] = (
                         clean.replace("<b>", "").replace("</b>", "")
                         .replace("<i>", "").replace("</i>", "")
                         .replace("<code>", "").replace("</code>", "")
                     )
-                    payload["text"] = plain[:4090]
-                    payload.pop("parse_mode", None)
-                    async with self._session.post(f"{self._base}/sendMessage", json=payload) as r2:
-                        if r2.status != 200:
-                            logger.warning("sendMessage plain %s", r2.status)
-        except Exception as e:
-            logger.warning("Telegram send failed: %s", e)
+                    plain_payload.pop("parse_mode", None)
+                    status, body, headers = await post(plain_payload)
+                    if status == 429:
+                        apply_retry_after(body, headers)
+                elif 500 <= status < 600:
+                    for retry_delay in (1.0, 2.0):
+                        logger.warning("sendMessage HTTP %s; retrying in %.1fs", status, retry_delay)
+                        await asyncio.sleep(retry_delay)
+                        status, body, headers = await post(payload)
+                        if status == 429:
+                            apply_retry_after(body, headers)
+                            break
+                        if status < 500:
+                            break
+                if status != 200:
+                    logger.warning("sendMessage %s: %s", status, body[:180])
+            except Exception as exc:
+                logger.warning("Telegram send failed: %s", exc)
+            finally:
+                self._last_send_mono = time.monotonic()
+
 
     async def notify(self, text: str) -> None:
         msg = (text or "").strip()
         if not msg:
             return
-        await asyncio.sleep(0.35)
         await self.send(f"🔔 {msg}", keyboard=_kb_main())
 
     async def _answer_callback(self, cq_id: str) -> None:
@@ -132,23 +220,42 @@ class TelegramController:
         mode = (st.get("mode") or "paper").upper()
         running = st.get("running")
         paused = st.get("paused")
-        state_emoji = "🟢" if running else ("⏸" if paused else "⏹")
-        state_txt = "торгует" if running else ("пауза" if paused else "остановлен")
+        risk_halted = bool(st.get("risk_halted"))
+        risk_reason = st.get("risk_halt_reason")
+        halt_reason = st.get("entry_halt_reason")
+        entry_ready = bool(st.get("entry_ready"))
+        halt_label = "дневной лимит убытка" if risk_reason == "daily_loss" else "лимит серии убытков"
+        if paused:
+            state_emoji, state_txt = "⏸", "пауза"
+        elif risk_halted:
+            state_emoji, state_txt = "⚠️", f"{halt_label} · только MERGE"
+        elif halt_reason == "polybolt_credentials_missing":
+            state_emoji, state_txt = "⚠️", "нет PolyBolt API credentials"
+        elif halt_reason == "waiting_for_fresh_chainlink":
+            state_emoji, state_txt = "⏳", "ожидание свежего Chainlink/TWAP"
+        elif entry_ready:
+            state_emoji, state_txt = "🟢", "торгует"
+        else:
+            state_emoji, state_txt = "⏹", "остановлен"
         equity = st.get("equity", 0) or 0
         cash = st.get("cash", 0) or 0
-        day = st.get("day_pnl", 0) or stats.get("today_net_pnl", 0) or 0
+        day = st.get("day_pnl")
+        if day is None:
+            day = stats.get("today_net_pnl", 0)
+        day = float(day or 0)
         day_s = f"+${day:.2f}" if day >= 0 else f"-${abs(day):.2f}"
         fees = float(st.get("fees_paid", 0) or 0)
         lines = [
             f"{state_emoji} <b>PolyBot — {state_txt}</b>",
             "━━━━━━━━━━━━━━━━",
-            f"Стратегия: <b>mo-money</b> · CLOB+fee",
+            f"Стратегия: <b>mo-money</b> · CLOB REST",
             f"Режим: <b>{mode}</b>",
             f"",
-            f"💵 Equity: <b>${equity:,.2f}</b>",
+            f"💵 Equity at cost: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
-            f"수수료 Fees: −${fees:.2f}".replace("수수료 ", ""),
+            f"Price feed: {('PolyBolt' if st.get('price_feed_mode') == 'polybolt' else ('PolyBolt: нет CLOB API credentials' if st.get('price_feed_mode') == 'polybolt_unconfigured' else 'не подключён'))} · {'OK' if st.get('chainlink_twap_ready') else 'ожидание'}",
+            f"Комиссии: −${fees:.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
@@ -171,33 +278,36 @@ class TelegramController:
         fees = float(st.get("fees_paid", 0) or getattr(self.engine, "fees_paid", 0) or 0)
         pnl = equity - bank
         day = float(st.get("day_pnl", 0) or 0)
-        res_pnl = float(stats.get("realized_net_pnl", 0) or 0)
-        merge_pnl = float(st.get("merge_profit", 0) or stats.get("merged_locked_pnl", 0) or 0)
-        wins = int(stats.get("win_markets", 0) or st.get("wins") or 0)
+        res_pnl = float(stats.get("resolved_net_pnl", 0) or 0)
+        merge_pnl = float(st.get("merge_profit", stats.get("merged_net_pnl", 0)) or 0)
+        open_fees = float(stats.get("open_fees", 0) or 0)
+        wins = int(stats["win_markets"]) if "win_markets" in stats else int(st.get("wins", 0) or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
-        losses = max(0, resolved - wins)
+        losses = int(stats["loss_markets"]) if "loss_markets" in stats else max(0, resolved - wins)
+        zeroes = int(stats.get("zero_markets", 0) or 0)
         n_fills = int(stats.get("total_fills", 0) or 0)
         n_merge = int(stats.get("merge_count", 0) or len(st.get("merge_history") or []))
         emoji = "📈" if pnl >= 0 else "📉"
         return (
-            f"💰 <b>Прибыль и убытки (демо)</b>\n"
+            f"💰 <b>PAPER PnL (учёт по себестоимости)</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Старт: <b>${bank:,.0f}</b>\n"
-            f"Equity: <b>${equity:,.2f}</b>\n"
+            f"Equity (инвентарь по себестоимости): <b>${equity:,.2f}</b>\n"
             f"Cash: ${cash:,.2f}\n"
             f"{emoji} Итого: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
             f"Сегодня: <b>${day:+.2f}</b>\n"
             f"Комиссии (taker): <b>−${fees:.2f}</b>\n\n"
             f"<b>Откуда плюс/минус</b>\n"
             f"· MERGE (пары): <b>${merge_pnl:+.2f}</b>\n"
-            f"· Окна до конца: <b>${res_pnl:+.2f}</b>\n"
-            f"· Чистыми ≈ Equity − старт (уже минус fee)\n\n"
+            f"· Резолвы: <b>${res_pnl:+.2f}</b>\n"
+            f"· Комиссии незакрытого инвентаря: <b>−${open_fees:.2f}</b>\n"
+            f"· Книга: cash + открытые позиции по себестоимости; это не mark-to-market\n"
             f"📊 Журнал\n"
             f"· Ставок: <b>{n_fills}</b>\n"
             f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses})\n\n"
+            f"· Завершённых окон: <b>{resolved}</b> (✅ {wins} / ❌ {losses} / 0️⃣ {zeroes})\n\n"
             f"ℹ️ ✅/❌ только если позиция дождалась конца окна.\n"
-            f"Если всё закрыли MERGE — там 0, это нормально."
+            f"Открытый инвентарь не переоценён по текущему bid/ask: это не mark-to-market и не цена ликвидации."
         )
 
     def _fmt_positions(self) -> str:
@@ -224,13 +334,14 @@ class TelegramController:
         stats = st.get("stats") or {}
         fills = list(st.get("fill_history") or [])
         merges = list(st.get("merge_history") or [])
-        merge_pnl = float(st.get("merge_profit", 0) or stats.get("merged_locked_pnl", 0) or 0)
+        merge_pnl = float(st.get("merge_profit", stats.get("merged_net_pnl", 0)) or 0)
         n_fills = int(stats.get("total_fills", 0) or len(fills))
+        n_merges = int(stats.get("merge_count", 0) or len(merges))
         lines = [
             "📋 <b>Журнал сделок</b>",
             "━━━━━━━━━━━━━━━━",
             f"Ставок: <b>{n_fills}</b>",
-            f"MERGE: {len(merges) or stats.get('merge_count', 0)} → ${merge_pnl:+.2f}",
+            f"MERGE: {n_merges} → ${merge_pnl:+.2f}",
             "",
             "<b>Последние:</b>",
         ]
@@ -252,27 +363,26 @@ class TelegramController:
             lines.append("")
             lines.append("<b>MERGE:</b>")
             for m in merges[:6]:
-                lines.append(f"♻️ {m.get('pairs', 0):.0f} пар → ${m.get('locked_pnl', 0):+.2f}")
+                lines.append(f"♻️ {m.get('pairs', 0):.0f} пар → net ${m.get('net_pnl', float(m.get('locked_pnl', 0) or 0) - float(m.get('fees', 0) or 0)):+.2f}")
         return "\n".join(lines)
 
     def _fmt_help(self) -> str:
         return (
-            "ℹ️ <b>Как зарабатывает бот</b>\n━━━━━━━━━━━━━━━━\n"
-            "1) Покупает Up и Down в CLOB\n"
-            "2) Если вместе дешевле $1 (после fee)\n"
-            "3) MERGE → получает $1 за пару\n"
-            "Разница = прибыль\n\n"
-            "✅/❌ окна — только если не сделали MERGE\n"
-            "и дождались конца 5 минут."
+            "ℹ️ <b>Как работает стратегия</b>\n━━━━━━━━━━━━━━━━\n"
+            "1) Покупает фаворита по лучшему ask, когда Chainlink-модель подтверждает сторону\n"
+            "2) При подходящей цене добавляет дешёвую противоположную ногу примерно до 22% стоимости фаворита\n"
+            "3) MERGE закрывает только совпавшие пары; остаток держит до подтверждённого резолва\n"
+            "4) SELL не используется. Комиссии taker учитываются отдельно.\n\n"
+            "Источник цен: PolyBolt требует CLOB API key/secret/passphrase; при отсутствии ключей новые входы заблокированы. PAPER-исполнение виртуальное; это не гарантия реального исполнения или прибыли."
         )
 
     def _fmt_presets(self) -> str:
-        lines = ["⚙️ <b>Пресет</b>", "━━━━━━━━━━━━━━━━"]
-        cur = self.engine.cfg.strategy_preset
-        for key, p in PRESETS.items():
-            mark = " ✅" if key == cur else ""
-            lines.append(f"\n<b>{getattr(p, 'title_ru', key)}</b>{mark}")
-        return "\n".join(lines)
+        return (
+            "⚙️ <b>Стратегия закреплена</b>\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "⭐ mo-money · BTC 5m + 15m\n"
+            "Переключение на другие пресеты отключено, чтобы не менять проверяемую стратегию случайной командой."
+        )
 
     async def _handle(self, action: str):
         a = (action or "").strip().lower()
@@ -301,23 +411,53 @@ class TelegramController:
             return f"🛑 СТОП: merge ${res.get('merged_usd', 0):.2f}", _kb_main()
         if a.startswith("preset:"):
             key = a.split(":", 1)[1].strip()
-            if key in PRESETS and hasattr(self.engine, "set_preset"):
-                self.engine.set_preset(key)
-                return f"✅ Пресет: {key}", _kb_main()
+            if hasattr(self.engine, "set_preset") and self.engine.set_preset(key):
+                return "✅ Закреплённый пресет: mo-money · BTC 5m + 15m", _kb_main()
+            return "⛔ Переключение отключено: используется только mo-money.", _kb_main()
         return self._fmt_status(), _kb_main()
 
     async def _poll_loop(self) -> None:
         assert self._session
         while self._running:
             try:
-                params = {"offset": self._offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}
+                params = {
+                    "offset": self._offset,
+                    "timeout": 25,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                }
                 async with self._session.get(f"{self._base}/getUpdates", params=params) as r:
-                    if r.status != 200:
-                        await asyncio.sleep(3)
+                    if r.status == 429:
+                        retry_after = r.headers.get("Retry-After")
+                        try:
+                            body = await r.json()
+                            retry_after = (body.get("parameters") or {}).get("retry_after") or retry_after
+                        except Exception:
+                            pass
+                        try:
+                            wait = float(retry_after) if retry_after is not None else 5.0
+                        except (TypeError, ValueError):
+                            wait = 5.0
+                        await asyncio.sleep(min(60.0, max(1.0, wait)))
                         continue
+                    if r.status >= 500:
+                        await asyncio.sleep(self._poll_backoff)
+                        self._poll_backoff = min(30.0, self._poll_backoff * 2.0)
+                        continue
+                    if r.status != 200:
+                        logger.warning("getUpdates returned HTTP %s", r.status)
+                        await asyncio.sleep(10)
+                        continue
+                    self._poll_backoff = 1.0
                     data = await r.json()
                     for upd in data.get("result", []):
                         self._offset = max(self._offset, upd["update_id"] + 1)
+                        update_message = upd.get("message") or (upd.get("callback_query") or {}).get("message") or {}
+                        try:
+                            update_ts = int(update_message.get("date") or 0)
+                        except (TypeError, ValueError):
+                            update_ts = 0
+                        if update_ts < int(self._startup_ts):
+                            continue
                         if "message" in upd:
                             msg = upd["message"]
                             if str((msg.get("chat") or {}).get("id", "")).strip() != self.chat_id:

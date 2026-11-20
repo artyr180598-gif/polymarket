@@ -48,15 +48,17 @@ class AssetPriceTracker:
         self.cl_spot: Optional[float] = None
         self.cl_spot_ts: float = 0.0
         self.cl_recv_mono: float = 0.0
+        self.cl_received_ts: float = 0.0
         self.cl_twap60: Optional[float] = None
         self.cl_twap60_ts: float = 0.0
         self.cl_twap_recv_mono: float = 0.0
+        self.cl_twap_received_ts: float = 0.0
         self.bn_spot: Optional[float] = None
         self.bn_spot_ts: float = 0.0
         self.bn_recv_mono: float = 0.0
         self.basis_ema: Optional[float] = None
         self.basis_alpha: float = 0.035
-        self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=400)
+        self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=5000)
         self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=900)
         self.boundary_twap: Dict[int, float] = {}
         default_v = DEFAULT_SIGMA_1S.get(self.asset, 0.00012) ** 2
@@ -66,9 +68,18 @@ class AssetPriceTracker:
         self._last_vol_ts: float = 0.0
         self._vol_samples: int = 0
 
-    def on_chainlink_spot(self, price: float, feed_ts_ms: int) -> None:
+    def on_chainlink_spot(
+        self, price: float, feed_ts_ms: int, *, compute_twap: bool = True,
+        received_at_ms: int | None = None,
+    ) -> None:
         ts = feed_ts_ms / 1000.0
+        received_ts = (received_at_ms / 1000.0) if received_at_ms else ts
         now_m = time.monotonic()
+        if self.cl_spot_ts and ts <= self.cl_spot_ts:
+            if received_ts > self.cl_received_ts:
+                self.cl_received_ts = received_ts
+                self.cl_recv_mono = now_m
+            return
         if self._last_vol_px is not None and ts > self._last_vol_ts:
             dt = ts - self._last_vol_ts
             if dt > 0:
@@ -83,8 +94,11 @@ class AssetPriceTracker:
         self.cl_spot = price
         self.cl_spot_ts = ts
         self.cl_recv_mono = now_m
-        if not self.cl_spot_hist or ts >= self.cl_spot_hist[-1][0]:
+        self.cl_received_ts = received_ts
+        if not self.cl_spot_hist or ts > self.cl_spot_hist[-1][0]:
             self.cl_spot_hist.append((ts, price))
+            if compute_twap:
+                self._refresh_twap60(ts)
         if self.bn_spot is not None and abs(self.bn_spot_ts - ts) <= 3.0:
             diff = self.bn_spot - price
             if self.basis_ema is None:
@@ -92,11 +106,46 @@ class AssetPriceTracker:
             else:
                 self.basis_ema = (1.0 - self.basis_alpha) * self.basis_ema + self.basis_alpha * diff
 
-    def on_chainlink_twap60(self, twap_val: float, feed_ts_ms: int) -> None:
+    def _refresh_twap60(self, now_ts: float) -> None:
+        """Build a true 60-second time-weighted average from Chainlink samples."""
+        history = list(self.cl_spot_hist)
+        cutoff = now_ts - 60.0
+        if len(history) < 2 or history[0][0] > cutoff:
+            return
+        prior = [(ts, px) for ts, px in history if ts <= cutoff]
+        if not prior:
+            return
+        cursor = cutoff
+        price = prior[-1][1]
+        integral = 0.0
+        for ts, px in history:
+            if ts <= cutoff:
+                continue
+            if ts > now_ts:
+                break
+            integral += price * (ts - cursor)
+            cursor = ts
+            price = px
+        integral += price * (now_ts - cursor)
+        self.on_chainlink_twap60(integral / 60.0, int(now_ts * 1000))
+
+    def on_chainlink_twap60(
+        self, twap_val: float, feed_ts_ms: int, *, received_at_ms: int | None = None,
+    ) -> None:
         ts = feed_ts_ms / 1000.0
+        received_ts = (received_at_ms / 1000.0) if received_at_ms else ts
+        now_m = time.monotonic()
+        if self.cl_twap60_ts and ts < self.cl_twap60_ts:
+            return
+        if self.cl_twap60_ts and ts == self.cl_twap60_ts:
+            if received_ts > self.cl_twap_received_ts:
+                self.cl_twap_received_ts = received_ts
+                self.cl_twap_recv_mono = now_m
+            return
         self.cl_twap60 = twap_val
         self.cl_twap60_ts = ts
-        self.cl_twap_recv_mono = time.monotonic()
+        self.cl_twap_recv_mono = now_m
+        self.cl_twap_received_ts = received_ts
         if not self.cl_twap_hist or ts >= self.cl_twap_hist[-1][0]:
             self.cl_twap_hist.append((ts, twap_val))
         sec = int(round(ts))
@@ -107,6 +156,8 @@ class AssetPriceTracker:
 
     def on_binance_spot(self, price: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        if self.bn_spot_ts and ts <= self.bn_spot_ts:
+            return
         self.bn_spot = price
         self.bn_spot_ts = ts
         self.bn_recv_mono = time.monotonic()
@@ -152,7 +203,10 @@ class AssetPriceTracker:
         # lead-lag: binance vs chainlink basis-adjusted
         lead_bps = 0.0
         s_hat = s_cl
-        if self.bn_spot is not None and self.basis_ema is not None:
+        if (
+            self.bn_spot is not None and self.basis_ema is not None
+            and time.monotonic() - self.bn_recv_mono <= 5.0
+        ):
             residual = self.bn_spot - self.basis_ema - s_cl
             lead_bps = 10000.0 * residual / s_cl if s_cl else 0.0
             s_hat = s_cl + 0.55 * residual

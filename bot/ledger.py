@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import sqlite3
 import time
@@ -12,17 +13,59 @@ from typing import Any, Dict, List
 class Ledger:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        parent = os.path.dirname(os.path.abspath(db_path))
+        marker_path = f"{db_path}.initialized"
+        if not os.path.exists(db_path):
+            backups = glob.glob(f"{db_path}.pre-reset-*")
+            if os.path.exists(marker_path) or backups:
+                raise RuntimeError(
+                    f"Persistent PAPER ledger {db_path!r} is missing; refusing to create a fresh database. "
+                    "Preserve the volume and restore the existing ledger."
+                )
+        absolute_db_path = os.path.abspath(db_path)
+        parent = os.path.dirname(absolute_db_path)
+        marker = f"{db_path}.initialized"
+        railway_runtime = bool(os.getenv("RAILWAY_ENVIRONMENT_NAME"))
+        mounted_data = os.path.join(os.sep, "data")
+        app_local_data = os.path.join(os.getcwd(), "data") + os.sep
+        if railway_runtime and absolute_db_path.startswith(app_local_data):
+            raise RuntimeError(
+                "Railway DB_PATH resolves to the app-local data directory, not the persistent volume. "
+                "Set DB_PATH=/data/polybot.db."
+            )
+        if (
+            railway_runtime
+            and absolute_db_path.startswith(mounted_data + os.sep)
+            and not os.path.ismount(mounted_data)
+        ):
+            raise RuntimeError("Railway /data volume is not mounted; refusing to use an ephemeral PAPER ledger")
+        db_exists = os.path.isfile(db_path)
+        if not db_exists and os.path.exists(marker):
+            raise RuntimeError(f"Persistent PAPER ledger is missing at {db_path!r}; refusing to recreate an empty history")
         try:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        except Exception:
-            fallback = "/tmp/polybot.db"
-            self.db_path = fallback
-            self.conn = sqlite3.connect(fallback, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+            self.conn.row_factory = sqlite3.Row
+            self._init_schema()
+            if not os.path.exists(marker):
+                with open(marker, "x", encoding="utf-8") as handle:
+                    handle.write("initialized\\n")
+        except Exception as exc:
+            conn = getattr(self, "conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"Unable to open persistent PAPER ledger at {db_path!r}") from exc
+        try:
+            with open(marker_path, "a", encoding="utf-8"):
+                pass
+        except Exception as exc:
+            self.conn.close()
+            raise RuntimeError(f"Unable to persist PAPER ledger initialization marker at {marker_path!r}") from exc
 
     def _init_schema(self) -> None:
         cur = self.conn.cursor()
@@ -46,7 +89,11 @@ class Ledger:
                 notional REAL NOT NULL,
                 fee REAL NOT NULL,
                 fair_prob REAL NOT NULL,
-                tx_or_order_id TEXT DEFAULT ''
+                tx_or_order_id TEXT DEFAULT '',
+                price_to_beat REAL,
+                final_price REAL,
+                window_start_ts REAL,
+                window_end_ts REAL
             );
 
             CREATE TABLE IF NOT EXISTS merges (
@@ -58,6 +105,7 @@ class Ledger:
                 pairs REAL NOT NULL,
                 cost_basis REAL NOT NULL,
                 locked_pnl REAL NOT NULL,
+                fees REAL NOT NULL DEFAULT 0.0,
                 tx_hash TEXT DEFAULT ''
             );
 
@@ -94,6 +142,13 @@ class Ledger:
             );
             """
         )
+        merge_columns = {row[1] for row in cur.execute("PRAGMA table_info(merges)").fetchall()}
+        if "fees" not in merge_columns:
+            cur.execute("ALTER TABLE merges ADD COLUMN fees REAL NOT NULL DEFAULT 0.0")
+        fill_columns = {row[1] for row in cur.execute("PRAGMA table_info(fills)").fetchall()}
+        for name in ("price_to_beat", "final_price", "window_start_ts", "window_end_ts"):
+            if name not in fill_columns:
+                cur.execute(f"ALTER TABLE fills ADD COLUMN {name} REAL")
         self.conn.commit()
 
     def record_fill(
@@ -112,19 +167,25 @@ class Ledger:
         fee: float,
         fair_prob: float,
         tx_or_order_id: str = "",
+        price_to_beat: float | None = None,
+        final_price: float | None = None,
+        window_start_ts: float | None = None,
+        window_end_ts: float | None = None,
         ts: float | None = None,
     ) -> None:
         t = ts if ts is not None else time.time()
         self.conn.execute(
             """
             INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
-                               shares, price, notional, fee, fair_prob, tx_or_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               shares, price, notional, fee, fair_prob, tx_or_order_id,
+                               price_to_beat, final_price, window_start_ts, window_end_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 t, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
                 round(shares, 4), round(price, 4), round(shares * price, 4),
                 round(fee, 5), round(fair_prob, 4), tx_or_order_id,
+                price_to_beat, final_price, window_start_ts, window_end_ts,
             ),
         )
         self.conn.commit()
@@ -138,14 +199,16 @@ class Ledger:
         pairs: float,
         cost_basis: float,
         locked_pnl: float,
+        fees: float = 0.0,
         tx_hash: str = "",
+        ts: float | None = None,
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO merges (ts, mode, slug, condition_id, pairs, cost_basis, locked_pnl, tx_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO merges (ts, mode, slug, condition_id, pairs, cost_basis, locked_pnl, fees, tx_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (time.time(), mode, slug, condition_id, round(pairs, 4), round(cost_basis, 4), round(locked_pnl, 4), tx_hash),
+            (ts if ts is not None else time.time(), mode, slug, condition_id, round(pairs, 4), round(cost_basis, 4), round(locked_pnl, 4), round(fees, 5), tx_hash),
         )
         self.conn.commit()
 
@@ -215,10 +278,11 @@ class Ledger:
                 COALESCE(SUM(notional), 0) AS total_notional,
                 COALESCE(SUM(CASE WHEN role='MAKER' THEN notional ELSE 0 END), 0) AS maker_notional,
                 COALESCE(SUM(fee), 0) AS total_fees,
+                COALESCE(SUM(CASE WHEN ts >= ? THEN fee ELSE 0 END), 0) AS today_fees,
                 COALESCE(SUM(shares * price * (1.0 - price)), 0) AS weighted_vol
             FROM fills WHERE mode = ?
             """,
-            (mode,),
+            (today_start, mode),
         ).fetchone()
 
         r_row = self.conn.execute(
@@ -226,9 +290,12 @@ class Ledger:
             SELECT
                 COUNT(*) AS resolved_mkts,
                 COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS win_mkts,
+                COALESCE(SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END), 0) AS loss_mkts,
+                COALESCE(SUM(CASE WHEN net_pnl = 0 THEN 1 ELSE 0 END), 0) AS zero_mkts,
                 COALESCE(SUM(gross_pnl), 0) AS gross_pnl,
                 COALESCE(SUM(net_pnl), 0) AS net_pnl,
-                COALESCE(SUM(CASE WHEN ts >= ? THEN net_pnl ELSE 0 END), 0) AS today_net_pnl
+                COALESCE(SUM(total_fees), 0) AS resolution_fees,
+                COALESCE(SUM(CASE WHEN ts >= ? THEN gross_pnl ELSE 0 END), 0) AS today_gross_pnl
             FROM resolutions WHERE mode = ?
             """,
             (today_start, mode),
@@ -237,10 +304,13 @@ class Ledger:
         m_row = self.conn.execute(
             """
             SELECT COUNT(*) AS merge_count, COALESCE(SUM(pairs), 0) AS merged_usd,
-                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl
+                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl,
+                   COALESCE(SUM(fees), 0) AS merged_fees,
+                   COALESCE(SUM(locked_pnl - fees), 0) AS merged_net_pnl,
+                   COALESCE(SUM(CASE WHEN ts >= ? THEN locked_pnl ELSE 0 END), 0) AS today_merged_gross_pnl
             FROM merges WHERE mode = ?
             """,
-            (mode,),
+            (today_start, mode),
         ).fetchone()
 
         total_fills = int(f_row["total_fills"])
@@ -257,13 +327,21 @@ class Ledger:
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
             "win_markets": int(r_row["win_mkts"]),
+            "loss_markets": int(r_row["loss_mkts"]),
+            "zero_markets": int(r_row["zero_mkts"]),
+            "resolved_gross_pnl": round(float(r_row["gross_pnl"]), 2),
+            "resolved_net_pnl": round(float(r_row["net_pnl"]), 2),
+            "resolution_fees": round(float(r_row["resolution_fees"]), 4),
+            "open_fees": round(max(0.0, float(f_row["total_fees"]) - float(m_row["merged_fees"]) - float(r_row["resolution_fees"])), 4),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
-            "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
-            "realized_net_pnl": round(float(r_row["net_pnl"]), 2),
-            "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
+            "realized_gross_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]), 2),
+            "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
+            "today_net_pnl": round(float(r_row["today_gross_pnl"]) + float(m_row["today_merged_gross_pnl"]) - float(f_row["today_fees"]), 2),
             "merge_count": int(m_row["merge_count"]),
             "merged_usd": round(float(m_row["merged_usd"]), 2),
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
+            "merged_fees": round(float(m_row["merged_fees"]), 4),
+            "merged_net_pnl": round(float(m_row["merged_net_pnl"]), 2),
         }
 
     def recent_fills(self, mode: str, limit: int = 30) -> List[Dict[str, Any]]:
@@ -297,3 +375,56 @@ class Ledger:
             (mode, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def update_window_prices(
+        self,
+        *,
+        mode: str,
+        slug: str,
+        price_to_beat: float | None = None,
+        final_price: float | None = None,
+    ) -> None:
+        """Persist newly observed oracle boundary prices on all fills for a window."""
+        if price_to_beat is None and final_price is None:
+            return
+        self.conn.execute(
+            """
+            UPDATE fills
+            SET price_to_beat = COALESCE(?, price_to_beat),
+                final_price = COALESCE(?, final_price)
+            WHERE mode = ? AND slug = ?
+            """,
+            (price_to_beat, final_price, mode, slug),
+        )
+        self.conn.commit()
+
+    def update_merge_fees(self, merge_id: int, fees: float) -> None:
+        """Backfill fee allocation for legacy merge rows without changing their PnL basis."""
+        self.conn.execute(
+            "UPDATE merges SET fees = ? WHERE id = ? AND (fees IS NULL OR fees = 0)",
+            (round(max(0.0, fees), 5), int(merge_id)),
+        )
+        self.conn.commit()
+
+    def update_resolution_fees(self, resolution_id: int, fees: float) -> None:
+        """Backfill fee allocation on legacy resolutions created before fee accounting."""
+        self.conn.execute(
+            "UPDATE resolutions SET total_fees = ?, net_pnl = gross_pnl - ? WHERE id = ? AND (total_fees IS NULL OR total_fees = 0)",
+            (round(max(0.0, fees), 5), round(max(0.0, fees), 5), int(resolution_id)),
+        )
+        self.conn.commit()
+
+    def recovery_events(self, mode: str) -> List[Dict[str, Any]]:
+        """Return immutable paper-ledger events in replay order for crash recovery."""
+        events: List[Dict[str, Any]] = []
+        for table, kind in (("fills", "fill"), ("merges", "merge"), ("resolutions", "resolution")):
+            rows = self.conn.execute(
+                f"SELECT * FROM {table} WHERE mode = ? ORDER BY ts ASC, id ASC", (mode,)
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["event_type"] = kind
+                item["_priority"] = {"fill": 0, "merge": 1, "resolution": 2}[kind]
+                events.append(item)
+        events.sort(key=lambda item: (float(item.get("ts") or 0), item["_priority"], int(item.get("id") or 0)))
+        return events

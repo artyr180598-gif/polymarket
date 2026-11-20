@@ -30,7 +30,10 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
     def verify_pin(x_bot_pin: Optional[str] = Header(default=None)) -> None:
         required = engine.cfg.dashboard_pin
         if not required:
-            return
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard API disabled: DASHBOARD_PIN is not configured",
+            )
         provided = (x_bot_pin or "").strip()
         if not hmac.compare_digest(provided, required):
             raise HTTPException(status_code=401, detail="Неверный PIN-код панели")
@@ -40,11 +43,15 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
         mode = engine.cfg.trading_mode
         if engine.executor is not None:
             mode = getattr(engine.executor, "mode", mode) or mode
+        snapshot = engine.snapshot() if hasattr(engine, "snapshot") else {}
         return {
             "ok": True,
             "mode": mode,
             "running": getattr(engine, "running", False),
             "paused": getattr(engine, "paused", True),
+            "entry_ready": bool(snapshot.get("entry_ready", False)),
+            "entry_halt_reason": snapshot.get("entry_halt_reason", "status_unavailable"),
+            "price_feed_mode": snapshot.get("price_feed_mode", "unavailable"),
             "pin_required": bool(engine.cfg.dashboard_pin),
         }
 
@@ -85,13 +92,16 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
 
     @app.post("/api/action/risk", dependencies=[Depends(verify_pin)])
     async def act_risk(req: RiskUpdateRequest) -> dict:
-        if hasattr(engine, "update_risk_limits"):
-            engine.update_risk_limits(
-                order_clip_usd=req.order_clip_usd,
-                max_window_risk_usd=req.max_window_risk_usd,
-                max_daily_loss_usd=req.max_daily_loss_usd,
-                enabled_assets=req.enabled_assets,
-            )
+        if not hasattr(engine, "update_risk_limits"):
+            raise HTTPException(status_code=503, detail="Изменение риск-лимитов отключено в закреплённой стратегии")
+        result = engine.update_risk_limits(
+            order_clip_usd=req.order_clip_usd,
+            max_window_risk_usd=req.max_window_risk_usd,
+            max_daily_loss_usd=req.max_daily_loss_usd,
+            enabled_assets=req.enabled_assets,
+        )
+        if asyncio.iscoroutine(result):
+            await result
         return {"ok": True}
 
     @app.get("/", response_class=HTMLResponse)

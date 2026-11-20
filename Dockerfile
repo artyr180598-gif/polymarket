@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
+# Fail the image build if Python syntax or PAPER regression tests fail.
+RUN python -m compileall -q bot main.py tests \
+    && python -m unittest discover -s tests -v
+
 # Railway volume should be mounted at /data
 ENV DB_PATH=/data/polybot.db
 ENV PYTHONUNBUFFERED=1

@@ -1,8 +1,8 @@
-# PolyBot TWAP Hybrid
+# PolyBot PAPER
 
-Production-ready Polymarket crypto Up/Down trading bot.
+PAPER-first Polymarket crypto Up/Down strategy prototype. It is not production-validated and does not guarantee profit.
 
-Default preset **`mo_money`** copies the on-chain behaviour of
+Default preset **`mo_money`** is behaviorally inspired by the observed on-chain activity of
 [@mo-money](https://polymarket.com/profile/0x32ed2e546b187ca15e2841edc82b22c713cf8ec3)
 (`0x32ed2e546b187ca15e2841edc82b22c713cf8ec3`), scaled to your bankroll.
 
@@ -19,17 +19,17 @@ Sample: 9.2 hours, 2 164 buys, **$86 304**, **0 sells**, 197 markets, +$601k lif
 | Cadence | ~4 bursts per window, median gap 19s, until the bell |
 | Exit | **MERGE** matched pairs back to $1, then **REDEEM**. Never a SELL |
 
-The bot therefore:
+The current PAPER implementation therefore:
 
 1. Trades **only BTC 5m and 15m** on `STRATEGY_PRESET=mo_money` (ETH/SOL ignored in this preset).
-2. Lifts the **favorite** (the expensive side of the book) when the TWAP model agrees, and sizes up as the price goes to 90–97¢.
+2. Lifts the **favorite** (the expensive side of the book) at the CLOB best ask when fresh Chainlink data and the model agree.
 3. Buys the **cheap wing** up to ~22% of the favorite's cost (the hedge).
 4. **MERGEs** every matched pair immediately (same PnL as holding both to resolution, cash comes back now).
 5. **REDEEMs** the leftover winner. No sell orders.
 
 Dollar size is **not** copied. That wallet turns about $9k/hour; on a ~$2 750 bankroll the same notional would blow the account. Shape is copied, size follows `ORDER_CLIP_USD` / `MAX_WINDOW_RISK_USD`.
 
-Always starts in **paper** mode (live CLOB asks + spot, virtual bankroll). Live only after you have watched paper windows.
+This build is hard-locked to **PAPER** (virtual fills, real public market data). LIVE execution is disabled in code. The current strategy uses TAKER entries through CLOB REST; it does **not** reproduce a Maker queue or guarantee exchange fills.
 
 ## Quick start (Railway + iPhone)
 
@@ -67,10 +67,11 @@ main.py                 FastAPI + Uvicorn + Engine + Telegram
 bot/
   config.py             BotConfig + 3 strategy presets
   fees.py               Exact Polymarket fee formula + 2026-11-20 switchover
-  twap_model.py         Chainlink 60s TWAP fair-value model + Binance lead-lag
+  twap_model.py         Chainlink spot + native PolyBolt 60-second TWAP fair-value model
+  engine.py             Authenticated PolyBolt Chainlink spot/TWAP + CLOB REST quotes; fail-closed without credentials
   ledger.py             SQLite WAL (fills / merges / resolutions / equity)
   execution.py          PaperExecutor (queue-aware) + LiveExecutor
-  engine.py             discovery + mo-money tape strategy + risk
+  engine.py             discovery + mo-money-inspired PAPER strategy + risk
   telegram_ctl.py       Pure aiohttp Telegram controller
   web.py                Mobile PWA dashboard (all HTML/JS inlined)
 ```
@@ -107,3 +108,16 @@ One-shot Ubuntu install: `sudo bash deploy/install_vps.sh`
 ## License
 
 Private / personal use. Not financial advice. Trade at your own risk.
+
+
+## Important execution limits
+
+- Price source is authenticated PolyBolt Chainlink spot + native 60-second TWAP. It requires the three CLOB credentials `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and `POLYMARKET_PASSPHRASE` (or `POLYMARKET_API_PASSPHRASE`) in Railway Variables. `CHAINLINK_API_KEY` is optional unless Polymarket rejects the Chainlink subscription with `chainlink_key_required`; the bot never creates or changes credentials.
+- Legacy RTDS reference-price topics are retired/deprecated and are not used as a fallback. If CLOB credentials are missing or PolyBolt is unavailable, fresh-price checks block all new entries; there is no Coinbase-as-Chainlink fallback.
+- CLOB best ask and depth are currently polled through REST; there is no CLOB market WebSocket implementation in this build.
+- PAPER fills are virtual assumptions at the observed best ask. They do not model queue position, latency, partial fills, adverse selection, or actual exchange execution.
+- The observed wallet's Maker-heavy execution is not cloned here: the current implementation is TAKER-first, as explicitly configured for this experiment.
+- An unresolved position remains in inventory and risk accounting until the Data API reports an authoritative resolved payout. Post-close Chainlink prices are stored for audit only and never used to infer a winner.
+- PAPER balances, fills, merges, fees, and open inventory are rebuilt from the SQLite ledger on restart. Do not delete the mounted volume or database.
+- On Railway, set `DB_PATH=/data/polybot.db`. App-local relative paths such as `data/polybot.db` are rejected so a missing volume cannot silently create a fresh ephemeral ledger.
+- Dashboard state/control endpoints require `DASHBOARD_PIN`; if it is absent, protected endpoints fail closed. Telegram remains the supported control path.

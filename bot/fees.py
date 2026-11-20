@@ -17,6 +17,7 @@ Schedule transition at Friday, 2026-11-20 23:59:00 UTC (epoch 1795219140):
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timezone
 
@@ -30,12 +31,9 @@ def get_crypto_taker_fee_rate(
     market_override_rate: float | None = None,
 ) -> float:
     """Return the active taker fee coefficient for a crypto Up/Down market."""
-    if market_override_rate is not None and market_override_rate >= 0:
-        # Once Gamma publishes the updated per-market feeSchedule.rate, prefer it directly.
-        # Before switchover Gamma publishes 0.07; after switchover 0.05 or 0.01.
-        ts = now_ts if now_ts is not None else time.time()
-        if ts < NOV_20_2026_SWITCHOVER_TS or market_override_rate != 0.07:
-            return float(market_override_rate)
+    if market_override_rate is not None and math.isfinite(float(market_override_rate)) and market_override_rate >= 0:
+        # Gamma's per-market feeSchedule.rate is authoritative whenever present.
+        return float(market_override_rate)
 
     ts = now_ts if now_ts is not None else time.time()
     if ts < NOV_20_2026_SWITCHOVER_TS:
@@ -53,12 +51,16 @@ def calc_taker_fee_usdc(
     timeframe: str,
     now_ts: float | None = None,
     market_override_rate: float | None = None,
+    market_override_exponent: float | None = None,
 ) -> float:
     """Exact Polymarket taker fee in USDC (rounded to 5 decimals; <0.00001 -> 0)."""
     if shares <= 0 or price <= 0 or price >= 1:
         return 0.0
     rate = get_crypto_taker_fee_rate(asset, timeframe, now_ts=now_ts, market_override_rate=market_override_rate)
-    raw = shares * rate * price * (1.0 - price)
+    exponent = float(market_override_exponent) if market_override_exponent is not None else 1.0
+    if not math.isfinite(exponent) or exponent < 0:
+        exponent = 1.0
+    raw = shares * rate * (price * (1.0 - price)) ** exponent
     fee = round(raw, 5)
     return fee if fee >= 0.00001 else 0.0
 
@@ -69,12 +71,16 @@ def calc_taker_fee_per_share(
     timeframe: str,
     now_ts: float | None = None,
     market_override_rate: float | None = None,
+    market_override_exponent: float | None = None,
 ) -> float:
     """Taker fee per single share in USD."""
     if price <= 0 or price >= 1:
         return 0.0
     rate = get_crypto_taker_fee_rate(asset, timeframe, now_ts=now_ts, market_override_rate=market_override_rate)
-    return rate * price * (1.0 - price)
+    exponent = float(market_override_exponent) if market_override_exponent is not None else 1.0
+    if not math.isfinite(exponent) or exponent < 0:
+        exponent = 1.0
+    return rate * (price * (1.0 - price)) ** exponent
 
 
 def calc_weighted_volume(shares: float, price: float) -> float:

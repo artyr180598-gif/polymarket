@@ -17,7 +17,7 @@ class StrategyParams:
     title_ru: str
     description_ru: str
 
-    # Engine 1: @mo-money Post-Only Maker + Synthetic BUY-Opposite TP/SL + MERGE
+    # Legacy strategy parameters retained for non-mo-money presets; mo_money currently uses PAPER taker entries
     enable_maker: bool = True
     min_maker_edge: float = 0.025
     maker_min_price: float = 0.30
@@ -52,15 +52,15 @@ class StrategyParams:
 PRESETS: Dict[str, StrategyParams] = {
     "mo_money": StrategyParams(
         key="mo_money",
-        title_ru="mo-money (Maker + Merge)",
+        title_ru="mo-money (favorite + hedge + merge · PAPER taker)",
         description_ru=(
-            "Копия ленты @mo-money (0x32ed…): только BTC 5m и 15m, без SELL. "
-            "Бот снимает фаворита книги (основной объём на 65–97¢, клип растёт с ценой), "
-            "добирает дешёвую ногу ~22% и сразу MERGE в pUSD. Остаток — REDEEM. "
-            "Размер сделок масштабируется под BANKROLL, не под $9k/час этого кошелька."
+            "Поведенчески ориентированный PAPER-пресет: только BTC 5m и 15m, без SELL. "
+            "Покупает фаворита по лучшему ask при подтверждении Chainlink-модели, "
+            "добирает дешёвую ногу примерно до 22% стоимости фаворита, MERGE совпавших пар; "
+            "остаток ждёт подтверждённого резолва. Исполнение сейчас TAKER, не копия Maker-механики кошелька."
         ),
-        enable_maker=True,
-        enable_lockin=True,
+        enable_maker=False,
+        enable_lockin=False,
         enable_taker=True,
         min_maker_edge=0.024,
         min_taker_net_edge_btc=0.040,
@@ -141,6 +141,10 @@ class BotConfig:
     builder_api_key: str = ""
     builder_secret: str = ""
     builder_passphrase: str = ""
+    polymarket_api_key: str = ""
+    polymarket_api_secret: str = ""
+    polymarket_api_passphrase: str = ""
+    chainlink_api_key: str = ""
 
     dashboard_host: str = "0.0.0.0"
     dashboard_port: int = 8080
@@ -156,6 +160,13 @@ class BotConfig:
     @property
     def has_live_credentials(self) -> bool:
         return bool(self.private_key and self.wallet_address)
+
+    @property
+    def has_polybolt_credentials(self) -> bool:
+        return bool(
+            self.polymarket_api_key and self.polymarket_api_secret
+            and self.polymarket_api_passphrase
+        )
 
     @property
     def has_gasless_relayer(self) -> bool:
@@ -207,6 +218,10 @@ class BotConfig:
             builder_api_key=os.getenv("POLYMARKET_BUILDER_API_KEY", "").strip(),
             builder_secret=os.getenv("POLYMARKET_BUILDER_SECRET", "").strip(),
             builder_passphrase=os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip(),
+            polymarket_api_key=os.getenv("POLYMARKET_API_KEY", "").strip(),
+            polymarket_api_secret=os.getenv("POLYMARKET_API_SECRET", "").strip(),
+            polymarket_api_passphrase=(os.getenv("POLYMARKET_PASSPHRASE") or os.getenv("POLYMARKET_API_PASSPHRASE", "")).strip(),
+            chainlink_api_key=os.getenv("CHAINLINK_API_KEY", "").strip(),
             dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip(),
             # Railway injects PORT; prefer it over DASHBOARD_PORT (local/VPS default 8080)
             dashboard_port=int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "8080")),
