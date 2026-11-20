@@ -38,6 +38,7 @@ class Resting:
     token_id: str
     price: Decimal
     remaining: Decimal
+    original: Decimal
     queue_ahead: Decimal
     prev_level: Decimal | None = None
     seen_book: bool = False
@@ -74,8 +75,7 @@ class PaperBroker:
             token_id=token_id,
             price=price,
             remaining=shares,
-            # First poll sets the queue from the book. Seed with the size we
-            # saw at placement so a book that never changes does not fill us.
+            original=shares,
             queue_ahead=D(bid_size_at_price),
             prev_level=D(bid_size_at_price),
             seen_book=True,

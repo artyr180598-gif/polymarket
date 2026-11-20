@@ -56,6 +56,8 @@ class BotConfig:
     paper_reset_once: bool = False
     paper_reset_id: str = ""
     paper_stats_since_ts: float = 0.0
+    # Absolute paths of old ledger files to delete once at startup. Empty = do nothing.
+    legacy_db_delete: list[str] = field(default_factory=list)
 
     private_key: str = ""
     wallet_address: str = ""
@@ -122,6 +124,7 @@ class BotConfig:
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
             paper_stats_since_ts=_optional_float("PAPER_STATS_SINCE_TS"),
+            legacy_db_delete=_list("LEGACY_DB_DELETE", ""),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
             wallet_address=os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip(),
             relayer_api_key=os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip(),
