@@ -112,8 +112,8 @@ Private / personal use. Not financial advice. Trade at your own risk.
 
 ## Important execution limits
 
-- Preferred source is authenticated PolyBolt Chainlink spot + native 60-second TWAP. It requires `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`, and `CHAINLINK_API_KEY` in Railway Variables. The bot never creates or changes these credentials.
-- If those credentials are absent, the bot labels and uses the deprecated legacy RTDS feed as a temporary fallback. If that feed stops, fresh Chainlink/TWAP checks block new entries; there is no Coinbase-as-Chainlink fallback.
+- Price source is authenticated PolyBolt Chainlink spot + native 60-second TWAP. It requires the three CLOB credentials `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and `POLYMARKET_API_PASSPHRASE` in Railway Variables. `CHAINLINK_API_KEY` is optional; the subscription uses Polymarket's default Chainlink source. The bot never creates or changes credentials.
+- Legacy RTDS reference-price topics are retired/deprecated and are not used as a fallback. If CLOB credentials are missing or PolyBolt is unavailable, fresh-price checks block all new entries; there is no Coinbase-as-Chainlink fallback.
 - CLOB best ask and depth are currently polled through REST; there is no CLOB market WebSocket implementation in this build.
 - PAPER fills are virtual assumptions at the observed best ask. They do not model queue position, latency, partial fills, adverse selection, or actual exchange execution.
 - The observed wallet's Maker-heavy execution is not cloned here: the current implementation is TAKER-first, as explicitly configured for this experiment.
