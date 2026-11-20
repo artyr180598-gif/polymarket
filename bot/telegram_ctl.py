@@ -169,8 +169,12 @@ class TelegramController:
         mode = (st.get("mode") or "paper").upper()
         running = st.get("running")
         paused = st.get("paused")
-        state_emoji = "🟢" if running else ("⏸" if paused else "⏹")
-        state_txt = "торгует" if running else ("пауза" if paused else "остановлен")
+        risk_halted = bool(st.get("risk_halted"))
+        state_emoji = "⏸" if paused else ("⚠️" if risk_halted else ("🟢" if running else "⏹"))
+        state_txt = (
+            "пауза" if paused else
+            ("лимит риска · только MERGE" if risk_halted else ("торгует" if running else "остановлен"))
+        )
         equity = st.get("equity", 0) or 0
         cash = st.get("cash", 0) or 0
         day = st.get("day_pnl")
