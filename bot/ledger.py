@@ -17,10 +17,8 @@ class Ledger:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        except Exception:
-            fallback = "/tmp/polybot.db"
-            self.db_path = fallback
-            self.conn = sqlite3.connect(fallback, check_same_thread=False)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to open persistent PAPER ledger at {db_path!r}") from exc
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
