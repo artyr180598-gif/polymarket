@@ -1126,9 +1126,27 @@ class TradingEngine:
             })
         windows.sort(key=lambda x: x["remain_sec"])
         risk_halt_reason = self._risk_halt_reason()
+        price_ready = bool(self._rtds_ok and all(
+            t.cl_spot is not None and t.cl_twap60 is not None
+            and time.monotonic() - t.cl_recv_mono <= 5.0
+            and time.monotonic() - t.cl_twap_recv_mono <= 5.0
+            for t in self.trackers.values()
+        ))
+        if not self.running:
+            entry_halt_reason = "service_stopped"
+        elif self.paused:
+            entry_halt_reason = "manual_pause"
+        elif risk_halt_reason:
+            entry_halt_reason = risk_halt_reason
+        elif not price_ready:
+            entry_halt_reason = "polybolt_credentials_missing" if self._price_feed_mode == "polybolt_unconfigured" else "waiting_for_fresh_chainlink"
+        else:
+            entry_halt_reason = ""
         return {
             "mode": self.cfg.trading_mode,
             "running": self.running and not self.paused,
+            "entry_ready": not bool(entry_halt_reason),
+            "entry_halt_reason": entry_halt_reason,
             "risk_halted": bool(risk_halt_reason),
             "risk_halt_reason": risk_halt_reason,
             "paused": self.paused,
@@ -1150,20 +1168,10 @@ class TradingEngine:
                 else fee_regime_label()
             ),
             "assets": self.cfg.enabled_assets,
-            "streams_ok": bool(self._rtds_ok and all(
-                t.cl_spot is not None and t.cl_twap60 is not None
-                and time.monotonic() - t.cl_recv_mono <= 5.0
-                and time.monotonic() - t.cl_twap_recv_mono <= 5.0
-                for t in self.trackers.values()
-            )),
+            "streams_ok": price_ready,
             "rtds_ok": self._rtds_ok,
             "price_feed_mode": self._price_feed_mode,
-            "chainlink_twap_ready": all(
-                t.cl_spot is not None and t.cl_twap60 is not None
-                and time.monotonic() - t.cl_recv_mono <= 5.0
-                and time.monotonic() - t.cl_twap_recv_mono <= 5.0
-                for t in self.trackers.values()
-            ),
+            "chainlink_twap_ready": price_ready,
             "fill_history": self._fill_history[:20],
             "merge_history": self._merge_history[:10],
             "resolve_history": self._resolve_history[:10],
