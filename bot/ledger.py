@@ -76,6 +76,7 @@ class Ledger:
                 fair_prob REAL NOT NULL,
                 tx_or_order_id TEXT DEFAULT '',
                 price_to_beat REAL,
+                final_price REAL,
                 window_start_ts REAL,
                 window_end_ts REAL
             );
@@ -130,7 +131,7 @@ class Ledger:
         if "fees" not in merge_columns:
             cur.execute("ALTER TABLE merges ADD COLUMN fees REAL NOT NULL DEFAULT 0.0")
         fill_columns = {row[1] for row in cur.execute("PRAGMA table_info(fills)").fetchall()}
-        for name in ("price_to_beat", "window_start_ts", "window_end_ts"):
+        for name in ("price_to_beat", "final_price", "window_start_ts", "window_end_ts"):
             if name not in fill_columns:
                 cur.execute(f"ALTER TABLE fills ADD COLUMN {name} REAL")
         self.conn.commit()
@@ -152,6 +153,7 @@ class Ledger:
         fair_prob: float,
         tx_or_order_id: str = "",
         price_to_beat: float | None = None,
+        final_price: float | None = None,
         window_start_ts: float | None = None,
         window_end_ts: float | None = None,
         ts: float | None = None,
@@ -161,14 +163,14 @@ class Ledger:
             """
             INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
                                shares, price, notional, fee, fair_prob, tx_or_order_id,
-                               price_to_beat, window_start_ts, window_end_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               price_to_beat, final_price, window_start_ts, window_end_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 t, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
                 round(shares, 4), round(price, 4), round(shares * price, 4),
                 round(fee, 5), round(fair_prob, 4), tx_or_order_id,
-                price_to_beat, window_start_ts, window_end_ts,
+                price_to_beat, final_price, window_start_ts, window_end_ts,
             ),
         )
         self.conn.commit()
@@ -349,6 +351,28 @@ class Ledger:
             (mode, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def update_window_prices(
+        self,
+        *,
+        mode: str,
+        slug: str,
+        price_to_beat: float | None = None,
+        final_price: float | None = None,
+    ) -> None:
+        """Persist newly observed oracle boundary prices on all fills for a window."""
+        if price_to_beat is None and final_price is None:
+            return
+        self.conn.execute(
+            """
+            UPDATE fills
+            SET price_to_beat = COALESCE(?, price_to_beat),
+                final_price = COALESCE(?, final_price)
+            WHERE mode = ? AND slug = ?
+            """,
+            (price_to_beat, final_price, mode, slug),
+        )
+        self.conn.commit()
 
     def update_merge_fees(self, merge_id: int, fees: float) -> None:
         """Backfill fee allocation for legacy merge rows without changing their PnL basis."""
