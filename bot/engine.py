@@ -1080,6 +1080,8 @@ class TradingEngine:
             windows.append({
                 "slug": w.slug, "asset": w.asset, "remain_sec": round(w.remain_sec, 1),
                 "price_to_beat": w.price_to_beat,
+                "fee_rate": w.fee_rate,
+                "fee_exponent": w.fee_exponent,
                 "fair_up": round(fair, 4) if fair is not None else None,
                 "net_shares": round(w.net_shares, 2),
                 "up_shares": round(w.up_shares, 2),
@@ -1106,7 +1108,11 @@ class TradingEngine:
             "stats": stats,
             "windows": windows,
             "events": self.events[-40:],
-            "fee_regime": fee_regime_label(),
+            "fee_regime": (
+                "Gamma per-market feeSchedule"
+                if any(w.fee_rate is not None for w in self.windows.values())
+                else fee_regime_label()
+            ),
             "assets": self.cfg.enabled_assets,
             "streams_ok": bool(self._rtds_ok and all(
                 t.cl_spot is not None and t.cl_twap60 is not None
