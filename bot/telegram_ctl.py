@@ -205,12 +205,21 @@ class TelegramController:
         paused = st.get("paused")
         risk_halted = bool(st.get("risk_halted"))
         risk_reason = st.get("risk_halt_reason")
-        state_emoji = "⏸" if paused else ("⚠️" if risk_halted else ("🟢" if running else "⏹"))
+        halt_reason = st.get("entry_halt_reason")
+        entry_ready = bool(st.get("entry_ready"))
         halt_label = "дневной лимит убытка" if risk_reason == "daily_loss" else "лимит серии убытков"
-        state_txt = (
-            "пауза" if paused else
-            (f"{halt_label} · только MERGE" if risk_halted else ("торгует" if running else "остановлен"))
-        )
+        if paused:
+            state_emoji, state_txt = "⏸", "пауза"
+        elif risk_halted:
+            state_emoji, state_txt = "⚠️", f"{halt_label} · только MERGE"
+        elif halt_reason == "polybolt_credentials_missing":
+            state_emoji, state_txt = "⚠️", "нет PolyBolt API credentials"
+        elif halt_reason == "waiting_for_fresh_chainlink":
+            state_emoji, state_txt = "⏳", "ожидание свежего Chainlink/TWAP"
+        elif entry_ready:
+            state_emoji, state_txt = "🟢", "торгует"
+        else:
+            state_emoji, state_txt = "⏹", "остановлен"
         equity = st.get("equity", 0) or 0
         cash = st.get("cash", 0) or 0
         day = st.get("day_pnl")
