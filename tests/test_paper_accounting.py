@@ -12,6 +12,14 @@ from bot.twap_model import AssetPriceTracker
 
 
 class TwapTests(unittest.TestCase):
+    def test_out_of_order_chainlink_sample_is_ignored(self):
+        tracker = AssetPriceTracker("BTC")
+        base = int(time.time())
+        tracker.on_chainlink_spot(100.0, base * 1000)
+        tracker.on_chainlink_spot(90.0, (base - 1) * 1000)
+        self.assertEqual(tracker.cl_spot, 100.0)
+        self.assertEqual(tracker.cl_spot_ts, float(base))
+
     def test_twap_requires_full_sixty_seconds(self):
         tracker = AssetPriceTracker("BTC")
         base = 1_800_000_000.0
