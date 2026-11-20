@@ -1,4 +1,4 @@
-"""TradingEngine — honest paper: real CLOB best-ask + depth + taker fees."""
+"""PAPER-only engine: real Polymarket RTDS prices and CLOB REST quotes, virtual fills."""
 
 from __future__ import annotations
 
@@ -344,37 +344,6 @@ class TradingEngine:
                 merged += await self._execute_merge(w)
         self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
         return {"canceled": 0, "merged_usd": round(merged, 2)}
-
-    async def _fetch_spot(self, asset: str) -> Optional[float]:
-        timeout = aiohttp.ClientTimeout(total=8)
-        cb = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}.get(asset)
-        if cb:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(f"https://api.coinbase.com/v2/prices/{cb}/spot") as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            px = float((d.get("data") or {}).get("amount") or 0)
-                            if px > 0:
-                                return px
-            except Exception:
-                pass
-        kr = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}.get(asset)
-        if kr:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(f"https://api.kraken.com/0/public/Ticker?pair={kr}") as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            for v in (d.get("result") or {}).values():
-                                c0 = (v.get("c") or [None])[0]
-                                if c0:
-                                    px = float(c0)
-                                    if px > 0:
-                                        return px
-            except Exception:
-                pass
-        return None
 
     async def _rtds_loop(self) -> None:
         """Consume actual Polymarket RTDS Chainlink/Binance feeds."""
