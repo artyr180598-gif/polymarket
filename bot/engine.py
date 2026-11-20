@@ -41,10 +41,16 @@ class WindowState:
     last_trade_mono: float = 0.0
     resolved: bool = False
     merge_in_flight: bool = False
+    up_fees: float = 0.0
+    down_fees: float = 0.0
 
     @property
     def remain_sec(self) -> float:
         return max(0.0, self.end_ts - time.time())
+
+    @property
+    def seconds_after_end(self) -> float:
+        return time.time() - self.end_ts
 
     @property
     def net_shares(self) -> float:
@@ -133,6 +139,8 @@ class TradingEngine:
         self._fill_history: List[Dict[str, Any]] = []
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
+        self._rtds_ok = False
+        self._day_key = time.strftime("%Y-%m-%d", time.gmtime())
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
