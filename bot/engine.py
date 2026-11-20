@@ -697,7 +697,6 @@ class TradingEngine:
             {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60, "provider": "chainlink"}},
         ]
         while self.running:
-            last_seq: Dict[str, int] = {}
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
                     async with session.ws_connect("wss://ws-live-v2.polymarket.com/ws", heartbeat=90) as ws:
@@ -721,44 +720,44 @@ class TradingEngine:
                         self._price_feed_connected = True
                         delay = 1.0
                         self._log_event("INFO", "PolyBolt authenticated · Chainlink spot + native 60s TWAP", notify=True)
+                        last_ping = time.monotonic()
                         while self.running:
                             try:
-                                msg = await ws.receive(timeout=30.0)
+                                msg = await ws.receive(timeout=5.0)
                             except asyncio.TimeoutError:
-                                await ws.send_json({"op": "ping"})
-                                tracker = self.trackers.get("BTC")
-                                if (
-                                    tracker is None
-                                    or time.monotonic() - tracker.cl_recv_mono > 30.0
-                                    or time.monotonic() - tracker.cl_twap_recv_mono > 30.0
-                                ):
-                                    raise ConnectionError("PolyBolt Chainlink feed stale for more than 30 seconds")
-                                continue
-                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                msg = None
+                            if msg is not None and msg.type == aiohttp.WSMsgType.TEXT:
                                 try:
                                     frame = json.loads(msg.data)
                                 except (TypeError, ValueError):
-                                    continue
+                                    frame = None
                                 if isinstance(frame, dict):
                                     if frame.get("op") == "error":
                                         raise RuntimeError(f"PolyBolt stream error: {frame.get('code')}")
                                     channel = str(frame.get("channel") or "")
                                     if channel in ("price.crypto", "price.crypto.twap") and frame.get("v") == 1:
-                                        dropped = int(frame.get("dropped") or 0)
-                                        seq = frame.get("seq")
+                                        dropped = frame.get("dropped", 0)
+                                        if type(dropped) is not int or dropped < 0:
+                                            raise ConnectionError("PolyBolt returned invalid dropped-frame metadata")
                                         if dropped > 0:
                                             raise ConnectionError(f"PolyBolt dropped {dropped} {channel} updates")
-                                        if isinstance(seq, int):
-                                            previous = last_seq.get(channel)
-                                            if previous is not None and seq != previous + 1:
-                                                raise ConnectionError(f"PolyBolt {channel} sequence gap: {previous} -> {seq}")
-                                            last_seq[channel] = seq
                                     try:
                                         self._handle_polybolt_frame(frame)
                                     except Exception as exc:
                                         log.debug("Ignoring malformed PolyBolt frame: %s", exc)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg is not None and msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
+
+                            tracker = self.trackers.get("BTC")
+                            if (
+                                tracker is None
+                                or time.monotonic() - tracker.cl_recv_mono > 30.0
+                                or time.monotonic() - tracker.cl_twap_recv_mono > 30.0
+                            ):
+                                raise ConnectionError("PolyBolt Chainlink feed stale for more than 30 seconds")
+                            if time.monotonic() - last_ping >= 30.0:
+                                await ws.send_json({"op": "ping"})
+                                last_ping = time.monotonic()
                         self._price_feed_connected = False
                         self._price_ok = False
                         self._streams_ok = False
