@@ -865,7 +865,7 @@ class TradingEngine:
                 for w in list(self.windows.values()):
                     if w.resolved:
                         continue
-                    if w.remain_sec > -3:
+                    if w.seconds_after_end < 3:
                         continue
                     await self._resolve(w)
             except Exception as e:
@@ -889,18 +889,8 @@ class TradingEngine:
                                 winner = "Up" if payouts and float(payouts[0]) > 0 else "Down"
         except Exception:
             pass
-        spot = getattr(self.trackers[w.asset], "cl_spot", None)
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
-        if winner is None and w.price_to_beat is not None and spot is not None:
-            winner = "Up" if spot >= w.price_to_beat else "Down"
-        if winner is None and w.remain_sec <= -20:
-            if w.price_to_beat and spot:
-                winner = "Up" if spot >= w.price_to_beat else "Down"
-            elif w.up_shares >= w.down_shares:
-                winner = "Down"
-            else:
-                winner = "Up"
         if winner is None:
             return
         if w.up_shares < 0.01 and w.down_shares < 0.01:
@@ -908,7 +898,9 @@ class TradingEngine:
             return
         payout = float(w.up_shares if winner == "Up" else w.down_shares)
         gross_cost = float(w.up_cost + w.down_cost)
+        total_fees = float(w.up_fees + w.down_fees)
         gross = payout - gross_cost
+        self._roll_day()
         self.cash += payout
         self.realized_pnl += gross
         self.day_pnl += gross
@@ -919,13 +911,14 @@ class TradingEngine:
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
                 price_to_beat=w.price_to_beat, final_price=w.final_price or spot,
                 up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
-                merged_pairs=0.0, gross_cost=gross_cost, total_fees=0.0, total_payout=payout,
+                merged_pairs=0.0, gross_cost=gross_cost, total_fees=total_fees, total_payout=payout,
             )
         except Exception as e:
             log.warning("record_resolution: %s", e)
-        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "pnl": gross})
+        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "fees": total_fees, "pnl": gross - total_fees})
         self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
+        w.up_fees = w.down_fees = 0.0
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
         if gross >= 0:
@@ -947,7 +940,7 @@ class TradingEngine:
         now = time.time()
         windows = []
         for w in self.windows.values():
-            if w.resolved or w.end_ts < now - 3:
+            if w.resolved or (w.end_ts < now - 3 and w.up_shares < 0.01 and w.down_shares < 0.01):
                 continue
             fair = None
             if w.price_to_beat is not None:
@@ -984,6 +977,8 @@ class TradingEngine:
             "fee_regime": fee_regime_label(),
             "assets": self.cfg.enabled_assets,
             "streams_ok": self._price_ok,
+            "rtds_ok": self._rtds_ok,
+            "chainlink_twap_ready": all(t.cl_twap60 is not None and time.monotonic() - t.cl_twap_recv_mono <= 5.0 for t in self.trackers.values()),
             "fill_history": self._fill_history[:20],
             "merge_history": self._merge_history[:10],
             "resolve_history": self._resolve_history[:10],
