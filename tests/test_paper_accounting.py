@@ -397,7 +397,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(tracker.cl_twap60, 101.0, places=4)
             engine.ledger.conn.close()
 
-    async def test_polybolt_carried_forward_spot_can_anchor_window_boundary(self):
+    async def test_polybolt_carried_forward_spot_cannot_anchor_window_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "polybolt-carry.db"))
             engine = TradingEngine(cfg)
@@ -418,7 +418,17 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     "full_accuracy_value": "100.0000", "is_carried_forward": True,
                 },
             })
-            self.assertAlmostEqual(window.price_to_beat, 100.0, places=4)
+            self.assertIsNone(window.price_to_beat)
+            engine._handle_polybolt_frame({
+                "v": 1, "channel": "price.crypto", "ts": now_ms + 1, "seq": 2,
+                "snapshot": False,
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink", "timestamp": now_ms + 1,
+                    "received_at": now_ms + 1, "value": 100.25,
+                    "full_accuracy_value": "100.2500", "is_carried_forward": False,
+                },
+            })
+            self.assertAlmostEqual(window.price_to_beat, 100.25, places=4)
             engine.ledger.conn.close()
 
     async def test_resolution_does_not_guess_from_inventory_when_oracle_is_unavailable(self):
