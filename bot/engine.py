@@ -418,6 +418,193 @@ class TradingEngine:
         return {"canceled": 0, "merged_usd": round(merged, 2)}
 
     async def _rtds_loop(self) -> None:
+        if self.cfg.has_polybolt_credentials:
+            self._price_feed_mode = "polybolt"
+            await self._polybolt_loop()
+        else:
+            self._price_feed_mode = "legacy_rtds"
+            self._log_event(
+                "WARNING",
+                "PolyBolt credentials are not configured; using deprecated legacy RTDS fallback. "
+                "No credentials are created or changed by the bot.",
+                notify=True,
+            )
+            await self._legacy_rtds_loop()
+
+    async def _polybolt_wait_ack(self, ws, rid: str, expected_op: str, channels: List[str]) -> None:
+        pending = set(channels)
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(f"PolyBolt {expected_op} acknowledgement timed out")
+            msg = await ws.receive(timeout=remaining)
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    frame = json.loads(msg.data)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(frame, dict):
+                    continue
+                if frame.get("op") == "error" and str(frame.get("rid")) == rid:
+                    raise RuntimeError(f"PolyBolt rejected {expected_op}: {frame.get('code')}")
+                if frame.get("op") == expected_op and str(frame.get("rid")) == rid:
+                    if not pending:
+                        return
+                    channel = frame.get("channel")
+                    if channel in pending:
+                        pending.remove(channel)
+                    if not pending:
+                        return
+                else:
+                    self._handle_polybolt_frame(frame)
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise ConnectionError("PolyBolt connection closed during handshake")
+
+    def _handle_polybolt_frame(self, frame: Dict[str, Any]) -> None:
+        if frame.get("v") != 1:
+            return
+        channel = str(frame.get("channel") or "")
+        payload = frame.get("payload") or {}
+        if channel not in ("price.crypto", "price.crypto.twap") or not isinstance(payload, dict):
+            return
+        symbol = str(payload.get("symbol") or "").lower()
+        source = str(payload.get("source") or "").lower()
+        if symbol != "btcusd" or source != "chainlink":
+            return
+
+        snapshot = bool(frame.get("snapshot", False))
+        frame_ts = int(frame.get("ts") or 0)
+        if snapshot:
+            points = payload.get("data") or []
+            if not isinstance(points, list) or not points:
+                return
+            point = max(
+                (p for p in points if isinstance(p, dict)),
+                key=lambda p: int(p.get("timestamp") or 0),
+                default=None,
+            )
+            if point is None:
+                return
+            value_raw = point.get("full_accuracy_value", point.get("value"))
+            sample_ts = int(point.get("timestamp") or frame_ts)
+            received_ts = frame_ts
+            carried_forward = False
+        else:
+            value_raw = payload.get("full_accuracy_value", payload.get("value"))
+            sample_ts = int(payload.get("timestamp") or frame_ts)
+            received_ts = int(payload.get("received_at") or frame_ts)
+            carried_forward = bool(payload.get("is_carried_forward", False))
+
+        try:
+            price = float(value_raw)
+        except (TypeError, ValueError):
+            return
+        if price <= 0 or sample_ts <= 0:
+            return
+
+        tracker = self.trackers.get("BTC")
+        if tracker is None:
+            return
+        if channel == "price.crypto.twap":
+            if not snapshot and int(payload.get("window_seconds") or 0) != 60:
+                return
+            if frame_ts <= 0:
+                return
+            tracker.on_chainlink_twap60(price, frame_ts)
+            self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
+            self._streams_ok = self._price_ok
+            return
+
+        tracker.on_chainlink_spot(
+            price,
+            sample_ts,
+            compute_twap=False,
+            received_at_ms=received_ts if received_ts > 0 else None,
+        )
+        event_ts = (received_ts if carried_forward and received_ts > 0 else sample_ts) / 1000.0
+        self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
+        self._streams_ok = self._price_ok
+        for window in self.windows.values():
+            if window.asset != "BTC":
+                continue
+            elapsed = event_ts - window.start_ts
+            after_end = event_ts - window.end_ts
+            if window.price_to_beat is None and 0 <= elapsed <= 20:
+                window.price_to_beat = price
+                try:
+                    self.ledger.update_window_prices(
+                        mode=self.cfg.trading_mode, slug=window.slug, price_to_beat=price,
+                    )
+                except Exception as exc:
+                    log.warning("persist PolyBolt opening price %s: %s", window.slug, exc)
+            if window.final_price is None and 0 <= after_end <= 30:
+                window.final_price = price
+                try:
+                    self.ledger.update_window_prices(
+                        mode=self.cfg.trading_mode, slug=window.slug, final_price=price,
+                    )
+                except Exception as exc:
+                    log.warning("persist PolyBolt closing price %s: %s", window.slug, exc)
+
+    async def _polybolt_loop(self) -> None:
+        delay = 1.0
+        subscriptions = [
+            {"channel": "price.crypto", "filter": {"symbol": "btcusd", "provider": "chainlink"}},
+            {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60, "provider": "chainlink"}},
+        ]
+        while self.running:
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
+                    async with session.ws_connect("wss://ws-live-v2.polymarket.com/ws", heartbeat=90) as ws:
+                        await ws.send_json({
+                            "op": "auth",
+                            "rid": "1",
+                            "auth": {
+                                "apiKey": self.cfg.polymarket_api_key,
+                                "secret": self.cfg.polymarket_api_secret,
+                                "passphrase": self.cfg.polymarket_api_passphrase,
+                            },
+                            "chainlink_api_key": self.cfg.chainlink_api_key,
+                        })
+                        await self._polybolt_wait_ack(ws, "1", "authed", [])
+                        await ws.send_json({"op": "subscribe", "rid": "2", "subscriptions": subscriptions})
+                        await self._polybolt_wait_ack(
+                            ws, "2", "subscribed", ["price.crypto", "price.crypto.twap"]
+                        )
+                        self._rtds_ok = True
+                        delay = 1.0
+                        self._log_event("INFO", "PolyBolt authenticated · Chainlink spot + native 60s TWAP", notify=True)
+                        while self.running:
+                            try:
+                                msg = await ws.receive(timeout=30.0)
+                            except asyncio.TimeoutError:
+                                await ws.send_json({"op": "ping"})
+                                continue
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    frame = json.loads(msg.data)
+                                except (TypeError, ValueError):
+                                    continue
+                                if isinstance(frame, dict):
+                                    self._handle_polybolt_frame(frame)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                        self._rtds_ok = False
+                        self._price_ok = False
+                        self._streams_ok = False
+            except asyncio.CancelledError:
+                self._rtds_ok = False
+                raise
+            except Exception as exc:
+                self._rtds_ok = False
+                self._price_ok = False
+                self._streams_ok = False
+                log.warning("PolyBolt disconnected: %s", exc)
+            await asyncio.sleep(delay)
+            delay = min(30.0, delay * 2.0)
+
+    async def _legacy_rtds_loop(self) -> None:
         """Consume actual Polymarket RTDS Chainlink/Binance feeds."""
         delay = 1.0
         symbols = {"BTC": ("btc/usd", "btcusdt"), "ETH": ("eth/usd", "ethusdt"), "SOL": ("sol/usd", "solusdt")}
@@ -434,7 +621,7 @@ class TradingEngine:
                         await ws.send_json({"action": "subscribe", "subscriptions": subscriptions})
                         self._rtds_ok = True
                         delay = 1.0
-                        self._log_event("INFO", "Polymarket RTDS connected · Chainlink + Binance", notify=True)
+                        self._log_event("WARNING", "Legacy RTDS connected · Chainlink spot + locally computed TWAP (deprecated feed)", notify=True)
                         while self.running:
                             try:
                                 msg = await ws.receive(timeout=5.0)
