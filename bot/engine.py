@@ -1010,13 +1010,25 @@ class TradingEngine:
             "events": self.events[-40:],
             "fee_regime": fee_regime_label(),
             "assets": self.cfg.enabled_assets,
-            "streams_ok": self._price_ok,
+            "streams_ok": bool(self._rtds_ok and all(
+                t.cl_spot is not None and t.cl_twap60 is not None
+                and time.monotonic() - t.cl_recv_mono <= 5.0
+                and time.monotonic() - t.cl_twap_recv_mono <= 5.0
+                for t in self.trackers.values()
+            )),
             "rtds_ok": self._rtds_ok,
-            "chainlink_twap_ready": all(t.cl_twap60 is not None and time.monotonic() - t.cl_twap_recv_mono <= 5.0 for t in self.trackers.values()),
+            "chainlink_twap_ready": all(
+                t.cl_spot is not None and t.cl_twap60 is not None
+                and time.monotonic() - t.cl_recv_mono <= 5.0
+                and time.monotonic() - t.cl_twap_recv_mono <= 5.0
+                for t in self.trackers.values()
+            ),
             "fill_history": self._fill_history[:20],
             "merge_history": self._merge_history[:10],
             "resolve_history": self._resolve_history[:10],
             "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
             "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
-            "merge_profit": round(sum(x.get("locked_pnl", 0) for x in self._merge_history), 2),
+            "merge_profit": round(float(stats.get("merged_net_pnl", 0.0) or 0.0), 2),
+            "merge_profit_gross": round(float(stats.get("merged_locked_pnl", 0.0) or 0.0), 2),
+            "merge_fees": round(float(stats.get("merged_fees", 0.0) or 0.0), 4),
         }
