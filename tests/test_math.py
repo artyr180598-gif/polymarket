@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -278,6 +279,13 @@ class BookTests(unittest.TestCase):
             trade_price=Decimal("0.41"), trade_size=Decimal("50"), taker_side="SELL",
         )
         self.assertEqual(got, Decimal("0"))
+        # A cheaper print traded somebody else's bid. It must not eat our queue.
+        queue, got = apply_trade_print(
+            queue_ahead=Decimal("13"), remaining=Decimal("12"), our_price=Decimal("0.57"),
+            trade_price=Decimal("0.48"), trade_size=Decimal("14"), taker_side="SELL",
+        )
+        self.assertEqual(got, Decimal("0"))
+        self.assertEqual(queue, Decimal("13"))
 
     def test_paper_broker_fills_only_on_a_sell_print(self) -> None:
         port = Portfolio(initial_cash=Decimal("1000"), cash=Decimal("1000"))
@@ -293,10 +301,15 @@ class BookTests(unittest.TestCase):
         )
         self.assertIsNotNone(order_id)
         self.assertEqual(port.cash, Decimal("996"))
-        # Book disappearing is not a fill.
-        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "BUY"), [])
-        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("20"), "SELL"), [])
-        fills = broker.on_trade("t", Decimal("0.40"), Decimal("40"), "SELL")
+        now = time.time()
+        # Book disappearing is not a fill. A print below our price is not either.
+        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "BUY", trade_ts=now), [])
+        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "SELL", trade_ts=now), [])
+        self.assertEqual(broker.orders[order_id].queue_ahead, Decimal("50"))
+        # A print from before we joined the book does not fill, even at our price.
+        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("100"), "SELL", trade_ts=now - 30), [])
+        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("20"), "SELL", trade_ts=now), [])
+        fills = broker.on_trade("t", Decimal("0.40"), Decimal("40"), "SELL", trade_ts=now)
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].shares, Decimal("10"))
         self.assertEqual(fills[0].fee, Decimal("0"))
@@ -309,6 +322,67 @@ class BookTests(unittest.TestCase):
         port.unlock(order_id)
         self.assertEqual(port.equity({("m", "Up"): Decimal("0.40")}), Decimal("1000"))
         self.assertEqual(port.markets["m"].lot("Up").shares, Decimal("10"))
+
+    def test_a_failed_tape_fetch_does_not_seed_history(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        engine._session = object()
+        window = Window(
+            slug="m", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "t", "Down": "d"}, start_ts=0, end_ts=10**12,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        order_id = engine.paper.place(
+            outcome="Up", token_id="t", price=Decimal("0.57"), shares=Decimal("12"),
+            best_ask=Decimal("0.58"), bid_size_at_price=Decimal("0"),
+        )
+        window.orders["Up@0.57"] = order_id
+
+        async def failed(_cid):
+            return None
+
+        engine._recent_trades = failed  # type: ignore[method-assign]
+        asyncio.run(engine._paper_prints(window))
+        self.assertFalse(window.prints_seeded)
+
+        async def empty(_cid):
+            return []
+
+        engine._recent_trades = empty  # type: ignore[method-assign]
+        asyncio.run(engine._paper_prints(window))
+        self.assertTrue(window.prints_seeded)
+
+        async def late_history(_cid):
+            # The 11:20:06 cluster: sells below 0.57, timestamped before the order.
+            return [
+                {"transaction_hash": "a", "token_id": "t", "price": "0.51", "size": "1", "timestamp": 100, "side": "SELL"},
+                {"transaction_hash": "b", "token_id": "t", "price": "0.47", "size": "2", "timestamp": 110, "side": "SELL"},
+                {"transaction_hash": "c", "token_id": "t", "price": "0.48", "size": "5", "timestamp": 110, "side": "SELL"},
+                {"transaction_hash": "d", "token_id": "t", "price": "0.48", "size": "14", "timestamp": 110, "side": "SELL"},
+            ]
+
+        engine.paper.orders[order_id].placed_at = 1000
+        engine._recent_trades = late_history  # type: ignore[method-assign]
+        self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
+        self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("12"))
+
+        async def real_print(_cid):
+            return [
+                {"transaction_hash": "e", "token_id": "t", "price": "0.57", "size": "20", "timestamp": 1000, "side": "SELL"},
+            ]
+
+        engine._recent_trades = real_print  # type: ignore[method-assign]
+        fills = asyncio.run(engine._paper_prints(window))
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].shares, Decimal("12"))
 
 
 class ResolutionTests(unittest.TestCase):

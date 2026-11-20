@@ -626,21 +626,24 @@ class TradingEngine:
                 params={"condition": condition_id, "limit": "80"},
             ) as response:
                 if response.status != 200:
-                    return []
+                    return None
                 payload = await response.json(content_type=None)
         except Exception as exc:  # noqa: BLE001
             self._note("ERROR", f"Лента сделок: {exc}")
-            return []
+            return None
         rows = payload.get("data") if isinstance(payload, dict) else payload
         return list(rows or [])
 
     async def _paper_prints(self, window: Window) -> list[Fill]:
         """Seed the tape once, then fill only on new sell prints.
 
-        The first response is history. Filling it would pretend we were
-        already at the front of the queue.
+        The first successful response is history. A failed fetch is not a
+        seed: the next good page would otherwise look like new trades and
+        fill orders with prints from before they were placed.
         """
         rows = await self._recent_trades(window.condition_id)
+        if rows is None:
+            return []
         fresh: list[tuple[str, dict]] = []
         for row in rows:
             key = "|".join(
@@ -663,8 +666,16 @@ class TradingEngine:
                 size = D(row.get("size"))
             except (TypeError, ValueError, ArithmeticError):
                 continue
+            raw_ts = row.get("timestamp")
+            try:
+                trade_ts = float(raw_ts) if raw_ts is not None else None
+            except (TypeError, ValueError):
+                trade_ts = None
             fills.extend(
-                self.paper.on_trade(str(row.get("token_id") or ""), price, size, str(row.get("side") or ""))
+                self.paper.on_trade(
+                    str(row.get("token_id") or ""), price, size, str(row.get("side") or ""),
+                    trade_ts=trade_ts,
+                )
             )
         return fills
 
