@@ -749,14 +749,34 @@ class TradingEngine:
 
     async def _open(self, w, outcome, price, size, reason, fee: float = 0.0) -> None:
         price = round(max(0.01, min(0.99, float(price))), 2)
-        size = round(max(5.0, float(size)), 2)
-        fee = float(fee or 0.0)
+        size = round(max(0.0, float(size)), 2)
+        if size < 5.0:
+            return
+        # Recalculate the exact fee after price/size rounding; the caller's estimate
+        # may be stale if the available cash forced a smaller clip.
+        fee = calc_taker_fee_usdc(size, price, w.asset, w.timeframe)
         cost = price * size + fee
         if cost > self.cash:
-            size = max(5.0, round((self.cash * 0.95 - fee) / max(price, 0.01), 2))
-            cost = price * size + fee
-            if size < 5:
+            size = round(size * max(0.0, self.cash * 0.95) / cost, 2)
+            if size < 5.0:
                 return
+            fee = calc_taker_fee_usdc(size, price, w.asset, w.timeframe)
+            cost = price * size + fee
+        if cost > self.cash:
+            return
+
+        # Persist first. A failed SQLite write must never create an un-recoverable PAPER fill.
+        try:
+            self.ledger.record_fill(
+                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
+                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
+                reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
+                tx_or_order_id=f"paper-clob-{int(time.time() * 1000)}",
+            )
+        except Exception as exc:
+            log.error("record_fill failed; PAPER fill rejected: %s", exc)
+            return
+
         self.cash -= cost
         self.fees_paid += fee
         self._roll_day()
@@ -775,19 +795,10 @@ class TradingEngine:
         fill = {
             "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
             "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
-            "fee": fee, "notional": cost,
+            "fee": fee, "notional": price * size,
         }
         self._fill_history.insert(0, fill)
         self._fill_history = self._fill_history[:80]
-        try:
-            self.ledger.record_fill(
-                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
-                reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
-                tx_or_order_id=f"paper-clob-{int(time.time())}",
-            )
-        except Exception as e:
-            log.warning("record_fill: %s", e)
         side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
         why = {
             "favorite": "фаворит книги, как mo-money",
