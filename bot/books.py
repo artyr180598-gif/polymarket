@@ -1,7 +1,7 @@
 """Order-book helpers and the paper maker fill model.
 
-Paper fills only when a sell print trades the queue in front of a resting
-bid. A cancel that shrinks the book is not a fill. We never charge a maker fee.
+Paper fills only when a sell print at our price trades the queue in front
+of a resting bid. A cheaper print and a cancel are not fills. No maker fee.
 """
 
 from __future__ import annotations
@@ -57,10 +57,11 @@ def apply_trade_print(
 ) -> tuple[Decimal, Decimal]:
     """Return (new_queue_ahead, shares_filled).
 
-    Only a sell print fills a resting bid, and only by the size of that
-    print. A cancel that shrinks the book is not a trade and fills nothing.
-    Prints above our price do not reach us. We never fill more than the
-    print itself, so a one-lot trade cannot empty a large order.
+    Only a sell print at our own price fills a resting bid, and only by
+    the size of that print. A cancel that shrinks the book is not a trade.
+    A print above us traded a better bid. A print below us traded a worse
+    bid. Neither one is our queue, so neither one fills us or moves it.
+    We never fill more than the print itself.
     """
     queue = D(queue_ahead)
     left = D(remaining)
@@ -69,7 +70,8 @@ def apply_trade_print(
         return queue, _ZERO
     if (taker_side or "").upper() == "BUY":
         return queue, _ZERO
-    if D(trade_price) > D(our_price):
+    # Half a thousandth: 0.570000 and 0.57 are the same level, 0.569 is not.
+    if abs(D(trade_price) - D(our_price)) > Decimal("0.0005"):
         return queue, _ZERO
     queue -= size
     if queue >= 0:

@@ -8,6 +8,7 @@ the geoblock check fail, the engine stays paused instead of pretending to trade.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -40,6 +41,7 @@ class Resting:
     remaining: Decimal
     original: Decimal
     queue_ahead: Decimal
+    placed_at: float = 0.0
     prev_level: Decimal | None = None
     seen_book: bool = False
 
@@ -77,6 +79,7 @@ class PaperBroker:
             remaining=shares,
             original=shares,
             queue_ahead=D(bid_size_at_price),
+            placed_at=time.time(),
             prev_level=D(bid_size_at_price),
             seen_book=True,
         )
@@ -95,11 +98,23 @@ class PaperBroker:
         for order_id in list(self.orders):
             self.cancel(order_id)
 
-    def on_trade(self, token_id: str, price: Decimal, size: Decimal, taker_side: str) -> list[Fill]:
-        """Fill only from a trade print. Book updates alone do nothing."""
+    def on_trade(
+        self,
+        token_id: str,
+        price: Decimal,
+        size: Decimal,
+        taker_side: str,
+        trade_ts: float | None = None,
+    ) -> list[Fill]:
+        """Fill only from a trade print at our price after we joined the book."""
         fills: list[Fill] = []
         for order in list(self.orders.values()):
             if order.token_id != token_id or order.remaining <= 0:
+                continue
+            # data-api timestamps are whole seconds. A print from the second
+            # we joined can be ours. A print from an earlier second cannot:
+            # the tape often shows it only after the order is already up.
+            if trade_ts is None or float(trade_ts) + 1 < order.placed_at:
                 continue
             queue, got = apply_trade_print(
                 queue_ahead=order.queue_ahead,
