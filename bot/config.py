@@ -220,7 +220,7 @@ class BotConfig:
             builder_passphrase=os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip(),
             polymarket_api_key=os.getenv("POLYMARKET_API_KEY", "").strip(),
             polymarket_api_secret=os.getenv("POLYMARKET_API_SECRET", "").strip(),
-            polymarket_api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE", "").strip(),
+            polymarket_api_passphrase=os.getenv("POLYMARKET_PASSPHRASE", os.getenv("POLYMARKET_API_PASSPHRASE", "")).strip(),
             chainlink_api_key=os.getenv("CHAINLINK_API_KEY", "").strip(),
             dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip(),
             # Railway injects PORT; prefer it over DASHBOARD_PORT (local/VPS default 8080)
