@@ -56,6 +56,53 @@ class TwapTests(unittest.TestCase):
         self.assertAlmostEqual(tracker.cl_twap60, 129.5, places=6)
 
 
+class PolyBoltFrameTests(unittest.TestCase):
+    def test_native_chainlink_spot_and_twap_use_exact_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = TradingEngine(BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "polybolt.db")))
+            ts = int(time.time() * 1000)
+            common = {"v": 1, "seq": 1, "dropped": 0, "ts": ts, "snapshot": False}
+            engine._handle_polybolt_frame({
+                **common,
+                "channel": "price.crypto",
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink",
+                    "timestamp": ts, "received_at": ts,
+                    "full_accuracy_value": "100000.123456",
+                    "is_carried_forward": False,
+                },
+            })
+            engine._handle_polybolt_frame({
+                **common,
+                "seq": 2,
+                "channel": "price.crypto.twap",
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink",
+                    "window_seconds": 60, "timestamp": ts,
+                    "full_accuracy_value": "99999.987654",
+                },
+            })
+            tracker = engine.trackers["BTC"]
+            self.assertAlmostEqual(tracker.cl_spot, 100000.123456, places=6)
+            self.assertAlmostEqual(tracker.cl_twap60, 99999.987654, places=6)
+            engine.ledger.conn.close()
+
+    def test_approximate_price_without_full_accuracy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = TradingEngine(BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "polybolt.db")))
+            ts = int(time.time() * 1000)
+            engine._handle_polybolt_frame({
+                "v": 1, "seq": 1, "dropped": 0, "ts": ts, "snapshot": False,
+                "channel": "price.crypto",
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink",
+                    "timestamp": ts, "value": 100000.0,
+                },
+            })
+            self.assertIsNone(engine.trackers["BTC"].cl_spot)
+            engine.ledger.conn.close()
+
+
 class ResolutionPayoutTests(unittest.TestCase):
     def test_normalized_winner_and_split_payouts(self):
         self.assertEqual(
