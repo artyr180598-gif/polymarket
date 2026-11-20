@@ -47,6 +47,26 @@ class TwapTests(unittest.TestCase):
             tracker.on_chainlink_spot(100.0 + second, int((base + second) * 1000))
         self.assertIsNone(tracker.cl_twap60)
 
+    def test_polybolt_tracks_received_time_separately_from_sample_time(self):
+        tracker = AssetPriceTracker("BTC")
+        now_ms = int(time.time() * 1000)
+        tracker.on_chainlink_spot(
+            100.0, now_ms - 120_000, compute_twap=False, received_at_ms=now_ms,
+        )
+        self.assertEqual(tracker.cl_spot_ts, (now_ms - 120_000) / 1000.0)
+        self.assertEqual(tracker.cl_received_ts, now_ms / 1000.0)
+        self.assertLess(time.monotonic() - tracker.cl_recv_mono, 1.0)
+
+    def test_native_twap_keeps_source_age_and_receive_age_separate(self):
+        tracker = AssetPriceTracker("BTC")
+        now_ms = int(time.time() * 1000)
+        tracker.on_chainlink_twap60(
+            101.0, now_ms - 10_000, received_at_ms=now_ms,
+        )
+        self.assertEqual(tracker.cl_twap60_ts, (now_ms - 10_000) / 1000.0)
+        self.assertEqual(tracker.cl_twap_received_ts, now_ms / 1000.0)
+        self.assertLess(time.monotonic() - tracker.cl_twap_recv_mono, 1.0)
+
     def test_twap_is_time_weighted_over_sixty_seconds(self):
         tracker = AssetPriceTracker("BTC")
         base = 1_800_000_000.0
@@ -227,6 +247,53 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(restored.down_shares, 5.0, places=4)
             self.assertAlmostEqual(restored.up_cost + restored.down_cost, 4.5, places=4)
             self.assertAlmostEqual(restored.gross_buy, 9.0, places=4)
+            engine.ledger.conn.close()
+
+    async def test_start_does_not_crash_when_polybolt_credentials_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "start.db"))
+            engine = TradingEngine(cfg)
+            with patch.object(engine, "_discover", new_callable=AsyncMock):
+                await engine.start()
+                await asyncio.sleep(0.02)
+                self.assertTrue(engine.running)
+                self.assertFalse(engine.snapshot()["entry_ready"])
+                self.assertEqual(engine.snapshot()["entry_halt_reason"], "polybolt_credentials_missing")
+                self.assertTrue(all(not task.done() for task in engine._tasks))
+                await engine.stop()
+            engine.ledger.conn.close()
+
+    async def test_discovery_retains_expired_unresolved_inventory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "discovery.db"))
+            engine = TradingEngine(cfg)
+            now = time.time()
+            open_slug = f"btc-updown-5m-{int(now) - 500}"
+            empty_slug = f"btc-updown-5m-{int(now) - 600}"
+            resolved_slug = f"btc-updown-5m-{int(now) - 700}"
+            engine.windows[open_slug] = WindowState(
+                slug=open_slug, asset="BTC", timeframe="5m", condition_id="c1",
+                up_token="u", down_token="d", start_ts=now - 800, end_ts=now - 500,
+                up_shares=12.0, up_cost=6.0,
+            )
+            engine.windows[empty_slug] = WindowState(
+                slug=empty_slug, asset="BTC", timeframe="5m", condition_id="c2",
+                up_token="u", down_token="d", start_ts=now - 900, end_ts=now - 600,
+            )
+            engine.windows[resolved_slug] = WindowState(
+                slug=resolved_slug, asset="BTC", timeframe="5m", condition_id="c3",
+                up_token="u", down_token="d", start_ts=now - 1000, end_ts=now - 700,
+                resolved=True,
+            )
+            async def stop_after_discovery():
+                engine.running = False
+            engine.running = True
+            with patch.object(engine, "_discover", new=AsyncMock(side_effect=stop_after_discovery)):
+                await engine._discovery_loop()
+            self.assertIn(open_slug, engine.windows)
+            self.assertNotIn(empty_slug, engine.windows)
+            self.assertNotIn(resolved_slug, engine.windows)
+            self.assertAlmostEqual(engine._inventory_usd(), 6.0, places=4)
             engine.ledger.conn.close()
 
     async def test_polybolt_uses_provider_spot_and_native_twap(self):
