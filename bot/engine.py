@@ -575,17 +575,23 @@ class TradingEngine:
     async def _strategy_loop(self) -> None:
         while self.running:
             try:
-                if not self.paused and not self._risk_halted():
-                    for w in list(self.windows.values()):
-                        if w.resolved:
-                            continue
-                        if w.remain_sec < 4:
-                            await self._try_merge(w)
-                            continue
-                        await self._run(w)
+                risk_halted = self._risk_halted()
+                for w in list(self.windows.values()):
+                    if w.resolved:
+                        continue
+                    # A risk halt blocks new exposure, not risk-reducing MERGE actions.
+                    if risk_halted:
                         await self._try_merge(w)
-            except Exception as e:
-                log.warning("strategy: %s", e)
+                        continue
+                    if self.paused:
+                        continue
+                    if w.remain_sec < 4:
+                        await self._try_merge(w)
+                        continue
+                    await self._run(w)
+                    await self._try_merge(w)
+            except Exception as exc:
+                log.warning("strategy: %s", exc)
             await asyncio.sleep(1.5)
 
     def _risk_halted(self) -> bool:
