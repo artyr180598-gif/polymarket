@@ -245,10 +245,11 @@ class Ledger:
             SELECT COUNT(*) AS merge_count, COALESCE(SUM(pairs), 0) AS merged_usd,
                    COALESCE(SUM(locked_pnl), 0) AS merged_pnl,
                    COALESCE(SUM(fees), 0) AS merged_fees,
-                   COALESCE(SUM(locked_pnl - fees), 0) AS merged_net_pnl
+                   COALESCE(SUM(locked_pnl - fees), 0) AS merged_net_pnl,
+                   COALESCE(SUM(CASE WHEN ts >= ? THEN locked_pnl - fees ELSE 0 END), 0) AS today_merged_net_pnl
             FROM merges WHERE mode = ?
             """,
-            (mode,),
+            (today_start, mode),
         ).fetchone()
 
         total_fills = int(f_row["total_fills"])
@@ -266,9 +267,9 @@ class Ledger:
             "resolved_markets": resolved_mkts,
             "win_markets": int(r_row["win_mkts"]),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
-            "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
-            "realized_net_pnl": round(float(r_row["net_pnl"]), 2),
-            "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
+            "realized_gross_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]), 2),
+            "realized_net_pnl": round(float(r_row["net_pnl"]) + float(m_row["merged_net_pnl"]), 2),
+            "today_net_pnl": round(float(r_row["today_net_pnl"]) + float(m_row["today_merged_net_pnl"]), 2),
             "merge_count": int(m_row["merge_count"]),
             "merged_usd": round(float(m_row["merged_usd"]), 2),
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
