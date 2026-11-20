@@ -56,7 +56,7 @@ class AssetPriceTracker:
         self.bn_recv_mono: float = 0.0
         self.basis_ema: Optional[float] = None
         self.basis_alpha: float = 0.035
-        self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=400)
+        self.cl_spot_hist: Deque[Tuple[float, float]] = deque(maxlen=5000)
         self.cl_twap_hist: Deque[Tuple[float, float]] = deque(maxlen=900)
         self.boundary_twap: Dict[int, float] = {}
         default_v = DEFAULT_SIGMA_1S.get(self.asset, 0.00012) ** 2
@@ -176,7 +176,10 @@ class AssetPriceTracker:
         # lead-lag: binance vs chainlink basis-adjusted
         lead_bps = 0.0
         s_hat = s_cl
-        if self.bn_spot is not None and self.basis_ema is not None:
+        if (
+            self.bn_spot is not None and self.basis_ema is not None
+            and time.monotonic() - self.bn_recv_mono <= 5.0
+        ):
             residual = self.bn_spot - self.basis_ema - s_cl
             lead_bps = 10000.0 * residual / s_cl if s_cl else 0.0
             s_hat = s_cl + 0.55 * residual
