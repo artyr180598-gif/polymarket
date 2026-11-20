@@ -545,8 +545,15 @@ class TradingEngine:
             if market.get("closed") is True or market.get("active") is False:
                 return None
             metadata = event.get("eventMetadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (TypeError, ValueError):
+                    metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
             price_to_beat = None
-            raw_strike = metadata.get("priceToBeat") if isinstance(metadata, dict) else None
+            raw_strike = metadata.get("priceToBeat")
             if raw_strike is not None:
                 try:
                     parsed_strike = float(raw_strike)
