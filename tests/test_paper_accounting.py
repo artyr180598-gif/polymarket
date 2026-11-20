@@ -175,6 +175,57 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(restored.gross_buy, 9.0, places=4)
             engine.ledger.conn.close()
 
+    async def test_polybolt_uses_provider_spot_and_native_twap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "polybolt.db"))
+            engine = TradingEngine(cfg)
+            now_ms = int(time.time() * 1000)
+            engine._handle_polybolt_frame({
+                "v": 1, "channel": "price.crypto", "ts": now_ms, "seq": 1,
+                "snapshot": False,
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink", "timestamp": now_ms,
+                    "received_at": now_ms, "value": 100.0,
+                    "full_accuracy_value": "100.0000", "is_carried_forward": False,
+                },
+            })
+            engine._handle_polybolt_frame({
+                "v": 1, "channel": "price.crypto.twap", "ts": now_ms + 1, "seq": 2,
+                "snapshot": False,
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink", "timestamp": now_ms + 1,
+                    "window_seconds": 60, "value": 101.0, "full_accuracy_value": "101.0000",
+                },
+            })
+            tracker = engine.trackers["BTC"]
+            self.assertAlmostEqual(tracker.cl_spot, 100.0, places=4)
+            self.assertAlmostEqual(tracker.cl_twap60, 101.0, places=4)
+            engine.ledger.conn.close()
+
+    async def test_polybolt_carried_forward_spot_can_anchor_window_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "polybolt-carry.db"))
+            engine = TradingEngine(cfg)
+            now_ms = int(time.time() * 1000)
+            now = now_ms / 1000.0
+            window = WindowState(
+                slug=f"btc-updown-5m-{int(now - 2)}", asset="BTC", timeframe="5m",
+                condition_id="condition", up_token="up", down_token="down",
+                start_ts=now - 2, end_ts=now + 298,
+            )
+            engine.windows[window.slug] = window
+            engine._handle_polybolt_frame({
+                "v": 1, "channel": "price.crypto", "ts": now_ms, "seq": 1,
+                "snapshot": False,
+                "payload": {
+                    "symbol": "btcusd", "source": "chainlink", "timestamp": now_ms - 120000,
+                    "received_at": now_ms, "value": 100.0,
+                    "full_accuracy_value": "100.0000", "is_carried_forward": True,
+                },
+            })
+            self.assertAlmostEqual(window.price_to_beat, 100.0, places=4)
+            engine.ledger.conn.close()
+
     async def test_resolution_does_not_guess_from_inventory_when_oracle_is_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "no-guess.db"))
