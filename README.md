@@ -68,7 +68,7 @@ bot/
   config.py             BotConfig + 3 strategy presets
   fees.py               Exact Polymarket fee formula + 2026-11-20 switchover
   twap_model.py         Rolling 60-second Chainlink TWAP + Binance lead-lag
-  engine.py             Polymarket RTDS Chainlink/Binance feed + CLOB REST quote polling
+  engine.py             PolyBolt Chainlink spot/TWAP when credentials exist; legacy RTDS fallback + CLOB REST
   ledger.py             SQLite WAL (fills / merges / resolutions / equity)
   execution.py          PaperExecutor (queue-aware) + LiveExecutor
   engine.py             discovery + mo-money-inspired PAPER strategy + risk
@@ -112,7 +112,8 @@ Private / personal use. Not financial advice. Trade at your own risk.
 
 ## Important execution limits
 
-- Chainlink and Binance prices are consumed from Polymarket RTDS. The 60-second TWAP is computed from Chainlink samples and trading waits until a full, fresh 60-second series is available.
+- Preferred source is authenticated PolyBolt Chainlink spot + native 60-second TWAP. It requires `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`, and `CHAINLINK_API_KEY` in Railway Variables. The bot never creates or changes these credentials.
+- If those credentials are absent, the bot labels and uses the deprecated legacy RTDS feed as a temporary fallback. If that feed stops, fresh Chainlink/TWAP checks block new entries; there is no Coinbase-as-Chainlink fallback.
 - CLOB best ask and depth are currently polled through REST; there is no CLOB market WebSocket implementation in this build.
 - PAPER fills are virtual assumptions at the observed best ask. They do not model queue position, latency, partial fills, adverse selection, or actual exchange execution.
 - The observed wallet's Maker-heavy execution is not cloned here: the current implementation is TAKER-first, as explicitly configured for this experiment.
