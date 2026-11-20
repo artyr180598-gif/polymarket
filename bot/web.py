@@ -197,7 +197,7 @@ function render(){
       card("Как заработано", '<div class="row"><span>Реализовано</span><b class="'+cls(s.realized)+'">'+money(s.realized)+'</b></div><div class="row"><span>Оценка открытого</span><b class="'+cls(s.unrealized)+'">'+money(s.unrealized)+'</b></div><div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div><div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div><div class="row"><span>Ребейт тейкера</span><span>'+money(s.taker_rebates||0)+'</span></div><div class="row"><span>Награды</span><span>'+money(s.liquidity_rewards||0)+'</span></div><div class="row"><span>В заявках</span><span>$'+Number(s.reserved).toFixed(2)+'</span></div>');
   } else if (tab === "positions") {
     const rows = s.positions || [];
-    el.innerHTML = rows.length ? rows.map(p => card(p.asset+" "+p.timeframe+" · "+(p.outcome==="Up"?"Вверх":"Вниз"),
+    el.innerHTML = rows.length ? '<p><small>Открыто позиций: '+rows.length+'</small></p>' + rows.map(p => card(p.asset+" "+p.timeframe+" · "+(p.outcome==="Up"?"Вверх":"Вниз"),
       '<div class="row"><span>Штук</span><span>'+p.shares+'</span></div><div class="row"><span>Вход</span><span>'+p.avg_price+'</span></div><div class="row"><span>Сейчас</span><span>'+p.mark+'</span></div><div class="row"><span>Результат</span><b class="'+cls(p.unrealized)+'">'+money(p.unrealized)+'</b></div>')).join("")
       : card("Позиции", "<p>Открытых позиций нет.</p>");
   } else if (tab === "trades") {
@@ -237,7 +237,7 @@ function render(){
       edgeCard(s);
   } else if (tab === "strategy") {
     const L = s.limits || {};
-    el.innerHTML = card("Что делает бот", "<ul><li>Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль.</li><li>Цены от 1¢ до 98¢. Дешёвые крылья дают лучшую отдачу на доллар. Выше 90¢ тоже небольшой плюс.</li><li>Средняя цена двух сторон вместе не выше 99¢. Дороже — вторую сторону не покупаем и убыточную пару не сливаем.</li><li>Пару дешевле $1 меняем на доллар. Остаток ждёт официальный итог. Продаж нет.</li><li>Оракул Chainlink для входа не нужен. Победителя назначаем, когда Gamma или CLOB закрыли рынок. До этого позиция ждёт и в реализованное не входит.</li></ul>")
+    el.innerHTML = card("Что делает бот", "<ul><li>Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль. Продаж нет.</li><li>Цены от 1¢ до 98¢, до трёх ступеней через 2¢. На фаворите размер больше, на крыле меньше.</li><li>Пока ни одной стороны нет, две цены вместе не дороже 99¢. Когда одна сторона уже куплена, вторую добираем до суммы 103¢.</li><li>Пару дешевле $1 меняем на доллар. Остаток ждёт, пока Gamma или CLOB закроют рынок.</li><li>По умолчанию BTC, ETH, SOL и XRP, окна 5м, 15м, 1ч и 4ч. Сутки, DOGE и BNB выключены.</li></ul>")
       + card("Лимиты", '<div class="row"><span>Заявка</span><span>$'+L.order_clip_usd+'</span></div><div class="row"><span>На одно окно</span><span>$'+L.max_window_risk_usd+'</span></div><div class="row"><span>На все окна</span><span>$'+L.max_total_exposure_usd+'</span></div><div class="row"><span>Стоп за день</span><span>−$'+L.max_daily_loss_usd+'</span></div><div class="row"><span>Комиссии</span><span>'+s.fee_regime+'</span></div><div class="row"><span>Активы</span><span>'+(s.assets||[]).join(", ")+'</span></div>')
       + edgeCard(s);
   } else if (tab === "errors") {

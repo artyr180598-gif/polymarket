@@ -40,6 +40,25 @@ _ZERO = Decimal(0)
 WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
+def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
+    """Start timestamps of the window that contains ``now``.
+
+    4h and daily crypto markets are midnight-to-midnight US Eastern, not UTC.
+    """
+    if timeframe == "4h":
+        phases = (0, 3600)
+    elif timeframe == "1d":
+        phases = (4 * 3600, 5 * 3600)
+    else:
+        phases = (0,)
+    bases: list[int] = []
+    for phase in phases:
+        base = int((now - phase) // sec) * sec + phase
+        if base not in bases:
+            bases.append(base)
+    return bases
+
+
 @dataclass
 class Window:
     slug: str
@@ -284,31 +303,35 @@ class TradingEngine:
                 sec = WINDOW_SECONDS.get(tf)
                 if not sec:
                     continue
-                base = int(now // sec) * sec
-                for offset in (0, 1):
-                    start = base + offset * sec
-                    end = start + sec
-                    if end < now - 30:
-                        continue
-                    slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
-                    if slug in self.windows:
-                        continue
-                    meta = await self._gamma(slug)
-                    if not meta:
-                        continue
-                    self.windows[slug] = Window(
-                        slug=slug,
-                        asset=asset,
-                        timeframe=tf,
-                        condition_id=meta["condition_id"],
-                        tokens=meta["tokens"],
-                        start_ts=float(start),
-                        end_ts=float(end),
-                        tick=meta["tick"],
-                        min_shares=meta["min_shares"],
-                        fee_rate=meta["fee_rate"],
-                        fee_exponent=meta["fee_exponent"],
-                    )
+                # 5m/15m/1h start on the UTC grid. 4h and 1d follow US Eastern,
+                # so the phase is 0 or 4h in summer and 1h or 5h in winter.
+                # 5m and 15m also look at the next window. Longer ones do not.
+                offsets = (0, 1) if tf in ("5m", "15m") else (0,)
+                for base in _window_bases(tf, sec, now):
+                    for offset in offsets:
+                        start = base + offset * sec
+                        end = start + sec
+                        if end < now - 30:
+                            continue
+                        slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
+                        if slug in self.windows:
+                            continue
+                        meta = await self._gamma(slug)
+                        if not meta:
+                            continue
+                        self.windows[slug] = Window(
+                            slug=slug,
+                            asset=asset,
+                            timeframe=tf,
+                            condition_id=meta["condition_id"],
+                            tokens=meta["tokens"],
+                            start_ts=float(start),
+                            end_ts=float(end),
+                            tick=meta["tick"],
+                            min_shares=meta["min_shares"],
+                            fee_rate=meta["fee_rate"],
+                            fee_exponent=meta["fee_exponent"],
+                        )
 
     async def _gamma(self, slug: str) -> dict | None:
         if self._session is None:

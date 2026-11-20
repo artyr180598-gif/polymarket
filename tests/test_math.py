@@ -218,10 +218,12 @@ class StrategyTests(unittest.TestCase):
     def test_respects_cash_and_min_size(self) -> None:
         self.assertEqual(self._quote("0.62", "0.30", free_cash=Decimal("0.2")), [])
 
-    def test_does_not_lock_a_pair_above_99_cents(self) -> None:
+    def test_does_not_lock_a_pair_above_the_hedge_cap(self) -> None:
+        # Down is already 0.70. Up at 0.40 would make 1.10, and 0.40 is more
+        # than 5¢ above the 1.03 cap, so the Up bid is dropped.
         quotes = self._quote(
-            "0.38", "0.20",
-            held_avg={"Down": Decimal("0.68")},
+            "0.40", "0.20",
+            held_avg={"Down": Decimal("0.70")},
             held_shares={"Down": Decimal("20")},
         )
         self.assertTrue(all(q.outcome != "Up" for q in quotes))
@@ -230,13 +232,45 @@ class StrategyTests(unittest.TestCase):
         from bot.strategy import projected_avg
         avg = projected_avg(Decimal("10"), Decimal("0.60"), Decimal("10"), Decimal("0.40"))
         self.assertEqual(avg, Decimal("0.50"))
-        # Adding the other side at 0.50 would make 1.00, which plan_quotes refuses.
+        # Up is already held at 0.50, so the hedge cap is $1.03. Down at 0.10 fits.
+        # Down at 0.54 would make 1.04 and is refused.
         quotes = self._quote(
             "0.50", "0.10",
             held_avg={"Up": avg},
             held_shares={"Up": Decimal("20")},
         )
-        self.assertTrue(all(q.outcome != "Down" or q.price + avg <= Decimal("0.99") for q in quotes))
+        self.assertTrue(any(q.outcome == "Down" for q in quotes))
+
+    def test_hedge_allows_the_lagging_side_up_to_103_cents(self) -> None:
+        fresh = self._quote("0.60", "0.42")
+        if fresh:
+            tops = {}
+            for q in fresh:
+                tops[q.outcome] = max(tops.get(q.outcome, q.price), q.price)
+            if len(tops) == 2:
+                self.assertLessEqual(tops["Up"] + tops["Down"], Decimal("0.99"))
+        hedged = self._quote(
+            "0.60", "0.42",
+            held_avg={"Up": Decimal("0.60")},
+            held_shares={"Up": Decimal("12")},
+        )
+        down = [q for q in hedged if q.outcome == "Down"]
+        self.assertTrue(down)
+        self.assertLessEqual(max(q.price for q in down) + Decimal("0.60"), Decimal("1.03"))
+        # 0.60 already held plus a 0.50 touch is 1.10. Shading stops at 5¢, so Down is dropped.
+        too_rich = self._quote(
+            "0.60", "0.50",
+            held_avg={"Up": Decimal("0.60")},
+            held_shares={"Up": Decimal("12")},
+        )
+        self.assertTrue(all(q.outcome != "Down" for q in too_rich))
+
+    def test_four_hour_windows_follow_us_eastern(self) -> None:
+        from bot.engine import _window_bases
+        # 4:00–8:00 AM ET on 20 Nov 2026, which is not on the UTC 4h grid.
+        bases = _window_bases("4h", 14400, 1795165200 + 100)
+        self.assertIn(1795165200, bases)
+        self.assertIn(1795176000, _window_bases("1h", 3600, 1795176000 + 10))
 
     def test_entry_window(self) -> None:
         self.assertFalse(in_entry_window(0.2, 200))
@@ -322,6 +356,14 @@ class BookTests(unittest.TestCase):
         port.unlock(order_id)
         self.assertEqual(port.equity({("m", "Up"): Decimal("0.40")}), Decimal("1000"))
         self.assertEqual(port.markets["m"].lot("Up").shares, Decimal("10"))
+        port.buy_fill(
+            slug="eth-updown-1h-1", condition_id="e", asset="ETH", timeframe="1h",
+            outcome="Down", shares=Decimal("5"), price=Decimal("0.20"), fee=Decimal("0"),
+        )
+        marks = {("m", "Up"): Decimal("0.40"), ("eth-updown-1h-1", "Down"): Decimal("0.25")}
+        # 1000 - 4 - 1 = 995 cash, marks 4 + 1.25.
+        self.assertEqual(port.equity(marks), Decimal("1000.25"))
+        self.assertEqual(len(port.markets), 2)
 
     def test_a_failed_tape_fetch_does_not_seed_history(self) -> None:
         import asyncio

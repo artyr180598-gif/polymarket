@@ -97,8 +97,8 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         self.assertEqual(snap["stats"]["win_rate_pct"], 0.0)
         self.assertIsNone(snap["edge"]["d7"]["roi_pct"])
         self.assertEqual(snap["limits"]["order_clip_usd"], 16)
-        self.assertEqual(snap["limits"]["max_window_risk_usd"], 140)
-        self.assertEqual(snap["limits"]["max_total_exposure_usd"], 420)
+        self.assertEqual(snap["limits"]["max_window_risk_usd"], 80)
+        self.assertEqual(snap["limits"]["max_total_exposure_usd"], 640)
         self.assertEqual(snap["limits"]["max_daily_loss_usd"], 160)
         ctl = TelegramController(engine)
         for text in (ctl._status(), ctl._pnl(), ctl._positions(), ctl._fills(), ctl._markets(), ctl._strategy(), ctl._errors(), ctl._help()):
