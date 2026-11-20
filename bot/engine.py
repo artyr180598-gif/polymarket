@@ -522,9 +522,11 @@ class TradingEngine:
         if tracker is None:
             return
         if channel == "price.crypto.twap":
-            if frame_ts <= 0:
+            if sample_ts <= 0:
                 return
-            tracker.on_chainlink_twap60(price, frame_ts)
+            # The sample timestamp belongs to the oracle value; frame_ts is
+            # transport/receive time and must not rewrite the market data clock.
+            tracker.on_chainlink_twap60(price, sample_ts)
             self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
             self._streams_ok = self._price_ok
             return
