@@ -982,8 +982,8 @@ class TradingEngine:
                 continue
             fair = None
             if w.price_to_beat is not None:
-                tr = self.trackers[w.asset]
-                if getattr(tr, "cl_spot", None) is not None:
+                tr = self.trackers.get(w.asset)
+                if tr is not None and getattr(tr, "cl_spot", None) is not None:
                     try:
                         fair = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts)).prob_up
                     except Exception:
@@ -1030,8 +1030,8 @@ class TradingEngine:
             "fill_history": self._fill_history[:20],
             "merge_history": self._merge_history[:10],
             "resolve_history": self._resolve_history[:10],
-            "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
-            "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
+            "wins": sum(1 for x in self._resolve_history if x.get("pnl", x.get("gross", 0)) > 0),
+            "losses": sum(1 for x in self._resolve_history if x.get("pnl", x.get("gross", 0)) < 0),
             "merge_profit": round(float(stats.get("merged_net_pnl", 0.0) or 0.0), 2),
             "merge_profit_gross": round(float(stats.get("merged_locked_pnl", 0.0) or 0.0), 2),
             "merge_fees": round(float(stats.get("merged_fees", 0.0) or 0.0), 4),
