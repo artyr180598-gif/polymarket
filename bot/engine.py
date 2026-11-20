@@ -458,7 +458,10 @@ class TradingEngine:
                     if not pending:
                         return
                 else:
-                    self._handle_polybolt_frame(frame)
+                    try:
+                        self._handle_polybolt_frame(frame)
+                    except Exception as exc:
+                        log.debug("Ignoring malformed PolyBolt frame during handshake: %s", exc)
             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 raise ConnectionError("PolyBolt connection closed during handshake")
 
@@ -588,7 +591,10 @@ class TradingEngine:
                                 except (TypeError, ValueError):
                                     continue
                                 if isinstance(frame, dict):
-                                    self._handle_polybolt_frame(frame)
+                                    try:
+                                        self._handle_polybolt_frame(frame)
+                                    except Exception as exc:
+                                        log.debug("Ignoring malformed PolyBolt frame: %s", exc)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
                         self._rtds_ok = False
