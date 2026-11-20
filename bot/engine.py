@@ -342,6 +342,13 @@ class TradingEngine:
 
     def resume(self) -> None:
         self.paused = False
+        if (
+            self.cfg.max_consecutive_losses > 0
+            and self.consecutive_losses >= self.cfg.max_consecutive_losses
+            and self.day_pnl > -self.cfg.max_daily_loss_usd
+        ):
+            self.consecutive_losses = 0
+            self._log_event("WARNING", "Ручной сброс лимита серии убытков; дневной лимит остаётся активным", notify=True)
         self._log_event("INFO", "Торговля возобновлена", notify=True)
 
     def set_preset(self, key: str) -> bool:
