@@ -895,19 +895,26 @@ class TradingEngine:
         winner = None
         try:
             timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
-                async with s.get(url) as r:
-                    if r.status == 200:
-                        data = await r.json()
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
                         items = data.get("data") if isinstance(data, dict) else data
                         if items:
-                            item = items[0] if isinstance(items, list) else items
-                            if item.get("status") == "resolved":
+                            candidates = items if isinstance(items, list) else [items]
+                            for item in candidates:
+                                if item.get("status") != "resolved":
+                                    continue
                                 payouts = item.get("payouts") or []
-                                winner = "Up" if payouts and float(payouts[0]) > 0 else "Down"
-        except Exception:
-            pass
+                                if len(payouts) >= 2:
+                                    winner = "Up" if float(payouts[0]) > float(payouts[1]) else "Down"
+                                    break
+        except Exception as exc:
+            log.debug("resolution API not ready for %s: %s", w.slug, exc)
+
+        # Fallback is permitted only with a Chainlink sample captured after the
+        # window ended. Never infer a winner from current spot or inventory size.
         if winner is None and w.final_price is not None and w.price_to_beat is not None:
             winner = "Up" if w.final_price >= w.price_to_beat else "Down"
         if winner is None:
@@ -915,35 +922,43 @@ class TradingEngine:
         if w.up_shares < 0.01 and w.down_shares < 0.01:
             w.resolved = True
             return
+
         payout = float(w.up_shares if winner == "Up" else w.down_shares)
         gross_cost = float(w.up_cost + w.down_cost)
         total_fees = float(w.up_fees + w.down_fees)
         gross = payout - gross_cost
-        self._roll_day()
-        self.cash += payout
-        self.realized_pnl += gross
-        self.day_pnl += gross
-        self.consecutive_losses = self.consecutive_losses + 1 if gross < 0 else 0
+        net = gross - total_fees
         try:
             self.ledger.record_resolution(
                 mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
                 asset=w.asset, timeframe=w.timeframe, winner=winner,
-                price_to_beat=w.price_to_beat, final_price=w.final_price or spot,
+                price_to_beat=w.price_to_beat, final_price=w.final_price,
                 up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
                 merged_pairs=0.0, gross_cost=gross_cost, total_fees=total_fees, total_payout=payout,
             )
-        except Exception as e:
-            log.warning("record_resolution: %s", e)
-        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "fees": total_fees, "pnl": gross - total_fees})
+        except Exception as exc:
+            log.error("record_resolution failed; PAPER settlement held for retry: %s", exc)
+            return
+
+        self._roll_day()
+        self.cash += payout
+        self.realized_pnl += gross
+        self.day_pnl += gross
+        self.consecutive_losses = self.consecutive_losses + 1 if net < 0 else 0
+        self._resolve_history.insert(0, {
+            "ts": time.time(), "slug": w.slug, "winner": winner,
+            "gross": gross, "fees": total_fees, "pnl": net,
+        })
         self._resolve_history = self._resolve_history[:40]
         w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
         w.up_fees = w.down_fees = 0.0
         w.resolved = True
         side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
-        if gross >= 0:
-            msg = f"✅ Окно закрылось · победил {side}\nПрибыль: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
-        else:
-            msg = f"❌ Окно закрылось · победил {side}\nУбыток: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+        msg = (
+            f"✅ Окно закрылось · победил {side}\n"
+            f"Gross: ${gross:+.2f} · fees: ${total_fees:.2f}\n"
+            f"Net: ${net:+.2f}\n<code>{w.slug}</code>"
+        )
         self._log_event("INFO", msg, notify=True)
 
     def snapshot(self) -> Dict[str, Any]:
