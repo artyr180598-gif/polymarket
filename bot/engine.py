@@ -617,13 +617,16 @@ class TradingEngine:
                 log.warning("strategy: %s", exc)
             await asyncio.sleep(1.5)
 
-    def _risk_halted(self) -> bool:
+    def _risk_halt_reason(self) -> str:
         self._roll_day()
         if self.day_pnl <= -self.cfg.max_daily_loss_usd:
-            return True
+            return "daily_loss"
         if self.cfg.max_consecutive_losses > 0 and self.consecutive_losses >= self.cfg.max_consecutive_losses:
-            return True
-        return False
+            return "consecutive_losses"
+        return ""
+
+    def _risk_halted(self) -> bool:
+        return bool(self._risk_halt_reason())
 
     def _inventory_usd(self) -> float:
         return sum((w.up_cost + w.down_cost) for w in self.windows.values() if not w.resolved)
@@ -1021,9 +1024,12 @@ class TradingEngine:
                 "mergeable": round(w.mergeable_pairs, 2),
             })
         windows.sort(key=lambda x: x["remain_sec"])
+        risk_halt_reason = self._risk_halt_reason()
         return {
             "mode": self.cfg.trading_mode,
             "running": self.running and not self.paused,
+            "risk_halted": bool(risk_halt_reason),
+            "risk_halt_reason": risk_halt_reason,
             "paused": self.paused,
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
