@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import time
 import unittest
@@ -198,6 +199,25 @@ class LedgerStatsTests(unittest.TestCase):
             self.assertEqual(stats["today_net_pnl"], 0.8)
             self.assertEqual(stats["merged_net_pnl"], 0.8)
             ledger.conn.close()
+
+
+class PolyBoltConfigTests(unittest.TestCase):
+    def test_three_clob_credentials_are_sufficient_and_chainlink_key_is_optional(self):
+        cfg = BotConfig(
+            polymarket_api_key="key",
+            polymarket_api_secret="secret",
+            polymarket_api_passphrase="passphrase",
+        )
+        self.assertTrue(cfg.has_polybolt_credentials)
+        self.assertFalse(cfg.chainlink_api_key)
+
+    def test_blank_primary_passphrase_uses_supported_alias(self):
+        with patch.dict(os.environ, {
+            "POLYMARKET_PASSPHRASE": "",
+            "POLYMARKET_API_PASSPHRASE": "alias-passphrase",
+        }, clear=True):
+            cfg = BotConfig.from_env()
+        self.assertEqual(cfg.polymarket_api_passphrase, "alias-passphrase")
 
 
 class StrategySafetyTests(unittest.TestCase):
