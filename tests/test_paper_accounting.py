@@ -147,6 +147,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 slug=slug, asset="BTC", timeframe="5m", condition_id="condition",
                 up_token="up", down_token="down",
                 start_ts=time.time() - 700, end_ts=time.time() - 400,
+                price_to_beat=100000.0, final_price=100001.0,
                 up_shares=20.0, down_shares=5.0, up_cost=10.0, down_cost=2.5,
             )
             engine.windows[slug] = window
