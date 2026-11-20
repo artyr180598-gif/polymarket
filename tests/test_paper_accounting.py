@@ -128,6 +128,20 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine.ledger.recent_resolutions("paper"), [])
             engine.ledger.conn.close()
 
+    async def test_manual_resume_resets_only_consecutive_loss_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "risk-reset.db"))
+            engine = TradingEngine(cfg)
+            engine.consecutive_losses = cfg.max_consecutive_losses
+            engine.day_pnl = 0.0
+            engine.resume()
+            self.assertEqual(engine.consecutive_losses, 0)
+            engine.consecutive_losses = cfg.max_consecutive_losses
+            engine.day_pnl = -cfg.max_daily_loss_usd - 1.0
+            engine.resume()
+            self.assertEqual(engine.consecutive_losses, cfg.max_consecutive_losses)
+            engine.ledger.conn.close()
+
     async def test_live_mode_is_rejected_before_any_executor_starts(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = BotConfig(trading_mode="live", db_path=str(Path(tmp) / "live-block.db"))
