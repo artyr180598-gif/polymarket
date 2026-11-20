@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, Dict, Optional
@@ -94,7 +95,7 @@ class TelegramController:
                     "offset": self._offset,
                     "timeout": 0,
                     "limit": 100,
-                    "allowed_updates": ["message", "callback_query"],
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
                 }
                 async with self._session.get(f"{self._base}/getUpdates", params=params) as response:
                     if response.status != 200:
@@ -356,7 +357,11 @@ class TelegramController:
         assert self._session
         while self._running:
             try:
-                params = {"offset": self._offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}
+                params = {
+                    "offset": self._offset,
+                    "timeout": 25,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                }
                 async with self._session.get(f"{self._base}/getUpdates", params=params) as r:
                     if r.status != 200:
                         await asyncio.sleep(3)
