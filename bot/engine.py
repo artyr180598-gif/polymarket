@@ -633,7 +633,9 @@ class TradingEngine:
         if channel == "price.crypto.twap":
             if frame_ts <= 0:
                 return
-            tracker.on_chainlink_twap60(price, frame_ts)
+            tracker.on_chainlink_twap60(
+                price, sample_ts, received_at_ms=frame_ts if frame_ts > 0 else None,
+            )
             self._price_ok = tracker.cl_spot is not None and tracker.cl_twap60 is not None
             self._streams_ok = self._price_ok
             return
@@ -863,6 +865,7 @@ class TradingEngine:
             w.price_to_beat is None or spot is None or tr.cl_twap60 is None
             or time.monotonic() - tr.cl_recv_mono > 5.0
             or time.monotonic() - tr.cl_twap_recv_mono > 5.0
+            or time.time() - tr.cl_twap60_ts > 5.0
         ):
             return
         try:
