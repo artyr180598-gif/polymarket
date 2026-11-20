@@ -171,7 +171,7 @@ class TradingEngine:
         self._fill_history: List[Dict[str, Any]] = []
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
-        self._rtds_ok = False
+        self._price_feed_connected = False
         self._price_feed_mode = "unavailable"
         self._day_key = time.strftime("%Y-%m-%d", time.gmtime())
         self._resolve_sem = asyncio.Semaphore(5)
@@ -369,7 +369,7 @@ class TradingEngine:
             await self._restore_paper_state()
         self.running = True
         self._tasks = [
-            asyncio.create_task(self._rtds_loop(), name="rtds"),
+            asyncio.create_task(self._price_feed_loop(), name="price_feed"),
             asyncio.create_task(self._discovery_loop(), name="discovery"),
             asyncio.create_task(self._strategy_loop(), name="strategy"),
             asyncio.create_task(self._resolve_loop(), name="resolve"),
@@ -530,10 +530,10 @@ class TradingEngine:
             log.debug("Gamma market lookup %s failed: %s", slug, exc)
             return None
 
-    async def _rtds_loop(self) -> None:
+    async def _price_feed_loop(self) -> None:
         if not self.cfg.has_polybolt_credentials:
             self._price_feed_mode = "polybolt_unconfigured"
-            self._rtds_ok = False
+            self._price_feed_connected = False
             self._price_ok = False
             self._streams_ok = False
             self._log_event(
@@ -718,7 +718,7 @@ class TradingEngine:
                         await self._polybolt_wait_ack(
                             ws, "2", "subscribed", ["price.crypto", "price.crypto.twap"]
                         )
-                        self._rtds_ok = True
+                        self._price_feed_connected = True
                         delay = 1.0
                         self._log_event("INFO", "PolyBolt authenticated · Chainlink spot + native 60s TWAP", notify=True)
                         while self.running:
@@ -756,14 +756,14 @@ class TradingEngine:
                                         log.debug("Ignoring malformed PolyBolt frame: %s", exc)
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
-                        self._rtds_ok = False
+                        self._price_feed_connected = False
                         self._price_ok = False
                         self._streams_ok = False
             except asyncio.CancelledError:
-                self._rtds_ok = False
+                self._price_feed_connected = False
                 raise
             except Exception as exc:
-                self._rtds_ok = False
+                self._price_feed_connected = False
                 self._price_ok = False
                 self._streams_ok = False
                 log.warning("PolyBolt disconnected: %s", exc)
@@ -1253,7 +1253,7 @@ class TradingEngine:
             })
         windows.sort(key=lambda x: x["remain_sec"])
         risk_halt_reason = self._risk_halt_reason()
-        price_ready = bool(self._rtds_ok and all(
+        price_ready = bool(self._price_feed_connected and all(
             t.cl_spot is not None and t.cl_twap60 is not None
             and time.monotonic() - t.cl_recv_mono <= 5.0
             and time.monotonic() - t.cl_twap_recv_mono <= 5.0
@@ -1297,7 +1297,7 @@ class TradingEngine:
             ),
             "assets": self.cfg.enabled_assets,
             "streams_ok": price_ready,
-            "rtds_ok": self._rtds_ok,
+            "price_feed_connected": self._price_feed_connected,
             "price_feed_mode": self._price_feed_mode,
             "chainlink_twap_ready": price_ready,
             "fill_history": self._fill_history[:20],
