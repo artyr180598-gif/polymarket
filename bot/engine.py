@@ -229,7 +229,10 @@ class TradingEngine:
                 dn_cost = w.down_cost * pairs / w.down_shares if w.down_shares else 0.0
                 up_fee = w.up_fees * pairs / w.up_shares if w.up_shares else 0.0
                 dn_fee = w.down_fees * pairs / w.down_shares if w.down_shares else 0.0
-                allocated_fees = float(event.get("fees") or 0.0) or (up_fee + dn_fee)
+                stored_fees = float(event.get("fees") or 0.0)
+                allocated_fees = stored_fees if stored_fees > 0 else (up_fee + dn_fee)
+                if stored_fees <= 0 and allocated_fees > 0:
+                    self.ledger.update_merge_fees(int(event["id"]), allocated_fees)
                 w.up_shares = max(0.0, w.up_shares - pairs)
                 w.down_shares = max(0.0, w.down_shares - pairs)
                 w.up_cost = max(0.0, w.up_cost - up_cost)
@@ -237,7 +240,7 @@ class TradingEngine:
                 w.up_fees = max(0.0, w.up_fees - up_fee)
                 w.down_fees = max(0.0, w.down_fees - dn_fee)
                 cash += pairs
-                gross = float(event.get("locked_pnl") or (pairs - up_cost - dn_cost))
+                gross = float(event.get("locked_pnl") if event.get("locked_pnl") is not None else (pairs - up_cost - dn_cost))
                 realized_gross += gross
                 outcomes.append((ts, gross - allocated_fees))
                 if ts >= day_start_ts:
