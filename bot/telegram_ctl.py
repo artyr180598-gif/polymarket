@@ -204,10 +204,12 @@ class TelegramController:
         running = st.get("running")
         paused = st.get("paused")
         risk_halted = bool(st.get("risk_halted"))
+        risk_reason = st.get("risk_halt_reason")
         state_emoji = "⏸" if paused else ("⚠️" if risk_halted else ("🟢" if running else "⏹"))
+        halt_label = "дневной лимит убытка" if risk_reason == "daily_loss" else "лимит серии убытков"
         state_txt = (
             "пауза" if paused else
-            ("лимит риска · только MERGE" if risk_halted else ("торгует" if running else "остановлен"))
+            (f"{halt_label} · только MERGE" if risk_halted else ("торгует" if running else "остановлен"))
         )
         equity = st.get("equity", 0) or 0
         cash = st.get("cash", 0) or 0
@@ -277,7 +279,7 @@ class TelegramController:
             f"📊 Журнал\n"
             f"· Ставок: <b>{n_fills}</b>\n"
             f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses} / 0️⃣ {zeroes})\n\n"
+            f"· Завершённых окон: <b>{resolved}</b> (✅ {wins} / ❌ {losses} / 0️⃣ {zeroes})\n\n"
             f"ℹ️ ✅/❌ только если позиция дождалась конца окна.\n"
             f"Открытый инвентарь не переоценён по текущему bid/ask: это не mark-to-market и не цена ликвидации."
         )
