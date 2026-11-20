@@ -147,6 +147,9 @@ class TradingEngine:
         cfg.strategy_preset = "mo_money"
         cfg.enabled_assets = ["BTC"]
         cfg.enabled_timeframes = ["5m", "15m"]
+        if not cfg.auto_start:
+            log.warning("Ignoring AUTO_START=false; PAPER engine is configured to start automatically")
+        cfg.auto_start = True
         self.params: StrategyParams = PRESETS["mo_money"]
         self.ledger = Ledger(cfg.db_path)
         self.trackers = {a: AssetPriceTracker(a) for a in cfg.enabled_assets}
