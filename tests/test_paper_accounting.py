@@ -116,8 +116,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 mode="paper", slug=slug, condition_id="condition",
                 asset="BTC", timeframe="5m", role="TAKER_CLOB",
                 reason="favorite", fair_prob=0.6,
-                price_to_beat=100000.0, final_price=100001.0,
-                window_start_ts=start, window_end_ts=start + 300,
+                price_to_beat=100000.0, window_start_ts=start, window_end_ts=start + 300,
             )
             ledger.record_fill(
                 **common, outcome="Up", shares=10, price=0.6, fee=0.10, ts=now - 20
@@ -125,6 +124,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ledger.record_fill(
                 **common, outcome="Down", shares=10, price=0.3, fee=0.05, ts=now - 19
             )
+            ledger.update_window_prices(mode="paper", slug=slug, final_price=100001.0)
             ledger.record_merge(
                 mode="paper", slug=slug, condition_id="condition",
                 pairs=5, cost_basis=4.5, locked_pnl=0.5, ts=now - 10
