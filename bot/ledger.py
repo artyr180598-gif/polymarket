@@ -275,8 +275,11 @@ class Ledger:
             SELECT
                 COUNT(*) AS resolved_mkts,
                 COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS win_mkts,
+                COALESCE(SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END), 0) AS loss_mkts,
+                COALESCE(SUM(CASE WHEN net_pnl = 0 THEN 1 ELSE 0 END), 0) AS zero_mkts,
                 COALESCE(SUM(gross_pnl), 0) AS gross_pnl,
                 COALESCE(SUM(net_pnl), 0) AS net_pnl,
+                COALESCE(SUM(total_fees), 0) AS resolution_fees,
                 COALESCE(SUM(CASE WHEN ts >= ? THEN gross_pnl ELSE 0 END), 0) AS today_gross_pnl
             FROM resolutions WHERE mode = ?
             """,
@@ -309,6 +312,12 @@ class Ledger:
             "weighted_vol": round(float(f_row["weighted_vol"]), 2),
             "resolved_markets": resolved_mkts,
             "win_markets": int(r_row["win_mkts"]),
+            "loss_markets": int(r_row["loss_mkts"]),
+            "zero_markets": int(r_row["zero_mkts"]),
+            "resolved_gross_pnl": round(float(r_row["gross_pnl"]), 2),
+            "resolved_net_pnl": round(float(r_row["net_pnl"]), 2),
+            "resolution_fees": round(float(r_row["resolution_fees"]), 4),
+            "open_fees": round(max(0.0, float(f_row["total_fees"]) - float(m_row["merged_fees"]) - float(r_row["resolution_fees"])), 4),
             "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
             "realized_gross_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]), 2),
             "realized_net_pnl": round(float(r_row["gross_pnl"]) + float(m_row["merged_pnl"]) - float(f_row["total_fees"]), 2),
