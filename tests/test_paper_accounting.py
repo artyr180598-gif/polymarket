@@ -8,7 +8,27 @@ from unittest.mock import AsyncMock, patch
 from bot.config import BotConfig
 from bot.engine import TradingEngine, WindowState, _resolution_payouts
 from bot.ledger import Ledger
+from bot.fees import calc_taker_fee_usdc
 from bot.twap_model import AssetPriceTracker
+
+
+class FeeScheduleTests(unittest.TestCase):
+    def test_gamma_market_rate_and_exponent_override_fallback(self):
+        fee = calc_taker_fee_usdc(
+            10.0, 0.5, "BTC", "5m",
+            now_ts=1_800_000_000.0,
+            market_override_rate=0.04,
+            market_override_exponent=2.0,
+        )
+        self.assertAlmostEqual(fee, 0.025, places=5)
+
+    def test_zero_gamma_fee_rate_is_respected(self):
+        fee = calc_taker_fee_usdc(
+            10.0, 0.5, "BTC", "5m",
+            market_override_rate=0.0,
+            market_override_exponent=1.0,
+        )
+        self.assertEqual(fee, 0.0)
 
 
 class TwapTests(unittest.TestCase):
