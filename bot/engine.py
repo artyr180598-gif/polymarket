@@ -189,16 +189,19 @@ class TradingEngine:
                 w = windows.get(slug)
                 if w is None:
                     try:
-                        start_ts = float(slug.rsplit("-", 1)[-1])
+                        start_ts = float(event.get("window_start_ts") or slug.rsplit("-", 1)[-1])
                     except (TypeError, ValueError):
                         log.error("PAPER recovery skipped malformed market slug: %s", slug)
                         continue
                     timeframe = str(event.get("timeframe") or "5m")
                     duration = 900 if timeframe == "15m" else 300
+                    end_ts = float(event.get("window_end_ts") or (start_ts + duration))
+                    saved_strike = event.get("price_to_beat")
                     w = WindowState(
                         slug=slug, asset=str(event.get("asset") or "BTC"),
                         timeframe=timeframe, condition_id=str(event.get("condition_id") or ""),
-                        up_token="", down_token="", start_ts=start_ts, end_ts=start_ts + duration,
+                        up_token="", down_token="", start_ts=start_ts, end_ts=end_ts,
+                        price_to_beat=float(saved_strike) if saved_strike is not None else None,
                     )
                     windows[slug] = w
                 shares = float(event.get("shares") or 0.0)
@@ -210,6 +213,12 @@ class TradingEngine:
                 fees_paid += fee
                 if ts >= day_start_ts:
                     day_fees += fee
+                if w.price_to_beat is None and event.get("price_to_beat") is not None:
+                    w.price_to_beat = float(event["price_to_beat"])
+                if event.get("window_start_ts") is not None:
+                    w.start_ts = float(event["window_start_ts"])
+                if event.get("window_end_ts") is not None:
+                    w.end_ts = float(event["window_end_ts"])
                 if str(event.get("outcome") or "").lower() == "up":
                     w.up_shares += shares
                     w.up_cost += principal
@@ -778,6 +787,7 @@ class TradingEngine:
                 asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
                 reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
                 tx_or_order_id=f"paper-clob-{int(time.time() * 1000)}",
+                price_to_beat=w.price_to_beat, window_start_ts=w.start_ts, window_end_ts=w.end_ts,
             )
         except Exception as exc:
             log.error("record_fill failed; PAPER fill rejected: %s", exc)
