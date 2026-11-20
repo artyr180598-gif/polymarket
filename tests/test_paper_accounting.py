@@ -99,7 +99,8 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 mode="paper", slug=slug, condition_id="condition",
                 asset="BTC", timeframe="5m", role="TAKER_CLOB",
                 reason="favorite", fair_prob=0.6,
-                price_to_beat=100000.0, window_start_ts=start, window_end_ts=start + 300,
+                price_to_beat=100000.0, final_price=100001.0,
+                window_start_ts=start, window_end_ts=start + 300,
             )
             ledger.record_fill(
                 **common, outcome="Up", shares=10, price=0.6, fee=0.10, ts=now - 20
@@ -128,6 +129,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(engine.windows), 1)
             restored = engine.windows[slug]
             self.assertEqual(restored.price_to_beat, 100000.0)
+            self.assertEqual(restored.final_price, 100001.0)
             self.assertEqual(restored.start_ts, float(start))
             self.assertEqual(restored.end_ts, float(start + 300))
             self.assertAlmostEqual(restored.up_shares, 5.0, places=4)
