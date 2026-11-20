@@ -183,6 +183,13 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(window.up_shares, 0.0)
             engine.ledger.conn.close()
 
+    async def test_ledger_does_not_fall_back_to_ephemeral_tmp_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "not-a-directory"
+            blocker.write_text("occupied")
+            with self.assertRaisesRegex(RuntimeError, "Unable to open persistent PAPER ledger"):
+                Ledger(str(blocker / "paper.db"))
+
     async def test_recovery_event_order_puts_fills_before_merge(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Ledger(str(Path(tmp) / "events.db"))
