@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import sqlite3
 import time
@@ -12,6 +13,14 @@ from typing import Any, Dict, List
 class Ledger:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        marker_path = f"{db_path}.initialized"
+        if not os.path.exists(db_path):
+            backups = glob.glob(f"{db_path}.pre-reset-*")
+            if os.path.exists(marker_path) or backups:
+                raise RuntimeError(
+                    f"Persistent PAPER ledger {db_path!r} is missing; refusing to create a fresh database. "
+                    "Preserve the volume and restore the existing ledger."
+                )
         parent = os.path.dirname(os.path.abspath(db_path))
         try:
             if parent:
@@ -21,6 +30,12 @@ class Ledger:
             raise RuntimeError(f"Unable to open persistent PAPER ledger at {db_path!r}") from exc
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
+        try:
+            with open(marker_path, "a", encoding="utf-8"):
+                pass
+        except Exception as exc:
+            self.conn.close()
+            raise RuntimeError(f"Unable to persist PAPER ledger initialization marker at {marker_path!r}") from exc
 
     def _init_schema(self) -> None:
         cur = self.conn.cursor()
