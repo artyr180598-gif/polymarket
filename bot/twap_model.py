@@ -66,7 +66,7 @@ class AssetPriceTracker:
         self._last_vol_ts: float = 0.0
         self._vol_samples: int = 0
 
-    def on_chainlink_spot(self, price: float, feed_ts_ms: int) -> None:
+    def on_chainlink_spot(self, price: float, feed_ts_ms: int, *, compute_twap: bool = True) -> None:
         ts = feed_ts_ms / 1000.0
         if self.cl_spot_ts and ts <= self.cl_spot_ts:
             return
@@ -87,7 +87,8 @@ class AssetPriceTracker:
         self.cl_recv_mono = now_m
         if not self.cl_spot_hist or ts > self.cl_spot_hist[-1][0]:
             self.cl_spot_hist.append((ts, price))
-            self._refresh_twap60(ts)
+            if compute_twap:
+                self._refresh_twap60(ts)
         if self.bn_spot is not None and abs(self.bn_spot_ts - ts) <= 3.0:
             diff = self.bn_spot - price
             if self.basis_ema is None:
