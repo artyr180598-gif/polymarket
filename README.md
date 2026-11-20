@@ -119,4 +119,5 @@ Private / personal use. Not financial advice. Trade at your own risk.
 - The observed wallet's Maker-heavy execution is not cloned here: the current implementation is TAKER-first, as explicitly configured for this experiment.
 - An unresolved position remains in inventory and risk accounting until the Data API reports an authoritative resolved payout. Post-close Chainlink prices are stored for audit only and never used to infer a winner.
 - PAPER balances, fills, merges, fees, and open inventory are rebuilt from the SQLite ledger on restart. Do not delete the mounted volume or database.
+- On Railway, set `DB_PATH=/data/polybot.db`. App-local relative paths such as `data/polybot.db` are rejected so a missing volume cannot silently create a fresh ephemeral ledger.
 - Dashboard state/control endpoints require `DASHBOARD_PIN`; if it is absent, protected endpoints fail closed. Telegram remains the supported control path.
