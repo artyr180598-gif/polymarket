@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from bot.config import BotConfig
 from bot.engine import TradingEngine, WindowState
@@ -100,7 +100,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 up_shares=20.0, down_shares=5.0, up_cost=10.0, down_cost=2.5,
             )
             engine.windows[slug] = window
-            with unittest.mock.patch("bot.engine.aiohttp.ClientSession", side_effect=RuntimeError("offline")):
+            with patch("bot.engine.aiohttp.ClientSession", side_effect=RuntimeError("offline")):
                 await engine._resolve(window)
             self.assertFalse(window.resolved)
             self.assertAlmostEqual(engine.cash, cfg.bankroll_usd, places=5)
@@ -125,7 +125,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 condition_id="condition", up_token="up", down_token="down",
                 start_ts=1800000000, end_ts=1800000300,
             )
-            with unittest.mock.patch.object(engine.ledger, "record_fill", side_effect=RuntimeError("disk full")):
+            with patch.object(engine.ledger, "record_fill", side_effect=RuntimeError("disk full")):
                 await engine._open(window, "Up", 0.5, 10.0, "favorite", fee=0.01)
             self.assertAlmostEqual(engine.cash, cfg.bankroll_usd, places=5)
             self.assertEqual(window.up_shares, 0.0)
