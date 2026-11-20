@@ -185,12 +185,15 @@ class StrategyTests(unittest.TestCase):
         return plan_quotes(sides, **args)
 
     def test_cheap_wing_and_favourite_both_quote_when_the_pair_is_under_a_dollar(self) -> None:
-        quotes = self._quote("0.04", "0.93")
+        # Opening bids stay inside 5–55¢. A 4¢ lottery and a 93¢ favourite
+        # are not how a sub-dollar pair gets started.
+        quotes = self._quote("0.20", "0.45")
         prices = {q.outcome: q.price for q in quotes}
         self.assertIn("Up", prices)
         self.assertIn("Down", prices)
         self.assertLessEqual(max(q.price for q in quotes if q.outcome == "Up")
                              + max(q.price for q in quotes if q.outcome == "Down"), Decimal("0.99"))
+        self.assertEqual(self._quote("0.04", "0.93"), [])
 
     def test_shades_or_drops_when_touches_sum_over_99_cents(self) -> None:
         quotes = self._quote("0.50", "0.50")
@@ -203,13 +206,11 @@ class StrategyTests(unittest.TestCase):
             self.assertLessEqual(by["Up"] + by["Down"], Decimal("0.99"))
 
     def test_keeps_a_single_side_when_the_other_cannot_fit(self) -> None:
-        quotes = self._quote("0.62", "0.96")
+        # 30¢ can open. 80¢ cannot, until the cheap side is actually held.
+        quotes = self._quote("0.30", "0.80")
         outcomes = {q.outcome for q in quotes}
-        self.assertIn("Up", outcomes)
-        if "Down" in outcomes:
-            hi_up = max(q.price for q in quotes if q.outcome == "Up")
-            hi_dn = max(q.price for q in quotes if q.outcome == "Down")
-            self.assertLessEqual(hi_up + hi_dn, Decimal("0.99"))
+        self.assertEqual(outcomes, {"Up"})
+        self.assertTrue(all(q.price <= Decimal("0.30") for q in quotes))
 
     def test_ladder_has_more_than_one_price(self) -> None:
         quotes = [q for q in self._quote("0.40", "0.40") if q.outcome == "Up"]
@@ -222,7 +223,7 @@ class StrategyTests(unittest.TestCase):
         # Down is already 0.70. Up at 0.40 would make 1.10, and 0.40 is more
         # than 5¢ above the 1.03 cap, so the Up bid is dropped.
         quotes = self._quote(
-            "0.40", "0.20",
+            "0.55", "0.20",
             held_avg={"Down": Decimal("0.70")},
             held_shares={"Down": Decimal("20")},
         )
@@ -269,6 +270,20 @@ class StrategyTests(unittest.TestCase):
         self.assertTrue(down)
         self.assertGreaterEqual(max(q.price for q in down), Decimal("0.42"))
         self.assertLessEqual(max(q.price for q in down) + Decimal("0.60"), Decimal("1.03"))
+
+    def test_hedge_is_sized_to_the_shares_already_held(self) -> None:
+        quotes = self._quote(
+            "0.40", "0.55",
+            held_avg={"Up": Decimal("0.40")},
+            held_shares={"Up": Decimal("12")},
+        )
+        down = [q for q in quotes if q.outcome == "Down"]
+        self.assertTrue(down)
+        total = sum((q.shares for q in down), Decimal(0))
+        self.assertGreaterEqual(total, Decimal("10"))
+        self.assertLessEqual(total, Decimal("12"))
+        self.assertTrue(all(q.price <= Decimal("0.60") for q in down))
+        self.assertTrue(all(q.price >= Decimal("0.05") for q in self._quote("0.02", "0.40")))
 
     def test_four_hour_windows_follow_us_eastern(self) -> None:
         from bot.engine import _window_bases

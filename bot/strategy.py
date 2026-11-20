@@ -20,18 +20,22 @@ from .accounting import D, floor_to_step
 # under the ask, so 0.99 is not a price we can rest against a 0.99 ask.
 BID_MIN = Decimal("0.01")
 BID_MAX = Decimal("0.98")
-# Matched shares pay $1. With nothing held, both bids stay under this so we
-# do not open a locked loss. After one side has filled, the lagging side may
-# a median pair of $1.03. That extra 3¢ is a locked loss. The maker rebate
-# is a share of a daily fee pool (docs.polymarket.com/programs/maker-rebates),
-# not cash we can book on the fill, and it is worth well under 1¢ a share.
-# The hedge therefore defaults to $1.00. PAIR_SUM_HEDGE is only the wallet's
-# observed median, used when the operator sets PAIR_SUM_HEDGE=1.03.
+# Matched shares pay $1. With nothing held, both bids stay under $0.99.
+# After one side has filled, the other may reach PAIR_SUM_HEDGE (default $1).
+# The wallet's median pair is $1.03, but that 3¢ is a locked loss: the maker
+# rebate is at most about 0.35¢ per share at 50¢ and 0 for a new account
+# after the 2026-11-20 tier change. Do not open above OPEN_BID_MAX: on BTC 5m
+# a first leg in the 40–55¢ band was two-sided 85% of the time, while a first
+# leg above 70¢ left a pair that does not fit under $1.
 PAIR_SUM_MAX = Decimal("0.99")
 PAIR_SUM_HEDGE = Decimal("1.03")
-# How far we will improve a touch so the two sides still sum to <= 0.99.
-# Further than this we are no longer at the market, so we quote one side.
+OPEN_BID_MAX = Decimal("0.55")
+OPEN_BID_MIN = Decimal("0.05")
+# How far we will improve a touch so the two sides still sum to the cap.
 MAX_SHADE = Decimal("0.05")
+# A balancing bid may sit this far behind the touch. Further than this it
+# is no longer a price the market is about to trade.
+HEDGE_SHADE = Decimal("0.15")
 # Fills are seen from +1s; the median first fill is +50s. The last 60s
 # of a 5m window is 19.5% of the dollars and the best return, so we
 # keep quoting until the last few seconds.
@@ -79,13 +83,21 @@ def _on_tick(price: Decimal, tick: Decimal) -> Decimal:
     return units * tick
 
 
-def _target_shares(price: Decimal, clip_usd: Decimal, min_shares: Decimal) -> Decimal:
+def _target_shares(
+    price: Decimal,
+    clip_usd: Decimal,
+    min_shares: Decimal,
+    balance_to: Decimal | None = None,
+) -> Decimal:
     """Share size, not dollars. A $16 clip is ~32 shares at 50¢.
 
     The favoured side (at or above 50¢) gets the larger clip. A cheap wing
-    stays near the 5-share minimum: that is where the per-dollar edge is,
-    and the notional is small.
+    stays near the 5-share minimum. A hedge is sized to the shares still
+    missing on that side, and never larger than the clip can pay for.
     """
+    if balance_to is not None and balance_to > 0:
+        clip_shares = D(clip_usd) / max(D(price), Decimal("0.05"))
+        return max(D(min_shares), min(D(balance_to), clip_shares))
     unit = D(clip_usd) / Decimal("0.50")
     if price < Decimal("0.20"):
         target = max(D(min_shares), Decimal("8"))
@@ -155,25 +167,47 @@ def plan_quotes(
     if not touches:
         return []
 
-    pair_cap = _pair_cap(held_shares, D(hedge_cap) if hedge_cap is not None else PAIR_SUM_MAX)
-    # Two touches that already sum past the cap: shade the expensive one,
-    # or drop it and keep the cheaper side.
-    if "Up" in touches and "Down" in touches:
-        up, up_ask = touches["Up"]
-        down, down_ask = touches["Down"]
-        if up + down > pair_cap:
+    hedge_cap_v = D(hedge_cap) if hedge_cap is not None else PAIR_SUM_MAX
+    real = {name: held_shares.get(name, Decimal(0)) for name in ("Up", "Down")}
+    any_real = real["Up"] > 0 or real["Down"] > 0
+    # anchor, ask, shares to balance (None when this is not the light side)
+    chosen: dict[str, tuple[Decimal, Decimal | None, Decimal | None]] = {}
+    for outcome, (touch, ask) in touches.items():
+        other = "Down" if outcome == "Up" else "Up"
+        if real[other] > real[outcome]:
+            ceiling = hedge_cap_v - held_avg.get(other, Decimal(0))
+            px = min(touch, ceiling)
+            if px < BID_MIN or touch - px > HEDGE_SHADE:
+                continue
+            if ask is not None and px >= ask:
+                continue
+            chosen[outcome] = (_on_tick(px, tick), ask, real[other] - real[outcome])
+            continue
+        if real[outcome] > real[other] > 0:
+            continue
+        if touch > OPEN_BID_MAX or touch < OPEN_BID_MIN:
+            continue
+        chosen[outcome] = (touch, ask, None)
+
+    if not any_real and "Up" in chosen and "Down" in chosen:
+        up, up_ask, _ = chosen["Up"]
+        down, down_ask, _ = chosen["Down"]
+        if up + down > PAIR_SUM_MAX:
             if up >= down:
-                capped = _cap_price(up, pair_cap - down, tick)
+                capped = _cap_price(up, PAIR_SUM_MAX - down, tick)
                 if capped is None or (up_ask is not None and capped >= up_ask):
-                    touches.pop("Up")
+                    chosen.pop("Up", None)
                 else:
-                    touches["Up"] = (capped, up_ask)
+                    chosen["Up"] = (capped, up_ask, None)
             else:
-                capped = _cap_price(down, pair_cap - up, tick)
+                capped = _cap_price(down, PAIR_SUM_MAX - up, tick)
                 if capped is None or (down_ask is not None and capped >= down_ask):
-                    touches.pop("Down")
+                    chosen.pop("Down", None)
                 else:
-                    touches["Down"] = (capped, down_ask)
+                    chosen["Down"] = (capped, down_ask, None)
+    if not chosen:
+        return []
+    pair_cap = hedge_cap_v if any_real else PAIR_SUM_MAX
 
     room_window = D(window_cap) - D(window_spent)
     room_account = D(exposure_cap) - D(total_exposure)
@@ -183,13 +217,15 @@ def plan_quotes(
 
     quotes: list[Quote] = []
     planned_high: dict[str, Decimal] = {}
-    for outcome, (touch, ask) in touches.items():
-        target = _target_shares(touch, D(clip_usd), min_shares)
+    for outcome, (touch, ask, balance_to) in chosen.items():
+        target = _target_shares(touch, D(clip_usd), min_shares, balance_to)
         side_room = D(window_cap) * SIDE_BUDGET_FRACTION - D(side_spent.get(outcome, 0))
         for level, weight in enumerate(_LEVEL_WEIGHTS[:LADDER_LEVELS]):
             raw = touch - (gap * level)
             px = _on_tick(raw, tick)
             if px < BID_MIN or px > BID_MAX:
+                continue
+            if balance_to is None and px < OPEN_BID_MIN:
                 continue
             if ask is not None and px >= ask:
                 continue
