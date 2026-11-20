@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 import aiohttp
 
 from .config import BotConfig, PRESETS, StrategyParams
-from .execution import PaperExecutor, LiveExecutor
+from .execution import PaperExecutor
 from .fees import calc_taker_fee_usdc, fee_regime_label
 from .ledger import Ledger
 from .twap_model import AssetPriceTracker
@@ -291,13 +291,11 @@ class TradingEngine:
         )
 
     async def start(self) -> None:
-        if self.cfg.trading_mode == "live" and getattr(self.cfg, "has_live_credentials", False):
-            self.executor = LiveExecutor(self.cfg)
-            await self.executor.start()
-        else:
-            self.executor = PaperExecutor(self.cfg.bankroll_usd)
-            self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · CLOB depth + taker fee", notify=True)
+        if self.cfg.trading_mode != "paper":
+            raise RuntimeError("LIVE mode is disabled in this build; set TRADING_MODE=paper")
+        self.executor = PaperExecutor(self.cfg.bankroll_usd)
+        self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
+        self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · CLOB REST depth + taker fee", notify=True)
         if self.cfg.trading_mode == "paper":
             await self._restore_paper_state()
         self.running = True
