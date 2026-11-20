@@ -160,6 +160,135 @@ class TradingEngine:
             except Exception:
                 pass
 
+    def _roll_day(self) -> None:
+        day_key = time.strftime("%Y-%m-%d", time.gmtime())
+        if day_key != self._day_key:
+            self.day_pnl = 0.0
+            self._day_key = day_key
+
+    async def _restore_paper_state(self) -> None:
+        """Rebuild PAPER cash and unmatched inventory from SQLite before resuming."""
+        events = self.ledger.recovery_events(self.cfg.trading_mode)
+        if not events:
+            return
+        now = time.time()
+        day_start_ts = int(now // 86400) * 86400
+        windows: Dict[str, WindowState] = {}
+        cash = float(self.cfg.bankroll_usd)
+        fees_paid = 0.0
+        realized_gross = 0.0
+        day_gross = 0.0
+        day_fees = 0.0
+        outcomes: List[tuple[float, float]] = []
+
+        for event in events:
+            kind = event["event_type"]
+            ts = float(event.get("ts") or 0.0)
+            slug = str(event.get("slug") or "")
+            if kind == "fill":
+                w = windows.get(slug)
+                if w is None:
+                    try:
+                        start_ts = float(slug.rsplit("-", 1)[-1])
+                    except (TypeError, ValueError):
+                        log.error("PAPER recovery skipped malformed market slug: %s", slug)
+                        continue
+                    timeframe = str(event.get("timeframe") or "5m")
+                    duration = 900 if timeframe == "15m" else 300
+                    w = WindowState(
+                        slug=slug, asset=str(event.get("asset") or "BTC"),
+                        timeframe=timeframe, condition_id=str(event.get("condition_id") or ""),
+                        up_token="", down_token="", start_ts=start_ts, end_ts=start_ts + duration,
+                    )
+                    windows[slug] = w
+                shares = float(event.get("shares") or 0.0)
+                price = float(event.get("price") or 0.0)
+                fee = float(event.get("fee") or 0.0)
+                principal = float(event.get("notional") or (shares * price))
+                cash -= principal + fee
+                fees_paid += fee
+                if ts >= day_start_ts:
+                    day_fees += fee
+                if str(event.get("outcome") or "").lower() == "up":
+                    w.up_shares += shares
+                    w.up_cost += principal
+                    w.up_fees += fee
+                else:
+                    w.down_shares += shares
+                    w.down_cost += principal
+                    w.down_fees += fee
+            elif kind == "merge":
+                w = windows.get(slug)
+                if w is None:
+                    continue
+                pairs = min(float(event.get("pairs") or 0.0), w.mergeable_pairs)
+                if pairs < 0.01:
+                    continue
+                up_cost = w.up_cost * pairs / w.up_shares if w.up_shares else 0.0
+                dn_cost = w.down_cost * pairs / w.down_shares if w.down_shares else 0.0
+                up_fee = w.up_fees * pairs / w.up_shares if w.up_shares else 0.0
+                dn_fee = w.down_fees * pairs / w.down_shares if w.down_shares else 0.0
+                allocated_fees = float(event.get("fees") or 0.0) or (up_fee + dn_fee)
+                w.up_shares = max(0.0, w.up_shares - pairs)
+                w.down_shares = max(0.0, w.down_shares - pairs)
+                w.up_cost = max(0.0, w.up_cost - up_cost)
+                w.down_cost = max(0.0, w.down_cost - dn_cost)
+                w.up_fees = max(0.0, w.up_fees - up_fee)
+                w.down_fees = max(0.0, w.down_fees - dn_fee)
+                cash += pairs
+                gross = float(event.get("locked_pnl") or (pairs - up_cost - dn_cost))
+                realized_gross += gross
+                outcomes.append((ts, gross - allocated_fees))
+                if ts >= day_start_ts:
+                    day_gross += gross
+            elif kind == "resolution":
+                w = windows.get(slug)
+                if w is None:
+                    continue
+                payout = float(event.get("total_payout") or 0.0)
+                gross = float(event.get("gross_pnl") if event.get("gross_pnl") is not None else payout - float(event.get("gross_cost") or 0.0))
+                allocated_fees = float(event.get("total_fees") or 0.0) or (w.up_fees + w.down_fees)
+                cash += payout
+                realized_gross += gross
+                outcomes.append((ts, gross - allocated_fees))
+                if ts >= day_start_ts:
+                    day_gross += gross
+                w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
+                w.up_fees = w.down_fees = 0.0
+                w.resolved = True
+
+        self.cash = cash
+        self.fees_paid = fees_paid
+        self.realized_pnl = realized_gross - fees_paid
+        self.day_pnl = day_gross - day_fees
+        self._day_key = time.strftime("%Y-%m-%d", time.gmtime(now))
+        self.consecutive_losses = 0
+        for _, pnl in sorted(outcomes, key=lambda item: item[0]):
+            self.consecutive_losses = self.consecutive_losses + 1 if pnl < 0 else 0
+        self._fill_history = self.ledger.recent_fills(self.cfg.trading_mode, 80)
+        self._merge_history = self.ledger.recent_merges(self.cfg.trading_mode, 40)
+        self._resolve_history = self.ledger.recent_resolutions(self.cfg.trading_mode, 40)
+
+        for slug, w in windows.items():
+            if w.resolved or (w.up_shares < 0.01 and w.down_shares < 0.01):
+                continue
+            try:
+                meta = await self._gamma(slug)
+                if meta:
+                    w.up_token = meta.get("up_token") or ""
+                    w.down_token = meta.get("down_token") or ""
+                    w.price_to_beat = meta.get("price_to_beat")
+            except Exception as exc:
+                log.warning("PAPER recovery market metadata %s: %s", slug, exc)
+            self.windows[slug] = w
+
+        self._log_event(
+            "INFO",
+            f"PAPER recovery: {len(self._fill_history)} recent fills · {len(self.windows)} open windows · "
+            f"cash ${self.cash:.2f} · fees ${self.fees_paid:.2f}",
+            notify=True,
+        )
+
     async def start(self) -> None:
         if self.cfg.trading_mode == "live" and getattr(self.cfg, "has_live_credentials", False):
             self.executor = LiveExecutor(self.cfg)
