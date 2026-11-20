@@ -48,6 +48,7 @@ class AssetPriceTracker:
         self.cl_spot: Optional[float] = None
         self.cl_spot_ts: float = 0.0
         self.cl_recv_mono: float = 0.0
+        self.cl_received_ts: float = 0.0
         self.cl_twap60: Optional[float] = None
         self.cl_twap60_ts: float = 0.0
         self.cl_twap_recv_mono: float = 0.0
@@ -66,11 +67,18 @@ class AssetPriceTracker:
         self._last_vol_ts: float = 0.0
         self._vol_samples: int = 0
 
-    def on_chainlink_spot(self, price: float, feed_ts_ms: int, *, compute_twap: bool = True) -> None:
+    def on_chainlink_spot(
+        self, price: float, feed_ts_ms: int, *, compute_twap: bool = True,
+        received_at_ms: int | None = None,
+    ) -> None:
         ts = feed_ts_ms / 1000.0
-        if self.cl_spot_ts and ts <= self.cl_spot_ts:
-            return
+        received_ts = (received_at_ms / 1000.0) if received_at_ms else ts
         now_m = time.monotonic()
+        if self.cl_spot_ts and ts <= self.cl_spot_ts:
+            if received_ts > self.cl_received_ts:
+                self.cl_received_ts = received_ts
+                self.cl_recv_mono = now_m
+            return
         if self._last_vol_px is not None and ts > self._last_vol_ts:
             dt = ts - self._last_vol_ts
             if dt > 0:
@@ -121,6 +129,8 @@ class AssetPriceTracker:
 
     def on_chainlink_twap60(self, twap_val: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
+        if self.cl_twap60_ts and ts <= self.cl_twap60_ts:
+            return
         self.cl_twap60 = twap_val
         self.cl_twap60_ts = ts
         self.cl_twap_recv_mono = time.monotonic()
