@@ -251,7 +251,10 @@ class TradingEngine:
                     continue
                 payout = float(event.get("total_payout") or 0.0)
                 gross = float(event.get("gross_pnl") if event.get("gross_pnl") is not None else payout - float(event.get("gross_cost") or 0.0))
-                allocated_fees = float(event.get("total_fees") or 0.0) or (w.up_fees + w.down_fees)
+                stored_fees = float(event.get("total_fees") or 0.0)
+                allocated_fees = stored_fees if stored_fees > 0 else (w.up_fees + w.down_fees)
+                if stored_fees <= 0 and allocated_fees > 0:
+                    self.ledger.update_resolution_fees(int(event["id"]), allocated_fees)
                 cash += payout
                 realized_gross += gross
                 outcomes.append((ts, gross - allocated_fees))
