@@ -21,6 +21,16 @@ def _flag(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _optional_float(name: str) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
 def _list(name: str, default: str) -> list[str]:
     return [part.strip() for part in os.getenv(name, default).split(",") if part.strip()]
 
@@ -42,6 +52,10 @@ class BotConfig:
     max_consecutive_losses: int = 10
     min_merge_shares: float = 1.0
     onchain_gas_usd: float = 0.0
+    # Kept so old Railway variables still parse. They never delete the ledger.
+    paper_reset_once: bool = False
+    paper_reset_id: str = ""
+    paper_stats_since_ts: float = 0.0
 
     private_key: str = ""
     wallet_address: str = ""
@@ -57,6 +71,10 @@ class BotConfig:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     db_path: str = "data/polybot.db"
+
+    @property
+    def paper_reset_requested(self) -> bool:
+        return self.paper_reset_once or bool(self.paper_reset_id)
 
     @property
     def live_requested(self) -> bool:
@@ -101,6 +119,9 @@ class BotConfig:
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
             min_merge_shares=max(0.01, float(os.getenv("MIN_MERGE_SHARES", "1"))),
             onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
+            paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
+            paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
+            paper_stats_since_ts=_optional_float("PAPER_STATS_SINCE_TS"),
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
             wallet_address=os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip(),
             relayer_api_key=os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip(),

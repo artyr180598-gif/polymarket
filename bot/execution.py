@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from .accounting import D, Portfolio
-from .books import advance_maker_fill, size_at
+from .books import apply_trade_print
 from .fees import taker_fee_usdc
 
 log = logging.getLogger(__name__)
@@ -95,22 +95,21 @@ class PaperBroker:
         for order_id in list(self.orders):
             self.cancel(order_id)
 
-    def on_book(self, token_id: str, bids: list, best_ask: Decimal | None) -> list[Fill]:
+    def on_trade(self, token_id: str, price: Decimal, size: Decimal, taker_side: str) -> list[Fill]:
+        """Fill only from a trade print. Book updates alone do nothing."""
         fills: list[Fill] = []
         for order in list(self.orders.values()):
             if order.token_id != token_id or order.remaining <= 0:
                 continue
-            level = size_at(bids, order.price)
-            queue, prev, got = advance_maker_fill(
+            queue, got = apply_trade_print(
                 queue_ahead=order.queue_ahead,
-                prev_level_size=order.prev_level,
-                level_size=level,
                 remaining=order.remaining,
-                price=order.price,
-                best_ask=best_ask,
+                our_price=order.price,
+                trade_price=price,
+                trade_size=size,
+                taker_side=taker_side,
             )
             order.queue_ahead = queue
-            order.prev_level = prev
             if got <= 0:
                 continue
             order.remaining -= got
@@ -125,8 +124,7 @@ class PaperBroker:
                 )
             )
             if order.remaining <= Decimal("0.0000005"):
-                # The portfolio lock stays until buy_fill spends it. The engine
-                # calls buy_fill with this order id immediately after.
+                # The lock stays until buy_fill spends it.
                 self.orders.pop(order.order_id, None)
         return fills
 

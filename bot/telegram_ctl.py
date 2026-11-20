@@ -50,6 +50,8 @@ class TelegramController:
         self._running = False
         self._offset = 0
         self._session: aiohttp.ClientSession | None = None
+        self._out: asyncio.Queue = asyncio.Queue()
+        self._send_task: asyncio.Task | None = None
 
     @property
     def _base(self) -> str:
@@ -61,15 +63,20 @@ class TelegramController:
         self._running = True
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40))
         self.engine.set_notifier(self.notify)
+        self._send_task = asyncio.create_task(self._sender(), name="telegram_send")
         self._task = asyncio.create_task(self._poll(), name="telegram")
         await self.send("Бот запущен. Управление кнопками ниже.", keyboard=_kb_main())
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
+        for task in (self._task, self._send_task):
+            if task:
+                task.cancel()
+        for task in (self._task, self._send_task):
+            if not task:
+                continue
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
         if self._session:
@@ -77,25 +84,60 @@ class TelegramController:
             self._session = None
 
     async def send(self, text: str, keyboard: dict | None = None) -> None:
-        if not self.enabled or not self._session:
+        if not self.enabled:
             return
-        payload: dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "text": (text or "")[:4000],
-            "disable_web_page_preview": True,
-        }
-        if keyboard:
-            payload["reply_markup"] = keyboard
-        try:
-            async with self._session.post(f"{self._base}/sendMessage", json=payload) as response:
-                if response.status != 200:
-                    log.warning("telegram %s", (await response.text())[:180])
-        except Exception as exc:  # noqa: BLE001
-            log.warning("telegram send: %s", exc)
+        await self._out.put(((text or "")[:4000], keyboard))
+
+    async def _sender(self) -> None:
+        """One message at a time. 429 and 502 back off instead of crashing."""
+        while self._running:
+            try:
+                text, keyboard = await asyncio.wait_for(self._out.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            delay = 1.2
+            for attempt in range(4):
+                if not self._session:
+                    break
+                payload: dict[str, Any] = {
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                }
+                if keyboard:
+                    payload["reply_markup"] = keyboard
+                try:
+                    async with self._session.post(f"{self._base}/sendMessage", json=payload) as response:
+                        if response.status == 200:
+                            break
+                        body = await response.text()
+                        if response.status == 429:
+                            wait = 5.0
+                            try:
+                                wait = float(response.headers.get("Retry-After") or 5)
+                            except ValueError:
+                                wait = 5.0
+                            log.warning("telegram 429, sleep %.1fs", wait)
+                            await asyncio.sleep(wait)
+                            continue
+                        if response.status in (500, 502, 503, 504) and attempt < 3:
+                            log.warning("telegram %s, retry", response.status)
+                            await asyncio.sleep(delay)
+                            delay *= 2
+                            continue
+                        log.warning("telegram %s %s", response.status, body[:180])
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("telegram send: %s", exc)
+                    await asyncio.sleep(delay)
+                    delay *= 2
+            await asyncio.sleep(0.4)
 
     async def notify(self, text: str) -> None:
-        await asyncio.sleep(0.2)
-        await self.send(text, keyboard=_kb_main())
+        # No keyboard on every fill: that was the 429 spam.
+        await self.send(text, keyboard=None)
 
     async def _answer(self, callback_id: str) -> None:
         if not self._session or not callback_id:
@@ -109,46 +151,63 @@ class TelegramController:
             pass
 
     def _status(self) -> str:
-        snap = self.engine.snapshot()
-        state = "пауза" if snap["paused"] else ("стоп риска" if snap["halt_reason"] else "торгует")
+        snap = self.engine.snapshot() or {}
+        state = "пауза" if snap.get("paused") else ("стоп риска" if snap.get("halt_reason") else "торгует")
         lines = [
             f"Состояние: {state}",
-            f"Режим: {snap['mode']}",
-            f"Стратегия: {snap['strategy_title']}",
+            f"Режим: {snap.get('mode', '')}",
+            f"Стратегия: {snap.get('strategy_title', '')}",
             "",
-            f"Капитал: ${_money(snap['equity']).lstrip('+')}",
-            f"Свободно: ${_money(snap['cash']).lstrip('+')}",
-            f"В заявках: ${_money(snap['reserved']).lstrip('+')}",
-            f"Сегодня: ${_money(snap['day_pnl'])}",
-            f"7 дней: ${_money(snap['pnl_7d'])}",
-            f"За всё время: ${_money(snap['pnl_all'])}",
+            f"Капитал: ${_money(snap.get('equity')).lstrip('+')}",
+            f"Свободно: ${_money(snap.get('cash')).lstrip('+')}",
+            f"В заявках: ${_money(snap.get('reserved')).lstrip('+')}",
+            f"Сегодня: ${_money(snap.get('day_pnl'))}",
+            f"7 дней: ${_money(snap.get('pnl_7d'))}",
+            f"За всё время: ${_money(snap.get('pnl_all'))}",
+            f"Ребейт мейкера: ${_money(snap.get('maker_rebates'))}",
+            f"Ребейт тейкера: ${_money(snap.get('taker_rebates'))}",
+            f"Награды ликвидности: ${_money(snap.get('liquidity_rewards'))}",
         ]
-        if snap["halt_reason"]:
-            lines.append(f"Причина стопа: {snap['halt_reason']}")
+        if snap.get("halt_reason"):
+            lines.append(f"Причина стопа: {snap.get('halt_reason')}")
         windows = snap.get("windows") or []
         lines.append(f"Окон в работе: {len(windows)}")
         return "\n".join(lines)
 
     def _pnl(self) -> str:
-        snap = self.engine.snapshot()
+        snap = self.engine.snapshot() or {}
         stats = snap.get("stats") or {}
-        return "\n".join([
+        edge = snap.get("edge") or {}
+        lines = [
             "Прибыль и убыток",
-            f"Старт: ${_money(snap['initial']).lstrip('+')}",
-            f"Капитал сейчас: ${_money(snap['equity']).lstrip('+')}",
-            f"Реализовано: ${_money(snap['realized'])}",
-            f"Нереализовано (по лучшему биду): ${_money(snap['unrealized'])}",
-            f"Сегодня: ${_money(snap['day_pnl'])}",
-            f"7 дней: ${_money(snap['pnl_7d'])}",
-            f"За всё время: ${_money(snap['pnl_all'])}",
-            f"Комиссии: ${_money(snap['fees_paid']).lstrip('+')}",
-            f"Газ: ${_money(snap['gas_paid']).lstrip('+')}",
+            f"Старт: ${_money(snap.get('initial')).lstrip('+')}",
+            f"Капитал сейчас: ${_money(snap.get('equity')).lstrip('+')}",
+            f"Реализовано (сделки): ${_money(snap.get('realized'))}",
+            f"Нереализовано (по лучшему биду): ${_money(snap.get('unrealized'))}",
+            f"Сегодня: ${_money(snap.get('day_pnl'))}",
+            f"7 дней: ${_money(snap.get('pnl_7d'))}",
+            f"За всё время: ${_money(snap.get('pnl_all'))}",
+            f"Комиссия тейкера: ${_money(snap.get('fees_paid')).lstrip('+')}",
+            f"Ребейт мейкера: ${_money(snap.get('maker_rebates'))}",
+            f"Ребейт тейкера: ${_money(snap.get('taker_rebates'))}",
+            f"Награды ликвидности: ${_money(snap.get('liquidity_rewards'))}",
+            f"Газ: ${_money(snap.get('gas_paid')).lstrip('+')}",
             "",
+            "Отдача на оборот (наши закрытые окна / оборот)",
+        ]
+        for key, title in (("d7", "7 дней"), ("d14", "14 дней"), ("d30", "30 дней")):
+            row = edge.get(key) or {}
+            roi = row.get("roi_pct")
+            lines.append(f"· {title}: {('—' if roi is None else str(roi) + '%')} на ${row.get('notional', 0)}")
+        lines += [
+            "",
+            "У кошелька-образца отдача падала: 4.1% → 1.9% за 14 дней.",
             f"Закрытых окон: {stats.get('markets', 0)}",
             f"Плюс: {stats.get('wins', 0)} · минус: {stats.get('losses', 0)}",
             f"Доля плюсовых: {stats.get('win_rate_pct', 0)}%",
             f"MERGE: {stats.get('merges', 0)} на ${_money(stats.get('merge_pnl', 0))}",
-        ])
+        ]
+        return "\n".join(lines)
 
     def _positions(self) -> str:
         snap = self.engine.snapshot()
@@ -191,12 +250,11 @@ class TelegramController:
         limits = self.engine.snapshot().get("limits") or {}
         return "\n".join([
             "Стратегия mo-money",
-            "Покупаем как мейкер (заявка в стакане, комиссия 0).",
-            "Только цены от 15¢ до 85¢. Крайние фавориты и дешёвые лоты не берём:",
-            "на истории кошелька они теряли деньги.",
-            "Обе стороны берём, только если вместе не дороже 99¢.",
-            "Пару Up+Down сразу меняем на $1 (MERGE).",
-            "Остаток после официального итога забираем (REDEEM). Продаж нет.",
+            "Лестница лимитных покупок на обе стороны, от 1¢ до 98¢.",
+            "Дешёвые крылья — лучшая отдача на доллар. Дороже 90¢ тоже в плюсе, но тонком.",
+            "Средняя цена Up и Down вместе не выше 99¢, иначе вторую сторону не берём.",
+            "Пару дешевле $1 меняем на доллар. Продаж нет.",
+            "Край стакана на истории кошелька не запрещён: убыток давала пара дороже $1, а не сама цена.",
             "",
             f"Размер заявки: ${limits.get('order_clip_usd')}",
             f"Лимит на окно: ${limits.get('max_window_risk_usd')}",

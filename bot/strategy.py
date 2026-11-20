@@ -1,11 +1,10 @@
-"""Quote rules copied from wallet 0x32ed2e546b187ca15e2841edc82b22c713cf8ec3.
+"""Quote rules for wallet 0x32ed2e546b187ca15e2841edc82b22c713cf8ec3.
 
-The measured behaviour (see docs/STRATEGY_ANALYSIS.md) is a post-only buyer
-of crypto up/down markets, mostly BTC 5m and 15m. It does not sell. It merges
-a matched Up+Down pair back into $1 and redeems whatever is left after the
-oracle. Lifetime money is made by bids between 15¢ and 85¢. Bids under 15¢
-and over 85¢ are in the tape, and those inventories lost money, so they are
-not copied.
+Reconciled with a fill-level study of 751,433 trades (see
+docs/STRATEGY_ANALYSIS.md). The wallet rests maker bids on both outcomes,
+from about 1¢ to 98¢. Cheap fills (≤10¢) are the highest return per dollar.
+Fills above 90¢ are a small positive, not a loss. What loses money is a
+pair whose average prices sum to more than $1.
 
 This module only decides the resting bids. It does not talk to the network.
 """
@@ -13,22 +12,29 @@ This module only decides the resting bids. It does not talk to the network.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, ROUND_DOWN
 
 from .accounting import D, floor_to_step
 
-BID_MIN = Decimal("0.15")
-BID_MAX = Decimal("0.85")
-# A double fill at these bids still returns $1 from a merge with 1¢ of room
-# before any (zero) maker fee. The wallet's two-sided average prices sit on $1.
+# Full posted range. Post-only still requires the bid to sit strictly
+# under the ask, so 0.99 is not a price we can rest against a 0.99 ask.
+BID_MIN = Decimal("0.01")
+BID_MAX = Decimal("0.98")
+# Matched shares pay $1. A pair bought for more than this locks a loss.
 PAIR_SUM_MAX = Decimal("0.99")
-MAX_SHADE_TICKS = 2
-START_AFTER_SEC = 5
-STOP_BEFORE_END_SEC = 12
-# One side may hold at most this fraction of the window budget, so the other
-# side can still be bought. Median hedge on the wallet is ~30% of the big leg,
-# i.e. the big leg is ~77% of the pair. 80% leaves that shape room.
+# How far we will improve a touch so the two sides still sum to <= 0.99.
+# Further than this we are no longer at the market, so we quote one side.
+MAX_SHADE = Decimal("0.05")
+# Fills are seen from +1s; the median first fill is +50s. The last 60s
+# of a 5m window is 19.5% of the dollars and the best return, so we
+# keep quoting until the last few seconds.
+START_AFTER_SEC = 1
+STOP_BEFORE_END_SEC = 3
+LADDER_LEVELS = 3
+# Wallet: median 3 distinct prices per outcome. A cent apart, not one tick.
+LADDER_GAP = Decimal("0.01")
 SIDE_BUDGET_FRACTION = Decimal("0.80")
+_LEVEL_WEIGHTS = (Decimal("0.50"), Decimal("0.30"), Decimal("0.20"))
 
 
 @dataclass(frozen=True)
@@ -47,19 +53,51 @@ class Quote:
     notional: Decimal
 
 
-def _join_bid(side: SideBook, tick: Decimal) -> Decimal | None:
-    """Price we are willing to rest, or None when the touch is outside the band."""
-    if side.best_bid is None:
+def projected_avg(shares: Decimal, avg: Decimal, add_shares: Decimal, add_price: Decimal) -> Decimal:
+    """Share-weighted average after one more fill, including a partial."""
+    shares = D(shares)
+    add_shares = D(add_shares)
+    if add_shares <= 0:
+        return D(avg) if shares > 0 else Decimal(0)
+    if shares <= 0:
+        return D(add_price)
+    return (shares * D(avg) + add_shares * D(add_price)) / (shares + add_shares)
+
+
+def _on_tick(price: Decimal, tick: Decimal) -> Decimal:
+    if tick <= 0:
+        return price
+    units = (price / tick).to_integral_value(rounding=ROUND_DOWN)
+    return units * tick
+
+
+def _target_shares(price: Decimal, clip_usd: Decimal, min_shares: Decimal) -> Decimal:
+    """Share size, not dollars. A $16 clip is ~32 shares at 50¢.
+
+    The favoured side (at or above 50¢) gets the larger clip. A cheap wing
+    stays near the 5-share minimum: that is where the per-dollar edge is,
+    and the notional is small.
+    """
+    unit = D(clip_usd) / Decimal("0.50")
+    if price < Decimal("0.20"):
+        target = max(D(min_shares), Decimal("8"))
+    elif price < Decimal("0.50"):
+        target = unit * Decimal("0.45")
+    else:
+        target = unit * Decimal("0.75")
+    return max(target, D(min_shares))
+
+
+def _cap_price(price: Decimal, ceiling: Decimal, tick: Decimal) -> Decimal | None:
+    """Lower ``price`` to ``ceiling`` if the gap is at most MAX_SHADE."""
+    if price <= ceiling:
+        return price
+    if price - ceiling > MAX_SHADE or ceiling < BID_MIN:
         return None
-    px = D(side.best_bid)
-    if px < BID_MIN or px > BID_MAX:
+    capped = _on_tick(ceiling, tick)
+    if capped < BID_MIN or capped > BID_MAX or capped <= 0:
         return None
-    if side.best_ask is not None and px >= D(side.best_ask):
-        # Joining here would cross. Post-only must stay strictly below the ask.
-        return None
-    if side.best_ask is not None and px > D(side.best_ask) - tick:
-        return None
-    return px
+    return capped
 
 
 def plan_quotes(
@@ -78,60 +116,53 @@ def plan_quotes(
     held_avg: dict[str, Decimal] | None = None,
     held_shares: dict[str, Decimal] | None = None,
 ) -> list[Quote]:
-    """Resting bids for this window. At most one quote per outcome.
+    """Up to three resting bids per outcome, both outcomes when they fit under $0.99.
 
-    ``window_spent`` / ``side_spent`` are cost basis already filled, not
-    including the new quote. ``free_cash`` is USDC that is not reserved.
+    The cap is on the average cost of shares we would actually hold after
+    each of these bids filled, not on a single simultaneous quote.
     """
     tick = D(tick)
     if tick <= 0:
         tick = Decimal("0.01")
-    raw: list[tuple[str, Decimal]] = []
+    gap = LADDER_GAP if LADDER_GAP >= tick else tick
+    held_avg = {k: D(v) for k, v in (held_avg or {}).items()}
+    held_shares = {k: D(v) for k, v in (held_shares or {}).items()}
+    min_shares = D(min_shares)
+    step = D(share_step)
+
+    touches: dict[str, tuple[Decimal, Decimal | None]] = {}
     for side in sides:
-        px = _join_bid(side, tick)
-        if px is not None:
-            raw.append((side.outcome, px))
-    if not raw:
+        if side.best_bid is None:
+            continue
+        px = D(side.best_bid)
+        ask = D(side.best_ask) if side.best_ask is not None else None
+        if px < BID_MIN or px > BID_MAX:
+            continue
+        if ask is not None and px >= ask:
+            continue
+        touches[side.outcome] = (px, ask)
+
+    if not touches:
         return []
 
-    # If both sides are quoted and the sum is above the pair cap, shade the
-    # more expensive bid down by at most MAX_SHADE_TICKS. Further than that
-    # we would sit behind the real queue and the fill would not be the tape's.
-    if len(raw) >= 2:
-        raw.sort(key=lambda item: item[1], reverse=True)
-        dear_name, dear_px = raw[0]
-        cheap_name, cheap_px = raw[1]
-        limit = PAIR_SUM_MAX - cheap_px
-        if dear_px > limit:
-            ticks = int(((dear_px - limit) / tick).to_integral_value(rounding=ROUND_CEILING))
-            if ticks > MAX_SHADE_TICKS or limit < BID_MIN:
-                raw = [(cheap_name, cheap_px)]
-            else:
-                shaded = dear_px - (tick * ticks)
-                # Keep the shaded bid on the tick grid and inside the band.
-                if shaded < BID_MIN or shaded > BID_MAX:
-                    raw = [(cheap_name, cheap_px)]
+    # Two touches that already sum past the cap: shade the expensive one,
+    # or drop it and keep the cheaper side (one-sided markets returned +10.6%).
+    if "Up" in touches and "Down" in touches:
+        up, up_ask = touches["Up"]
+        down, down_ask = touches["Down"]
+        if up + down > PAIR_SUM_MAX:
+            if up >= down:
+                capped = _cap_price(up, PAIR_SUM_MAX - down, tick)
+                if capped is None or (up_ask is not None and capped >= up_ask):
+                    touches.pop("Up")
                 else:
-                    raw = [(dear_name, shaded), (cheap_name, cheap_px)]
-
-    # A leg we already hold sets a ceiling on the other bid. Buying it above
-    # that ceiling would lock a pair that costs more than $0.99.
-    held_avg = held_avg or {}
-    held_shares = held_shares or {}
-    capped: list[tuple[str, Decimal]] = []
-    for outcome, px in raw:
-        other = "Down" if outcome == "Up" else "Up"
-        if held_shares.get(other, 0) > 0:
-            ceiling = PAIR_SUM_MAX - held_avg.get(other, Decimal(0))
-            if px > ceiling:
-                ticks = int(((px - ceiling) / tick).to_integral_value(rounding=ROUND_CEILING))
-                if ticks > MAX_SHADE_TICKS or ceiling < BID_MIN:
-                    continue
-                px = px - tick * ticks
-                if px < BID_MIN or px > BID_MAX:
-                    continue
-        capped.append((outcome, px))
-    raw = capped
+                    touches["Up"] = (capped, up_ask)
+            else:
+                capped = _cap_price(down, PAIR_SUM_MAX - up, tick)
+                if capped is None or (down_ask is not None and capped >= down_ask):
+                    touches.pop("Down")
+                else:
+                    touches["Down"] = (capped, down_ask)
 
     room_window = D(window_cap) - D(window_spent)
     room_account = D(exposure_cap) - D(total_exposure)
@@ -140,20 +171,63 @@ def plan_quotes(
         return []
 
     quotes: list[Quote] = []
-    for outcome, px in raw:
+    planned_high: dict[str, Decimal] = {}
+    for outcome, (touch, ask) in touches.items():
+        target = _target_shares(touch, D(clip_usd), min_shares)
         side_room = D(window_cap) * SIDE_BUDGET_FRACTION - D(side_spent.get(outcome, 0))
-        budget = min(D(clip_usd), room, side_room)
-        if budget <= 0 or px <= 0:
-            continue
-        qty = floor_to_step(budget / px, D(share_step))
-        if qty < D(min_shares):
-            continue
-        notional = (qty * px).quantize(Decimal("0.000001"))
-        if notional > room:
-            continue
-        quotes.append(Quote(outcome=outcome, price=px, shares=qty, notional=notional))
-        room -= notional
+        for level, weight in enumerate(_LEVEL_WEIGHTS[:LADDER_LEVELS]):
+            raw = touch - (gap * level)
+            px = _on_tick(raw, tick)
+            if px < BID_MIN or px > BID_MAX:
+                continue
+            if ask is not None and px >= ask:
+                continue
+            qty = floor_to_step(target * weight, step)
+            if qty < min_shares:
+                # Keep a second rung when the clip can pay for it.
+                # A wing that is only a few shares stays a single bid.
+                if level == 0 or target >= min_shares * (level + 1):
+                    qty = floor_to_step(min_shares, step)
+                else:
+                    continue
+            if qty < min_shares:
+                continue
+            if not _pair_ok(outcome, px, qty, held_avg, held_shares, planned_high):
+                continue
+            notional = (qty * px).quantize(Decimal("0.000001"))
+            if notional > room or notional > side_room or notional <= 0:
+                continue
+            quotes.append(Quote(outcome=outcome, price=px, shares=qty, notional=notional))
+            room -= notional
+            side_room -= notional
+            planned_high[outcome] = max(planned_high.get(outcome, px), px)
+            # Subsequent levels on this side see the shares we just planned,
+            # so the average cannot creep through the cap one level at a time.
+            prev_sh = held_shares.get(outcome, Decimal(0))
+            prev_avg = held_avg.get(outcome, Decimal(0))
+            held_avg[outcome] = projected_avg(prev_sh, prev_avg, qty, px)
+            held_shares[outcome] = prev_sh + qty
     return quotes
+
+
+def _pair_ok(
+    outcome: str,
+    price: Decimal,
+    shares: Decimal,
+    held_avg: dict[str, Decimal],
+    held_shares: dict[str, Decimal],
+    planned_high: dict[str, Decimal],
+) -> bool:
+    other = "Down" if outcome == "Up" else "Up"
+    this_avg = projected_avg(held_shares.get(outcome, 0), held_avg.get(outcome, 0), shares, price)
+    other_marks = []
+    if held_shares.get(other, 0) > 0:
+        other_marks.append(held_avg.get(other, Decimal(0)))
+    if other in planned_high:
+        other_marks.append(planned_high[other])
+    if not other_marks:
+        return True
+    return this_avg + max(other_marks) <= PAIR_SUM_MAX + Decimal("0.0000001")
 
 
 def in_entry_window(seconds_from_start: float, seconds_to_end: float) -> bool:

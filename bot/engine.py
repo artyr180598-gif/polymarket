@@ -51,8 +51,9 @@ class Window:
     min_shares: Decimal
     fee_rate: Decimal
     fee_exponent: Decimal
-    orders: dict[str, str] = field(default_factory=dict)  # outcome -> order id
-    cooldown_until: dict[str, float] = field(default_factory=dict)
+    orders: dict[str, str] = field(default_factory=dict)  # "Up@0.42" -> order id
+    seen_prints: set[str] = field(default_factory=set)
+    prints_seeded: bool = False
     resolved: bool = False
     reported: bool = False
 
@@ -94,12 +95,18 @@ class TradingEngine:
         self._notify: Notify | None = None
         self._last_equity_ts = 0.0
         self._live_prices: dict[str, Decimal] = {}
+        self._live_left: dict[str, Decimal] = {}
         self._stuck_noted: set[str] = set()
         self._preset_note = ""
         if cfg.strategy_preset not in ("mo_money",):
             self._preset_note = (
                 f"Пресет «{cfg.strategy_preset}» больше не используется. "
                 "Работают измеренные правила mo-money."
+            )
+        if cfg.paper_reset_requested:
+            self._note(
+                "INFO",
+                "PAPER_RESET_ONCE / PAPER_RESET_ID проигнорированы: база на томе не стирается при старте.",
             )
 
     def set_notifier(self, fn: Notify) -> None:
@@ -198,7 +205,7 @@ class TradingEngine:
 
     def set_preset(self, key: str) -> bool:
         # One measured strategy. The button stays so old menus do not 400.
-        self._note("INFO", "Стратегия одна: mo-money (мейкер 15–85¢, MERGE, REDEEM).", notify=True)
+        self._note("INFO", "Стратегия одна: mo-money (лестница мейкер-бидов, пара ≤ 99¢, MERGE, REDEEM).", notify=True)
         return key == "mo_money"
 
     def update_risk_limits(
@@ -377,9 +384,9 @@ class TradingEngine:
             best_bid, _, _ = touch(bids, asks)
             if best_bid is not None:
                 self.marks[(window.slug, outcome)] = best_bid
-            if self.mode == "paper":
-                for fill in self.paper.on_book(token, bids, touch(bids, asks)[1]):
-                    self._apply_fill(window, fill)
+        if self.mode == "paper":
+            for fill in await self._paper_prints(window):
+                self._apply_fill(window, fill)
         if self.mode == "live":
             await self._pull_live_fills(window)
         self._drop_finished_orders(window)
@@ -400,8 +407,6 @@ class TradingEngine:
 
         sides = []
         for outcome in ("Up", "Down"):
-            if window.cooldown_until.get(outcome, 0) > time.time():
-                continue
             bids, asks = books.get(outcome, ([], []))
             best_bid, best_ask, bid_size = touch(bids, asks)
             sides.append(SideBook(outcome, best_bid, best_ask, bid_size))
@@ -436,36 +441,35 @@ class TradingEngine:
         await self._merge(window)
 
     async def _sync_quotes(self, window: Window, quotes, books) -> None:
-        wanted = {q.outcome: q for q in quotes}
-        for outcome, order_id in list(window.orders.items()):
-            quote = wanted.get(outcome)
-            resting = self._resting(order_id)
-            if quote is None or resting is None or resting.price != quote.price:
+        from .books import size_at
+
+        wanted = {f"{q.outcome}@{q.price}": q for q in quotes}
+        for key, order_id in list(window.orders.items()):
+            if key not in wanted:
                 await self._cancel_order(order_id)
-                window.orders.pop(outcome, None)
-        for outcome, quote in wanted.items():
-            if outcome in window.orders:
+                window.orders.pop(key, None)
+        for key, quote in wanted.items():
+            if key in window.orders:
                 continue
-            bids, asks = books.get(outcome, ([], []))
+            bids, asks = books.get(quote.outcome, ([], []))
             _, best_ask, _ = touch(bids, asks)
-            from .books import size_at
             if self.mode == "paper":
                 order_id = self.paper.place(
-                    outcome=outcome,
-                    token_id=window.tokens[outcome],
+                    outcome=quote.outcome,
+                    token_id=window.tokens[quote.outcome],
                     price=quote.price,
                     shares=quote.shares,
                     best_ask=best_ask,
                     bid_size_at_price=size_at(bids, quote.price),
                 )
                 if order_id:
-                    window.orders[outcome] = order_id
+                    window.orders[key] = order_id
             else:
                 order_id, err, filled_now = await self.live.place(
-                    token_id=window.tokens[outcome], price=quote.price, shares=quote.shares
+                    token_id=window.tokens[quote.outcome], price=quote.price, shares=quote.shares
                 )
                 if not order_id:
-                    self._note("ERROR", f"Заявка {window.asset} {outcome} не принята: {err}")
+                    self._note("ERROR", f"Заявка {window.asset} {quote.outcome} не принята: {err}")
                     continue
                 if not self.portfolio.lock(order_id, quote.notional):
                     await self.live.cancel(order_id)
@@ -476,11 +480,14 @@ class TradingEngine:
                 if filled_now > 0:
                     self._apply_fill(
                         window,
-                        Fill(order_id=order_id, outcome=outcome, shares=filled_now, price=quote.price, fee=_ZERO, role="MAKER"),
+                        Fill(
+                            order_id=order_id, outcome=quote.outcome, shares=filled_now,
+                            price=quote.price, fee=_ZERO, role="MAKER",
+                        ),
                     )
                     self._live_left[order_id] = quote.shares - filled_now
-                if self._live_left[order_id] > 0:
-                    window.orders[outcome] = order_id
+                if self._live_left.get(order_id, _ZERO) > 0:
+                    window.orders[key] = order_id
                 else:
                     self.portfolio.unlock(order_id)
                     self._live_prices.pop(order_id, None)
@@ -510,9 +517,11 @@ class TradingEngine:
     def _drop_finished_orders(self, window: Window) -> None:
         if self.mode != "paper":
             return
-        for outcome, order_id in list(window.orders.items()):
+        for key, order_id in list(window.orders.items()):
+            if self.mode != "paper":
+                continue
             if order_id not in self.paper.orders:
-                window.orders.pop(outcome, None)
+                window.orders.pop(key, None)
 
     def _apply_fill(self, window: Window, fill: Fill) -> None:
         try:
@@ -550,10 +559,10 @@ class TradingEngine:
             notify=True,
         )
         self._persist()
-        window.cooldown_until[fill.outcome] = time.time() + 12
 
     async def _pull_live_fills(self, window: Window) -> None:
-        for outcome, order_id in list(window.orders.items()):
+        for key, order_id in list(window.orders.items()):
+            outcome = key.split("@", 1)[0]
             delta = await self.live.newly_matched(order_id)
             if delta <= 0:
                 continue
@@ -568,10 +577,61 @@ class TradingEngine:
             left = self._live_left.get(order_id, _ZERO) - delta
             self._live_left[order_id] = left
             if left <= 0:
-                window.orders.pop(outcome, None)
+                window.orders.pop(key, None)
                 self.portfolio.unlock(order_id)
                 self._live_prices.pop(order_id, None)
                 self._live_left.pop(order_id, None)
+
+    async def _recent_trades(self, condition_id: str) -> list[dict]:
+        if self._session is None or not condition_id:
+            return []
+        try:
+            async with self._session.get(
+                "https://data-api.polymarket.com/v2/trades",
+                params={"condition": condition_id, "limit": "80"},
+            ) as response:
+                if response.status != 200:
+                    return []
+                payload = await response.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            self._note("ERROR", f"Лента сделок: {exc}")
+            return []
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        return list(rows or [])
+
+    async def _paper_prints(self, window: Window) -> list[Fill]:
+        """Seed the tape once, then fill only on new sell prints.
+
+        The first response is history. Filling it would pretend we were
+        already at the front of the queue.
+        """
+        rows = await self._recent_trades(window.condition_id)
+        fresh: list[tuple[str, dict]] = []
+        for row in rows:
+            key = "|".join(
+                str(row.get(name))
+                for name in ("transaction_hash", "token_id", "price", "size", "timestamp", "side")
+            )
+            if key in window.seen_prints:
+                continue
+            fresh.append((key, row))
+        if not window.prints_seeded:
+            for key, _row in fresh:
+                window.seen_prints.add(key)
+            window.prints_seeded = True
+            return []
+        fills: list[Fill] = []
+        for key, row in fresh:
+            window.seen_prints.add(key)
+            try:
+                price = D(row.get("price"))
+                size = D(row.get("size"))
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+            fills.extend(
+                self.paper.on_trade(str(row.get("token_id") or ""), price, size, str(row.get("side") or ""))
+            )
+        return fills
 
     async def _merge(self, window: Window) -> Decimal:
         book = self.portfolio.markets.get(window.slug)
@@ -583,6 +643,10 @@ class TradingEngine:
             return _ZERO
         pairs = min(up.shares, down.shares)
         if pairs < D(str(self.cfg.min_merge_shares)):
+            return _ZERO
+        # Matched shares pay $1 either way. Merging a pair that cost $1 or
+        # more only crystallises a loss; leave it for resolution instead.
+        if up.shares > 0 and down.shares > 0 and up.avg_price() + down.avg_price() >= Decimal("1"):
             return _ZERO
         gas = self._gas()
         tx = ""
@@ -750,7 +814,13 @@ class TradingEngine:
                     "value": str(value),
                     "unrealized": str(usdc(value - lot.cost - lot.fees)),
                 })
-        series = []
+        now = time.time()
+        floor = float(self.cfg.paper_stats_since_ts or 0)
+        edge = {
+            "d7": self.ledger.turnover(self.mode, max(floor, now - 7 * 86400)),
+            "d14": self.ledger.turnover(self.mode, max(floor, now - 14 * 86400)),
+            "d30": self.ledger.turnover(self.mode, max(floor, now - 30 * 86400)),
+        }
         try:
             series = self.ledger.equity_series(self.mode)
         except Exception:  # noqa: BLE001
@@ -777,7 +847,7 @@ class TradingEngine:
             "paused": self.paused,
             "halt_reason": self.halt_reason,
             "preset": "mo_money",
-            "strategy_title": "mo-money: мейкер 15–85¢",
+            "strategy_title": "mo-money: лестница мейкер-бидов",
             "equity": str(equity),
             "cash": str(self.portfolio.cash),
             "reserved": str(self.portfolio.reserved),
@@ -789,6 +859,17 @@ class TradingEngine:
             "pnl_all": str(usdc(equity - self.portfolio.initial_cash)),
             "fees_paid": str(self.portfolio.fees_paid),
             "gas_paid": str(self.portfolio.gas_paid),
+            "maker_rebates": str(self.portfolio.maker_rebates),
+            "taker_rebates": str(self.portfolio.taker_rebates),
+            "liquidity_rewards": str(self.portfolio.liquidity_rewards),
+            "edge": edge,
+            "wallet_edge": [
+                {"label": "июль–август 2026", "roi": "4.1%"},
+                {"label": "сентябрь 2026", "roi": "3.3%"},
+                {"label": "октябрь 2026", "roi": "2.6%"},
+                {"label": "ноябрь 2026", "roi": "2.4%"},
+                {"label": "последние 14 дней", "roi": "1.9%"},
+            ],
             "exposure": str(self.portfolio.exposure_cost()),
             "consecutive_losses": self.consecutive_losses,
             "stats": stats,

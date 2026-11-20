@@ -226,6 +226,32 @@ class Ledger:
             "merge_pnl": round(float(merges["pnl"]), 2),
         }
 
+    def turnover(self, mode: str, since_ts: float) -> dict[str, Any]:
+        """Return on our own turnover since ``since_ts``. Rebates are separate."""
+        with self._lock:
+            fills = self.conn.execute(
+                """
+                SELECT COUNT(*) AS n, COALESCE(SUM(CAST(notional AS REAL)), 0) AS notional
+                FROM fills WHERE mode = ? AND ts >= ?
+                """,
+                (mode, since_ts),
+            ).fetchone()
+            resolved = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(CAST(pnl AS REAL)), 0) AS pnl
+                FROM resolutions WHERE mode = ? AND ts >= ?
+                """,
+                (mode, since_ts),
+            ).fetchone()
+        notional = float(fills["notional"])
+        pnl = float(resolved["pnl"])
+        return {
+            "fills": int(fills["n"]),
+            "notional": round(notional, 2),
+            "pnl": round(pnl, 2),
+            "roi_pct": round(100.0 * pnl / notional, 2) if notional else None,
+        }
+
     def breakdown(self, mode: str, limit: int = 12) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(

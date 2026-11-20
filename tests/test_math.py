@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from bot.accounting import Portfolio
-from bot.books import advance_maker_fill, touch
+from bot.books import touch
 from bot.engine import winner_from_payouts
 from bot.execution import PaperBroker
 from bot.fees import fallback_taker_fee_rate, taker_fee_usdc
@@ -15,7 +15,9 @@ from bot.strategy import SideBook, in_entry_window, plan_quotes
 
 
 class FeeTests(unittest.TestCase):
-    def test_docs_curve_at_ten_cents(self) -> None:
+    def test_railway_log_example(self) -> None:
+        # 25.6 shares at 25¢, rate 0.07 → $0.336, the figure in the Railway logs.
+        self.assertEqual(taker_fee_usdc("25.6", "0.25", "0.07"), Decimal("0.336"))
         # 100 shares at 10¢, rate 0.07: 100 * 0.07 * 0.10 * 0.90 = 0.63
         self.assertEqual(taker_fee_usdc(100, "0.10", "0.07"), Decimal("0.63"))
 
@@ -106,6 +108,20 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(port.cash, Decimal("50") - Decimal("7") - Decimal("0.02"))
         self.assertEqual(port.equity({}), Decimal("42.98"))
 
+    def test_rebates_are_separate_lines_and_do_not_invent_themselves(self) -> None:
+        port = Portfolio(initial_cash=Decimal("100"), cash=Decimal("100"))
+        self.assertEqual(port.maker_rebates, Decimal("0"))
+        port.credit_income("maker_rebate", Decimal("1.25"))
+        port.credit_income("taker_rebate", Decimal("0.40"))
+        port.credit_income("reward", Decimal("0.10"))
+        self.assertEqual(port.maker_rebates, Decimal("1.25"))
+        self.assertEqual(port.taker_rebates, Decimal("0.40"))
+        self.assertEqual(port.liquidity_rewards, Decimal("0.10"))
+        self.assertEqual(port.cash, Decimal("101.75"))
+        self.assertEqual(port.realized, Decimal("1.75"))
+        again = Portfolio.from_dict(port.to_dict())
+        self.assertEqual(again.maker_rebates, Decimal("1.25"))
+
     def test_cannot_buy_without_cash_or_merge_one_side(self) -> None:
         port = Portfolio(initial_cash=Decimal("1"), cash=Decimal("1"))
         with self.assertRaises(ValueError):
@@ -167,24 +183,39 @@ class StrategyTests(unittest.TestCase):
         args.update(kw)
         return plan_quotes(sides, **args)
 
-    def test_rejects_the_losing_tails(self) -> None:
-        self.assertEqual(self._quote("0.90", "0.05"), [])
-        self.assertEqual(self._quote("0.10", "0.90"), [])
+    def test_cheap_wing_and_favourite_both_quote_when_the_pair_is_under_a_dollar(self) -> None:
+        quotes = self._quote("0.04", "0.93")
+        prices = {q.outcome: q.price for q in quotes}
+        self.assertIn("Up", prices)
+        self.assertIn("Down", prices)
+        self.assertLessEqual(max(q.price for q in quotes if q.outcome == "Up")
+                             + max(q.price for q in quotes if q.outcome == "Down"), Decimal("0.99"))
 
-    def test_shades_the_pair_down_to_99_cents(self) -> None:
-        quotes = {q.outcome: q for q in self._quote("0.50", "0.50")}
-        self.assertEqual(len(quotes), 2)
-        self.assertLessEqual(quotes["Up"].price + quotes["Down"].price, Decimal("0.99"))
+    def test_shades_or_drops_when_touches_sum_over_99_cents(self) -> None:
+        quotes = self._quote("0.50", "0.50")
+        if not quotes:
+            return
+        by = {}
+        for q in quotes:
+            by[q.outcome] = max(by.get(q.outcome, q.price), q.price)
+        if len(by) == 2:
+            self.assertLessEqual(by["Up"] + by["Down"], Decimal("0.99"))
 
-    def test_keeps_a_single_side_inside_the_band(self) -> None:
+    def test_keeps_a_single_side_when_the_other_cannot_fit(self) -> None:
         quotes = self._quote("0.62", "0.96")
-        self.assertEqual([q.outcome for q in quotes], ["Up"])
-        self.assertEqual(quotes[0].price, Decimal("0.62"))
-        self.assertGreaterEqual(quotes[0].shares, Decimal("5"))
+        outcomes = {q.outcome for q in quotes}
+        self.assertIn("Up", outcomes)
+        if "Down" in outcomes:
+            hi_up = max(q.price for q in quotes if q.outcome == "Up")
+            hi_dn = max(q.price for q in quotes if q.outcome == "Down")
+            self.assertLessEqual(hi_up + hi_dn, Decimal("0.99"))
+
+    def test_ladder_has_more_than_one_price(self) -> None:
+        quotes = [q for q in self._quote("0.40", "0.40") if q.outcome == "Up"]
+        self.assertGreaterEqual(len({q.price for q in quotes}), 2)
 
     def test_respects_cash_and_min_size(self) -> None:
-        # $1 of cash cannot buy 5 shares at 62¢.
-        self.assertEqual(self._quote("0.62", "0.30", free_cash=Decimal("1")), [])
+        self.assertEqual(self._quote("0.62", "0.30", free_cash=Decimal("0.2")), [])
 
     def test_does_not_lock_a_pair_above_99_cents(self) -> None:
         quotes = self._quote(
@@ -192,13 +223,25 @@ class StrategyTests(unittest.TestCase):
             held_avg={"Down": Decimal("0.68")},
             held_shares={"Down": Decimal("20")},
         )
-        self.assertTrue(quotes)
         self.assertTrue(all(q.outcome != "Up" for q in quotes))
 
+    def test_partial_fill_updates_the_average_used_for_the_cap(self) -> None:
+        from bot.strategy import projected_avg
+        avg = projected_avg(Decimal("10"), Decimal("0.60"), Decimal("10"), Decimal("0.40"))
+        self.assertEqual(avg, Decimal("0.50"))
+        # Adding the other side at 0.50 would make 1.00, which plan_quotes refuses.
+        quotes = self._quote(
+            "0.50", "0.10",
+            held_avg={"Up": avg},
+            held_shares={"Up": Decimal("20")},
+        )
+        self.assertTrue(all(q.outcome != "Down" or q.price + avg <= Decimal("0.99") for q in quotes))
+
     def test_entry_window(self) -> None:
-        self.assertFalse(in_entry_window(1, 200))
+        self.assertFalse(in_entry_window(0.2, 200))
         self.assertTrue(in_entry_window(10, 60))
-        self.assertFalse(in_entry_window(200, 5))
+        self.assertTrue(in_entry_window(240, 40))
+        self.assertFalse(in_entry_window(290, 2))
 
 
 class BookTests(unittest.TestCase):
@@ -211,30 +254,32 @@ class BookTests(unittest.TestCase):
         self.assertEqual(ask, Decimal("0.55"))
         self.assertEqual(size, Decimal("8"))
 
-    def test_queue_then_sweep(self) -> None:
-        queue, prev, got = advance_maker_fill(
-            queue_ahead=Decimal("100"), prev_level_size=Decimal("100"),
-            level_size=Decimal("90"), remaining=Decimal("10"),
-            price=Decimal("0.40"), best_ask=Decimal("0.41"),
+    def test_queue_then_print(self) -> None:
+        from bot.books import apply_trade_print
+        queue, got = apply_trade_print(
+            queue_ahead=Decimal("100"), remaining=Decimal("10"), our_price=Decimal("0.40"),
+            trade_price=Decimal("0.40"), trade_size=Decimal("30"), taker_side="SELL",
         )
         self.assertEqual(got, Decimal("0"))
-        self.assertEqual(queue, Decimal("90"))
-        # Level still there: the ask printing through does not fill us.
-        queue, prev, got = advance_maker_fill(
-            queue_ahead=Decimal("40"), prev_level_size=Decimal("40"),
-            level_size=Decimal("40"), remaining=Decimal("10"),
-            price=Decimal("0.40"), best_ask=Decimal("0.39"),
+        self.assertEqual(queue, Decimal("70"))
+        _, got = apply_trade_print(
+            queue_ahead=queue, remaining=Decimal("10"), our_price=Decimal("0.40"),
+            trade_price=Decimal("0.40"), trade_size=Decimal("80"), taker_side="SELL",
+        )
+        self.assertEqual(got, Decimal("10"))
+        # A buy print and a print above us do not fill.
+        _, got = apply_trade_print(
+            queue_ahead=Decimal("0"), remaining=Decimal("10"), our_price=Decimal("0.40"),
+            trade_price=Decimal("0.40"), trade_size=Decimal("50"), taker_side="BUY",
         )
         self.assertEqual(got, Decimal("0"))
-        self.assertEqual(queue, Decimal("40"))
-        _, _, swept = advance_maker_fill(
-            queue_ahead=Decimal("90"), prev_level_size=Decimal("90"),
-            level_size=Decimal("0"), remaining=Decimal("10"),
-            price=Decimal("0.40"), best_ask=Decimal("0.39"),
+        _, got = apply_trade_print(
+            queue_ahead=Decimal("0"), remaining=Decimal("10"), our_price=Decimal("0.40"),
+            trade_price=Decimal("0.41"), trade_size=Decimal("50"), taker_side="SELL",
         )
-        self.assertEqual(swept, Decimal("10"))
+        self.assertEqual(got, Decimal("0"))
 
-    def test_paper_broker_does_not_cross_and_fills_from_the_lock(self) -> None:
+    def test_paper_broker_fills_only_on_a_sell_print(self) -> None:
         port = Portfolio(initial_cash=Decimal("1000"), cash=Decimal("1000"))
         broker = PaperBroker(port)
         refused = broker.place(
@@ -248,13 +293,12 @@ class BookTests(unittest.TestCase):
         )
         self.assertIsNotNone(order_id)
         self.assertEqual(port.cash, Decimal("996"))
-        none = broker.on_book("t", [{"price": "0.40", "size": "50"}], Decimal("0.41"))
-        self.assertEqual(none, [])
-        # Ask through a level that is still there does not fill the whole order.
-        held = broker.on_book("t", [{"price": "0.40", "size": "30"}], Decimal("0.39"))
-        self.assertEqual(held, [])
-        fills = broker.on_book("t", [], Decimal("0.39"))
+        # Book disappearing is not a fill.
+        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "BUY"), [])
+        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("20"), "SELL"), [])
+        fills = broker.on_trade("t", Decimal("0.40"), Decimal("40"), "SELL")
         self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].shares, Decimal("10"))
         self.assertEqual(fills[0].fee, Decimal("0"))
         self.assertEqual(fills[0].role, "MAKER")
         port.buy_fill(
@@ -273,6 +317,87 @@ class ResolutionTests(unittest.TestCase):
         self.assertEqual(winner_from_payouts([1_000_000, 0], ["Up", "Down"]), "Up")
         self.assertEqual(winner_from_payouts([0, 1_000_000], ["Up", "Down"]), "Down")
         self.assertIsNone(winner_from_payouts([0, 0], ["Up", "Down"]))
+
+
+class PersistenceAndTelegramTests(unittest.TestCase):
+    def test_boot_does_not_wipe_a_saved_ledger(self) -> None:
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine
+
+        folder = tempfile.mkdtemp()
+        path = os.path.join(folder, "polybot.db")
+        os.environ["PAPER_RESET_ONCE"] = "true"
+        os.environ["PAPER_RESET_ID"] = "wipe-me"
+        try:
+            cfg = BotConfig(db_path=path, auto_start=False, bankroll_usd=100)
+            cfg.paper_reset_once = True
+            cfg.paper_reset_id = "wipe-me"
+            engine = TradingEngine(cfg)
+            engine.portfolio.buy_fill(
+                slug="m", condition_id="c", asset="BTC", timeframe="5m",
+                outcome="Up", shares=Decimal("5"), price=Decimal("0.40"), fee=Decimal("0"),
+            )
+            engine._persist()
+            again = TradingEngine(cfg)
+            self.assertEqual(again.portfolio.markets["m"].lot("Up").shares, Decimal("5"))
+            self.assertTrue(any("не стирается" in line for line in again.events))
+        finally:
+            os.environ.pop("PAPER_RESET_ONCE", None)
+            os.environ.pop("PAPER_RESET_ID", None)
+
+    def test_merge_refuses_a_pair_that_cost_a_dollar_or_more(self) -> None:
+        import os
+        import tempfile
+        import asyncio
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        folder = tempfile.mkdtemp()
+        cfg = BotConfig(db_path=os.path.join(folder, "t.db"), auto_start=False, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        engine.portfolio.buy_fill(
+            slug="m", condition_id="c", asset="BTC", timeframe="5m",
+            outcome="Up", shares=Decimal("10"), price=Decimal("0.60"), fee=Decimal("0"),
+        )
+        engine.portfolio.buy_fill(
+            slug="m", condition_id="c", asset="BTC", timeframe="5m",
+            outcome="Down", shares=Decimal("10"), price=Decimal("0.50"), fee=Decimal("0"),
+        )
+        window = Window(
+            slug="m", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "u", "Down": "d"}, start_ts=0, end_ts=10**12,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        cash = engine.portfolio.cash
+        pnl = asyncio.run(engine._merge(window))
+        self.assertEqual(pnl, Decimal("0"))
+        self.assertEqual(engine.portfolio.cash, cash)
+
+    def test_telegram_pnl_survives_a_missing_key(self) -> None:
+        from bot.telegram_ctl import TelegramController
+
+        class Fake:
+            class cfg:
+                telegram_bot_token = ""
+                telegram_chat_id = ""
+
+            def snapshot(self):
+                return {}
+
+            def set_notifier(self, fn):
+                return None
+
+        ctl = TelegramController(Fake())
+        text = ctl._pnl()
+        self.assertIn("Прибыль", text)
+        self.assertIn("Ребейт мейкера", text)
+        ctl._status()
+        ctl._strategy()
 
 
 if __name__ == "__main__":

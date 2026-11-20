@@ -96,6 +96,9 @@ class Portfolio:
     realized: Decimal = _ZERO
     fees_paid: Decimal = _ZERO
     gas_paid: Decimal = _ZERO
+    maker_rebates: Decimal = _ZERO
+    taker_rebates: Decimal = _ZERO
+    liquidity_rewards: Decimal = _ZERO
     locks: dict[str, Decimal] = field(default_factory=dict)
     markets: dict[str, MarketBook] = field(default_factory=dict)
     day_key: str = ""
@@ -108,6 +111,9 @@ class Portfolio:
         self.realized = usdc(D(self.realized))
         self.fees_paid = usdc(D(self.fees_paid))
         self.gas_paid = usdc(D(self.gas_paid))
+        self.maker_rebates = usdc(D(self.maker_rebates))
+        self.taker_rebates = usdc(D(self.taker_rebates))
+        self.liquidity_rewards = usdc(D(self.liquidity_rewards))
         self.day_baseline = usdc(D(self.day_baseline)) if self.day_key else self.initial_cash
         if not self.day_key:
             self.day_key = _utc_day()
@@ -273,6 +279,27 @@ class Portfolio:
     def day_pnl(self, equity_now: Decimal) -> Decimal:
         return usdc(D(equity_now) - self.day_baseline)
 
+    def credit_income(self, kind: str, amount: Decimal) -> Decimal:
+        """Book a rebate or liquidity reward as its own line.
+
+        Cash and realized both increase, so unrealized does not move.
+        ``kind`` is maker_rebate, taker_rebate, or reward.
+        """
+        amount = usdc(D(amount))
+        if amount == 0:
+            return _ZERO
+        self.cash = usdc(self.cash + amount)
+        self.realized = usdc(self.realized + amount)
+        if kind == "maker_rebate":
+            self.maker_rebates = usdc(self.maker_rebates + amount)
+        elif kind == "taker_rebate":
+            self.taker_rebates = usdc(self.taker_rebates + amount)
+        elif kind == "reward":
+            self.liquidity_rewards = usdc(self.liquidity_rewards + amount)
+        else:
+            raise ValueError(f"unknown income kind {kind}")
+        return amount
+
     def to_dict(self) -> dict:
         markets = {}
         for slug, book in self.markets.items():
@@ -297,6 +324,9 @@ class Portfolio:
             "realized": str(self.realized),
             "fees_paid": str(self.fees_paid),
             "gas_paid": str(self.gas_paid),
+            "maker_rebates": str(self.maker_rebates),
+            "taker_rebates": str(self.taker_rebates),
+            "liquidity_rewards": str(self.liquidity_rewards),
             "locks": {k: str(v) for k, v in self.locks.items()},
             "day_key": self.day_key,
             "day_baseline": str(self.day_baseline),
@@ -312,6 +342,9 @@ class Portfolio:
             realized=D(raw.get("realized") or 0),
             fees_paid=D(raw.get("fees_paid") or 0),
             gas_paid=D(raw.get("gas_paid") or 0),
+            maker_rebates=D(raw.get("maker_rebates") or 0),
+            taker_rebates=D(raw.get("taker_rebates") or 0),
+            liquidity_rewards=D(raw.get("liquidity_rewards") or 0),
             day_key=raw.get("day_key") or _utc_day(),
             day_baseline=D(raw.get("day_baseline") or raw["initial_cash"]),
         )

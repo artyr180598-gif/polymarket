@@ -194,7 +194,7 @@ function render(){
       metric("Всё время", money(s.pnl_all), cls(s.pnl_all)) +
       metric("В позициях", "$"+Number(s.exposure).toFixed(2), "") +
       '</div>' +
-      card("Как заработано", '<div class="row"><span>Реализовано</span><b class="'+cls(s.realized)+'">'+money(s.realized)+'</b></div><div class="row"><span>Оценка открытого</span><b class="'+cls(s.unrealized)+'">'+money(s.unrealized)+'</b></div><div class="row"><span>Комиссии</span><span>$'+Number(s.fees_paid).toFixed(2)+'</span></div><div class="row"><span>В заявках</span><span>$'+Number(s.reserved).toFixed(2)+'</span></div>');
+      card("Как заработано", '<div class="row"><span>Реализовано</span><b class="'+cls(s.realized)+'">'+money(s.realized)+'</b></div><div class="row"><span>Оценка открытого</span><b class="'+cls(s.unrealized)+'">'+money(s.unrealized)+'</b></div><div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div><div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div><div class="row"><span>Ребейт тейкера</span><span>'+money(s.taker_rebates||0)+'</span></div><div class="row"><span>Награды</span><span>'+money(s.liquidity_rewards||0)+'</span></div><div class="row"><span>В заявках</span><span>$'+Number(s.reserved).toFixed(2)+'</span></div>');
   } else if (tab === "positions") {
     const rows = s.positions || [];
     el.innerHTML = rows.length ? rows.map(p => card(p.asset+" "+p.timeframe+" · "+(p.outcome==="Up"?"Вверх":"Вниз"),
@@ -215,7 +215,7 @@ function render(){
     el.innerHTML += card("Сейчас открыты", wins || "<p>Нет активных окон.</p>");
   } else if (tab === "stats") {
     const st = s.stats || {};
-    el.innerHTML = '<div class="grid">' +
+      el.innerHTML = '<div class="grid">' +
       metric("Плюсовых окон", (st.win_rate_pct||0)+"%", "") +
       metric("Окон закрыто", String(st.markets||0), "") +
       metric("Сделок", String(st.fills||0), "") +
@@ -224,11 +224,17 @@ function render(){
       '<div class="row"><span>Плюс / минус</span><span>'+(st.wins||0)+' / '+(st.losses||0)+'</span></div>'+
       '<div class="row"><span>Реализовано по окнам</span><span>'+money(st.realized_pnl||0)+'</span></div>'+
       '<div class="row"><span>Оборот</span><span>$'+Number(st.notional||0).toFixed(2)+'</span></div>'+
-      '<div class="row"><span>Серия убытков</span><span>'+s.consecutive_losses+'</span></div>');
+      '<div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div>'+
+      '<div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div>'+
+      '<div class="row"><span>Ребейт тейкера</span><span>'+money(s.taker_rebates||0)+'</span></div>'+
+      '<div class="row"><span>Награды ликвидности</span><span>'+money(s.liquidity_rewards||0)+'</span></div>'+
+      '<div class="row"><span>Серия убытков</span><span>'+s.consecutive_losses+'</span></div>') +
+      edgeCard(s);
   } else if (tab === "strategy") {
     const L = s.limits || {};
-    el.innerHTML = card("Что делает бот", "<ul><li>Ставит заявки в стакан и ждёт, пока их купят. Комиссия мейкера — ноль.</li><li>Берёт цены только от 15¢ до 85¢. Края стакана на истории этого кошелька теряли деньги.</li><li>Если берёт обе стороны, вместе они не дороже 99¢.</li><li>Пару сразу меняет на 1 доллар. Остаток забирает после официального итога. Продаж нет.</li></ul>")
-      + card("Лимиты", '<div class="row"><span>Заявка</span><span>$'+L.order_clip_usd+'</span></div><div class="row"><span>На одно окно</span><span>$'+L.max_window_risk_usd+'</span></div><div class="row"><span>На все окна</span><span>$'+L.max_total_exposure_usd+'</span></div><div class="row"><span>Стоп за день</span><span>−$'+L.max_daily_loss_usd+'</span></div><div class="row"><span>Комиссии</span><span>'+s.fee_regime+'</span></div><div class="row"><span>Активы</span><span>'+(s.assets||[]).join(", ")+'</span></div>');
+    el.innerHTML = card("Что делает бот", "<ul><li>Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль.</li><li>Цены от 1¢ до 98¢. Дешёвые крылья дают лучшую отдачу на доллар. Выше 90¢ тоже небольшой плюс.</li><li>Средняя цена двух сторон вместе не выше 99¢. Дороже — вторую сторону не покупаем и убыточную пару не сливаем.</li><li>Пару дешевле $1 меняем на доллар. Остаток ждёт официальный итог. Продаж нет.</li><li>Оракул Chainlink для входа не нужен. Пока нет официальной резолюции, победителя не назначаем.</li></ul>")
+      + card("Лимиты", '<div class="row"><span>Заявка</span><span>$'+L.order_clip_usd+'</span></div><div class="row"><span>На одно окно</span><span>$'+L.max_window_risk_usd+'</span></div><div class="row"><span>На все окна</span><span>$'+L.max_total_exposure_usd+'</span></div><div class="row"><span>Стоп за день</span><span>−$'+L.max_daily_loss_usd+'</span></div><div class="row"><span>Комиссии</span><span>'+s.fee_regime+'</span></div><div class="row"><span>Активы</span><span>'+(s.assets||[]).join(", ")+'</span></div>')
+      + edgeCard(s);
   } else if (tab === "errors") {
     const rows = s.errors || [];
     el.innerHTML = card("Ошибки", rows.length ? "<ul>"+rows.map(e => "<li>"+e+"</li>").join("")+"</ul>" : "<p>Ошибок нет.</p>");
@@ -238,6 +244,16 @@ function render(){
     document.getElementById("pause").onclick = () => act("/api/action/pause");
     document.getElementById("kill").onclick = () => { if (confirm("Снять заявки и слить пары?")) act("/api/action/kill"); };
   }
+}
+function edgeCard(s){
+  const e = s.edge || {};
+  function line(title, row){
+    row = row || {};
+    const roi = row.roi_pct == null ? "—" : row.roi_pct + "%";
+    return '<div class="row"><span>'+title+'</span><span>'+roi+' на $'+Number(row.notional||0).toFixed(0)+'</span></div>';
+  }
+  const ref = (s.wallet_edge||[]).map(x => '<div class="row"><span>'+x.label+'</span><span>'+x.roi+'</span></div>').join("");
+  return card("Отдача на оборот", line("Наши 7 дней", e.d7)+line("Наши 14 дней", e.d14)+line("Наши 30 дней", e.d30)+'<p><small>У кошелька-образца отдача снижалась. Это не прогноз.</small></p>'+ref);
 }
 function metric(k,v,c){ return '<div class="card"><div class="k">'+k+'</div><div class="v '+c+'">'+v+'</div></div>'; }
 async function act(path){

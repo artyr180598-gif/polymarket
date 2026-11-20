@@ -1,9 +1,7 @@
 """Order-book helpers and the paper maker fill model.
 
-Paper fills are conservative on purpose. A resting bid sits at the back of
-the visible queue. It is filled only when that size is later consumed, or
-when the best ask prints strictly through the bid (the whole level traded).
-We never assume a taker fill and we never charge a maker fee.
+Paper fills only when a sell print trades the queue in front of a resting
+bid. A cancel that shrinks the book is not a fill. We never charge a maker fee.
 """
 
 from __future__ import annotations
@@ -48,43 +46,33 @@ def size_at(bids: list, price: Decimal) -> Decimal:
     return sum((sz for px, sz in parse_levels(bids) if px == D(price)), _ZERO)
 
 
-def advance_maker_fill(
+def apply_trade_print(
     *,
     queue_ahead: Decimal,
-    prev_level_size: Decimal | None,
-    level_size: Decimal,
     remaining: Decimal,
-    price: Decimal,
-    best_ask: Decimal | None,
-) -> tuple[Decimal, Decimal | None, Decimal]:
-    """Return (new_queue_ahead, new_prev_level_size, shares_filled).
+    our_price: Decimal,
+    trade_price: Decimal,
+    trade_size: Decimal,
+    taker_side: str,
+) -> tuple[Decimal, Decimal]:
+    """Return (new_queue_ahead, shares_filled).
 
-    ``prev_level_size is None`` means this is the first book we have seen
-    since the order was placed: we join the back and do not take old size.
+    Only a sell print fills a resting bid, and only by the size of that
+    print. A cancel that shrinks the book is not a trade and fills nothing.
+    Prints above our price do not reach us. We never fill more than the
+    print itself, so a one-lot trade cannot empty a large order.
     """
     queue = D(queue_ahead)
-    level = D(level_size)
     left = D(remaining)
-    filled = _ZERO
-    if left <= 0:
-        return queue, level, filled
-
-    if prev_level_size is None:
-        # Join the back. The size we see is in front of us.
-        return level, level, filled
-
-    prev = D(prev_level_size)
-    if level < prev:
-        eaten = prev - level
-        queue -= eaten
-        if queue < 0:
-            filled = min(left, -queue)
-            queue = _ZERO
-            left -= filled
-    # Ask printed strictly through our bid and the level is gone: everyone
-    # at this price, including the queue in front of us, has been traded.
-    # A still-visible level is not a sweep — only the consumed size counts.
-    if left > 0 and best_ask is not None and D(best_ask) < D(price) and level <= 0:
-        filled += left
-        queue = _ZERO
-    return queue, level, filled
+    size = D(trade_size)
+    if left <= 0 or size <= 0:
+        return queue, _ZERO
+    if (taker_side or "").upper() == "BUY":
+        return queue, _ZERO
+    if D(trade_price) > D(our_price):
+        return queue, _ZERO
+    queue -= size
+    if queue >= 0:
+        return queue, _ZERO
+    filled = min(left, -queue)
+    return _ZERO, filled
