@@ -641,7 +641,9 @@ class TradingEngine:
                             min_px = min(px for px, _ in levels)
                             if best_px is None:
                                 best_px = min_px
-                            depth = sum(sz for px, sz in levels if abs(px - best_px) < 0.015)
+                            # Only size actually resting at the best ask can be
+                            # filled at best_px without assuming price improvement.
+                            depth = sum(sz for px, sz in levels if abs(px - best_px) < 1e-6)
                 # A price without a readable book is not executable depth. Never
                 # synthesize a default depth or inflate a thin book to the minimum.
                 if best_px is None or best_px <= 0 or depth < 5.0:
