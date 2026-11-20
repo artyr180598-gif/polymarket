@@ -99,6 +99,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 mode="paper", slug=slug, condition_id="condition",
                 asset="BTC", timeframe="5m", role="TAKER_CLOB",
                 reason="favorite", fair_prob=0.6,
+                price_to_beat=100000.0, window_start_ts=start, window_end_ts=start + 300,
             )
             ledger.record_fill(
                 **common, outcome="Up", shares=10, price=0.6, fee=0.10, ts=now - 20
@@ -116,7 +117,7 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             engine = TradingEngine(cfg)
             engine._gamma = AsyncMock(return_value={
                 "condition_id": "condition", "up_token": "up-token",
-                "down_token": "down-token", "price_to_beat": 100000.0,
+                "down_token": "down-token", "price_to_beat": None,
             })
             await engine._restore_paper_state()
 
@@ -126,6 +127,9 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(engine.ledger.get_stats("paper")["merged_fees"], 0.075, places=4)
             self.assertEqual(len(engine.windows), 1)
             restored = engine.windows[slug]
+            self.assertEqual(restored.price_to_beat, 100000.0)
+            self.assertEqual(restored.start_ts, float(start))
+            self.assertEqual(restored.end_ts, float(start + 300))
             self.assertAlmostEqual(restored.up_shares, 5.0, places=4)
             self.assertAlmostEqual(restored.down_shares, 5.0, places=4)
             self.assertAlmostEqual(restored.up_cost + restored.down_cost, 4.5, places=4)
