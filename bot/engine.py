@@ -758,31 +758,39 @@ class TradingEngine:
     async def _housekeep_loop(self) -> None:
         while self.running:
             try:
-                now = time.time()
-                if now - self._last_equity_ts > 30:
-                    equity = self.portfolio.equity(self.marks)
-                    self.ledger.record_equity(
-                        mode=self.mode, equity=str(equity), cash=str(self.portfolio.cash),
-                        realized=str(self.portfolio.realized),
-                    )
-                    self._last_equity_ts = now
-                    self._persist()
-                stale = []
-                for slug, window in self.windows.items():
-                    book = self.portfolio.markets.get(slug)
-                    still_open = book is not None and not book.closed
-                    if still_open:
-                        if window.end_ts < now - 6 * 3600 and slug not in self._stuck_noted:
-                            self._stuck_noted.add(slug)
-                            self._note("ERROR", f"Окно {slug} без итога больше 6 часов, позиция сохранена")
-                        continue
-                    if window.end_ts < now - 600:
-                        stale.append(slug)
-                for slug in stale:
-                    self.windows.pop(slug, None)
+                self._housekeep_once()
             except Exception as exc:  # noqa: BLE001
-                self._note("ERROR", f"Фон: {exc}")
+                # A bookkeeping error must not cancel this task. Quoting
+                # lives in _trade_loop and keeps running either way.
+                self._note("ERROR", f"Фон: {exc}. Котировки продолжаются.")
             await asyncio.sleep(15)
+
+    def _housekeep_once(self) -> None:
+        now = time.time()
+        if now - self._last_equity_ts > 30:
+            try:
+                equity = self.portfolio.equity(self.marks)
+                self.ledger.record_equity(
+                    mode=self.mode, equity=str(equity), cash=str(self.portfolio.cash),
+                    realized=str(self.portfolio.realized),
+                )
+                self._last_equity_ts = now
+                self._persist()
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Запись капитала: {exc}. Котировки продолжаются.")
+        stale = []
+        for slug, window in self.windows.items():
+            book = self.portfolio.markets.get(slug)
+            still_open = book is not None and not book.closed
+            if still_open:
+                if window.end_ts < now - 6 * 3600 and slug not in self._stuck_noted:
+                    self._stuck_noted.add(slug)
+                    self._note("ERROR", f"Окно {slug} без итога больше 6 часов, позиция сохранена")
+                continue
+            if window.end_ts < now - 600:
+                stale.append(slug)
+        for slug in stale:
+            self.windows.pop(slug, None)
 
     def snapshot(self) -> dict[str, Any]:
         equity = self.portfolio.equity(self.marks)
