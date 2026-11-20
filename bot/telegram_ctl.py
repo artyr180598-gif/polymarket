@@ -133,16 +133,18 @@ class TelegramController:
                     if response.status != 200:
                         body = await response.text()
                         logger.warning("sendMessage %s: %s", response.status, body[:180])
-                        plain = (
-                            clean.replace("<b>", "").replace("</b>", "")
-                            .replace("<i>", "").replace("</i>", "")
-                            .replace("<code>", "").replace("</code>", "")
-                        )
-                        payload["text"] = plain[:4090]
-                        payload.pop("parse_mode", None)
-                        async with self._session.post(f"{self._base}/sendMessage", json=payload) as fallback:
-                            if fallback.status != 200:
-                                logger.warning("sendMessage plain %s", fallback.status)
+                        # Retry without HTML only for Telegram parse errors; never retry 429/5xx.
+                        if response.status == 400:
+                            plain = (
+                                clean.replace("<b>", "").replace("</b>", "")
+                                .replace("<i>", "").replace("</i>", "")
+                                .replace("<code>", "").replace("</code>", "")
+                            )
+                            payload["text"] = plain[:4090]
+                            payload.pop("parse_mode", None)
+                            async with self._session.post(f"{self._base}/sendMessage", json=payload) as fallback:
+                                if fallback.status != 200:
+                                    logger.warning("sendMessage plain %s", fallback.status)
             except Exception as exc:
                 logger.warning("Telegram send failed: %s", exc)
             finally:
