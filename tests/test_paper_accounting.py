@@ -196,6 +196,15 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "Unable to open persistent PAPER ledger"):
                 Ledger(str(blocker / "paper.db"))
 
+    async def test_missing_existing_ledger_is_not_recreated_as_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "paper.db")
+            ledger = Ledger(db_path)
+            ledger.conn.close()
+            Path(db_path).unlink()
+            with self.assertRaisesRegex(RuntimeError, "is missing"):
+                Ledger(db_path)
+
     async def test_recovery_event_order_puts_fills_before_merge(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Ledger(str(Path(tmp) / "events.db"))
