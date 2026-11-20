@@ -537,6 +537,13 @@ class TradingEngine:
                 token_ids = json.loads(token_ids)
             if not isinstance(token_ids, list) or len(token_ids) < 2:
                 return None
+            condition_id = str(market.get("conditionId") or "").strip()
+            up_token = str(token_ids[0]).strip()
+            down_token = str(token_ids[1]).strip()
+            if not condition_id or not up_token or not down_token or up_token == down_token:
+                return None
+            if market.get("closed") is True or market.get("active") is False:
+                return None
             metadata = event.get("eventMetadata") or {}
             price_to_beat = None
             raw_strike = metadata.get("priceToBeat") if isinstance(metadata, dict) else None
@@ -549,9 +556,9 @@ class TradingEngine:
                     pass
             fee_rate, fee_exponent = _market_fee_params(market)
             return {
-                "condition_id": str(market.get("conditionId") or ""),
-                "up_token": str(token_ids[0]),
-                "down_token": str(token_ids[1]),
+                "condition_id": condition_id,
+                "up_token": up_token,
+                "down_token": down_token,
                 "price_to_beat": price_to_beat,
                 "fee_rate": fee_rate,
                 "fee_exponent": fee_exponent,
