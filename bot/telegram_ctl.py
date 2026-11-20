@@ -191,7 +191,7 @@ class TelegramController:
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
             f"RTDS Chainlink/TWAP: {'OK' if st.get('chainlink_twap_ready') else 'ожидание'}",
-            f"수수료 Fees: −${fees:.2f}".replace("수수료 ", ""),
+            f"Комиссии: −${fees:.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
         if windows:
@@ -219,7 +219,8 @@ class TelegramController:
         open_fees = float(stats.get("open_fees", 0) or 0)
         wins = int(stats.get("win_markets", 0) or st.get("wins") or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
-        losses = max(0, resolved - wins)
+        losses = int(stats.get("loss_markets", max(0, resolved - wins)) or 0)
+        zeroes = int(stats.get("zero_markets", 0) or 0)
         n_fills = int(stats.get("total_fills", 0) or 0)
         n_merge = int(stats.get("merge_count", 0) or len(st.get("merge_history") or []))
         emoji = "📈" if pnl >= 0 else "📉"
@@ -240,7 +241,7 @@ class TelegramController:
             f"📊 Журнал\n"
             f"· Ставок: <b>{n_fills}</b>\n"
             f"· MERGE: <b>{n_merge}</b>\n"
-            f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses})\n\n"
+            f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses} / 0️⃣ {zeroes})\n\n"
             f"ℹ️ ✅/❌ только если позиция дождалась конца окна.\n"
             f"Открытый инвентарь не переоценён по текущему bid/ask: это не mark-to-market и не цена ликвидации."
         )
