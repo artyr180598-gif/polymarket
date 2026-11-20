@@ -29,9 +29,7 @@ def _kb_main() -> Dict[str, Any]:
 def _kb_presets() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "⭐ mo-money", "callback_data": "preset:mo_money"}],
-            [{"text": "🛡️ Lock-In", "callback_data": "preset:lockin"}],
-            [{"text": "⚡ Гибрид", "callback_data": "preset:hybrid"}],
+            [{"text": "⭐ mo-money · закреплён", "callback_data": "preset:mo_money"}],
             [{"text": "« Назад", "callback_data": "status"}],
         ]
     }
@@ -216,8 +214,9 @@ class TelegramController:
         fees = float(st.get("fees_paid", 0) or getattr(self.engine, "fees_paid", 0) or 0)
         pnl = equity - bank
         day = float(st.get("day_pnl", 0) or 0)
-        res_pnl = float(stats.get("realized_net_pnl", 0) or 0)
+        res_pnl = float(stats.get("resolved_net_pnl", 0) or 0)
         merge_pnl = float(st.get("merge_profit", stats.get("merged_net_pnl", 0)) or 0)
+        open_fees = float(stats.get("open_fees", 0) or 0)
         wins = int(stats.get("win_markets", 0) or st.get("wins") or 0)
         resolved = int(stats.get("resolved_markets", 0) or 0)
         losses = max(0, resolved - wins)
@@ -235,8 +234,9 @@ class TelegramController:
             f"Комиссии (taker): <b>−${fees:.2f}</b>\n\n"
             f"<b>Откуда плюс/минус</b>\n"
             f"· MERGE (пары): <b>${merge_pnl:+.2f}</b>\n"
-            f"· Окна до конца: <b>${res_pnl:+.2f}</b>\n"
-            f"· Книга: cash + открытые позиции по себестоимости, комиссии уже учтены\n"
+            f"· Резолвы: <b>${res_pnl:+.2f}</b>\n"
+            f"· Комиссии незакрытого инвентаря: <b>−${open_fees:.2f}</b>\n"
+            f"· Книга: cash + открытые позиции по себестоимости; это не mark-to-market\n"
             f"📊 Журнал\n"
             f"· Ставок: <b>{n_fills}</b>\n"
             f"· MERGE: <b>{n_merge}</b>\n"
@@ -312,12 +312,12 @@ class TelegramController:
         )
 
     def _fmt_presets(self) -> str:
-        lines = ["⚙️ <b>Пресет</b>", "━━━━━━━━━━━━━━━━"]
-        cur = self.engine.cfg.strategy_preset
-        for key, p in PRESETS.items():
-            mark = " ✅" if key == cur else ""
-            lines.append(f"\n<b>{getattr(p, 'title_ru', key)}</b>{mark}")
-        return "\n".join(lines)
+        return (
+            "⚙️ <b>Стратегия закреплена</b>\n"
+            "━━━━━━━━━━━━━━━━\n"
+            "⭐ mo-money · BTC 5m + 15m\n"
+            "Переключение на другие пресеты отключено, чтобы не менять проверяемую стратегию случайной командой."
+        )
 
     async def _handle(self, action: str):
         a = (action or "").strip().lower()
@@ -346,9 +346,9 @@ class TelegramController:
             return f"🛑 СТОП: merge ${res.get('merged_usd', 0):.2f}", _kb_main()
         if a.startswith("preset:"):
             key = a.split(":", 1)[1].strip()
-            if key in PRESETS and hasattr(self.engine, "set_preset"):
-                self.engine.set_preset(key)
-                return f"✅ Пресет: {key}", _kb_main()
+            if hasattr(self.engine, "set_preset") and self.engine.set_preset(key):
+                return "✅ Закреплённый пресет: mo-money · BTC 5m + 15m", _kb_main()
+            return "⛔ Переключение отключено: используется только mo-money.", _kb_main()
         return self._fmt_status(), _kb_main()
 
     async def _poll_loop(self) -> None:
