@@ -88,13 +88,16 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
 
     @app.post("/api/action/risk", dependencies=[Depends(verify_pin)])
     async def act_risk(req: RiskUpdateRequest) -> dict:
-        if hasattr(engine, "update_risk_limits"):
-            engine.update_risk_limits(
-                order_clip_usd=req.order_clip_usd,
-                max_window_risk_usd=req.max_window_risk_usd,
-                max_daily_loss_usd=req.max_daily_loss_usd,
-                enabled_assets=req.enabled_assets,
-            )
+        if not hasattr(engine, "update_risk_limits"):
+            raise HTTPException(status_code=503, detail="Изменение риск-лимитов отключено в закреплённой стратегии")
+        result = engine.update_risk_limits(
+            order_clip_usd=req.order_clip_usd,
+            max_window_risk_usd=req.max_window_risk_usd,
+            max_daily_loss_usd=req.max_daily_loss_usd,
+            enabled_assets=req.enabled_assets,
+        )
+        if asyncio.iscoroutine(result):
+            await result
         return {"ok": True}
 
     @app.get("/", response_class=HTMLResponse)
