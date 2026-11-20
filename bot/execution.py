@@ -1,325 +1,282 @@
-"""Paper and Live execution engines for Polymarket CLOB.
+"""Paper broker and a thin live broker.
 
-PaperExecutor:
-  - Virtual bankroll on live order books
-  - Limit orders join the BACK of the real queue (queue_ahead from L2)
-  - 120ms artificial latency
-  - Strict post-only: never fills as maker if price crosses the book
-  - Exact taker fee from fees.py
-  - MERGE / REDEEM simulated from Data API v2 resolutions
-
-LiveExecutor:
-  - AsyncSecureClient + optional Relayer for gasless merge/redeem
-  - Geoblock check before allowing live
+Paper never crosses the spread. Live uses the official ``polymarket`` SDK
+(``AsyncSecureClient``) and only sends post-only bids. If live credentials or
+the geoblock check fail, the engine stays paused instead of pretending to trade.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal
 
-from .fees import calc_taker_fee_usdc
+from .accounting import D, Portfolio
+from .books import advance_maker_fill, size_at
+from .fees import taker_fee_usdc
 
 log = logging.getLogger(__name__)
 
-
-@dataclass
-class PaperOrder:
-    order_id: str
-    asset_id: str
-    side: str  # BUY only in this bot
-    price: float
-    size: float
-    remaining: float
-    post_only: bool
-    created_ts: float
-    queue_ahead: float = 0.0
-    status: str = "open"  # open | filled | canceled
+_ZERO = Decimal(0)
 
 
 @dataclass
-class PaperFill:
+class Fill:
     order_id: str
-    asset_id: str
-    price: float
-    size: float
-    fee: float
-    role: str  # MAKER | TAKER
-    ts: float
+    outcome: str
+    shares: Decimal
+    price: Decimal
+    fee: Decimal
+    role: str
 
 
-class PaperExecutor:
-    """Simulates maker/taker fills against live L2 + trade tape."""
+@dataclass
+class Resting:
+    order_id: str
+    outcome: str
+    token_id: str
+    price: Decimal
+    remaining: Decimal
+    queue_ahead: Decimal
+    prev_level: Decimal | None = None
+    seen_book: bool = False
 
-    def __init__(self, bankroll_usd: float = 2750.0) -> None:
-        self.cash = float(bankroll_usd)
-        self.initial_bankroll = float(bankroll_usd)
-        self.orders: Dict[str, PaperOrder] = {}
-        self.fills: List[PaperFill] = []
-        self.positions: Dict[str, float] = {}  # asset_id -> shares
-        self._latency_sec = 0.120
 
-    @property
-    def equity(self) -> float:
-        # Mark-to-market simplified: cash + cost basis approximation via positions
-        # Engine maintains accurate equity via ledger + window inventory
-        return self.cash
+@dataclass
+class PaperBroker:
+    portfolio: Portfolio
+    orders: dict[str, Resting] = field(default_factory=dict)
 
-    async def place_post_only_buy(
+    def place(
         self,
-        asset_id: str,
-        price: float,
-        size: float,
-        best_bid: float = 0.0,
-        best_ask: float = 1.0,
-        bid_size_at_or_better: float = 0.0,
-    ) -> Optional[str]:
-        """Place post-only BUY. Rejects if would cross the spread."""
-        price = round(price, 2)
-        size = round(size, 2)
-        if size < 5.0 or price <= 0 or price >= 1:
+        *,
+        outcome: str,
+        token_id: str,
+        price: Decimal,
+        shares: Decimal,
+        best_ask: Decimal | None,
+        bid_size_at_price: Decimal,
+    ) -> str | None:
+        price = D(price)
+        shares = D(shares)
+        if shares <= 0 or price <= 0 or price >= 1:
             return None
-        if price >= best_ask - 1e-9:
-            # Would take liquidity — post-only rejects
+        if best_ask is not None and price >= D(best_ask):
             return None
-        cost = price * size
-        if cost > self.cash:
-            size = max(0.0, (self.cash / price) // 0.01 * 0.01)
-            if size < 5.0:
-                return None
-            cost = price * size
-
-        oid = str(uuid.uuid4())[:12]
-        # Queue position: volume of bids at better or equal price
-        queue_ahead = max(0.0, bid_size_at_or_better)
-        self.orders[oid] = PaperOrder(
-            order_id=oid,
-            asset_id=asset_id,
-            side="BUY",
+        notional = price * shares  # maker fee is 0
+        order_id = uuid.uuid4().hex[:12]
+        if not self.portfolio.lock(order_id, notional):
+            return None
+        self.orders[order_id] = Resting(
+            order_id=order_id,
+            outcome=outcome,
+            token_id=token_id,
             price=price,
-            size=size,
-            remaining=size,
-            post_only=True,
-            created_ts=time.time(),
-            queue_ahead=queue_ahead,
+            remaining=shares,
+            # First poll sets the queue from the book. Seed with the size we
+            # saw at placement so a book that never changes does not fill us.
+            queue_ahead=D(bid_size_at_price),
+            prev_level=D(bid_size_at_price),
+            seen_book=True,
         )
-        self.cash -= cost  # reserve
-        return oid
+        return order_id
 
-    async def place_market_buy(
-        self,
-        asset_id: str,
-        size: float,
-        best_ask: float,
-        asset: str = "BTC",
-        timeframe: str = "5m",
-    ) -> Optional[PaperFill]:
-        """FAK-style taker buy at best_ask."""
-        size = round(size, 2)
-        if size < 5.0 or best_ask <= 0 or best_ask >= 1:
-            return None
-        fee = calc_taker_fee_usdc(size, best_ask, asset, timeframe)
-        cost = best_ask * size + fee
-        if cost > self.cash:
-            return None
-        self.cash -= cost
-        self.positions[asset_id] = self.positions.get(asset_id, 0.0) + size
-        fill = PaperFill(
-            order_id="taker-" + str(uuid.uuid4())[:8],
-            asset_id=asset_id,
-            price=best_ask,
-            size=size,
-            fee=fee,
-            role="TAKER",
-            ts=time.time(),
-        )
-        self.fills.append(fill)
-        return fill
+    def cancel(self, order_id: str) -> None:
+        order = self.orders.pop(order_id, None)
+        if order is None:
+            return
+        # Release only the unfilled remainder. Filled shares already left the lock.
+        # buy_fill already removed the filled part of the lock. What is left
+        # is the unfilled remainder, and it goes back to free cash.
+        self.portfolio.unlock(order_id)
 
-    def on_book_and_tape(
-        self,
-        asset_id: str,
-        best_bid: float,
-        best_ask: float,
-        last_trade_price: Optional[float] = None,
-        last_trade_size: float = 0.0,
-        last_trade_side: str = "",
-    ) -> List[PaperFill]:
-        """Progress queue and generate maker fills when tape eats through us."""
-        now = time.time()
-        new_fills: List[PaperFill] = []
-        for oid, o in list(self.orders.items()):
-            if o.status != "open" or o.asset_id != asset_id:
+    def cancel_all(self) -> None:
+        for order_id in list(self.orders):
+            self.cancel(order_id)
+
+    def on_book(self, token_id: str, bids: list, best_ask: Decimal | None) -> list[Fill]:
+        fills: list[Fill] = []
+        for order in list(self.orders.values()):
+            if order.token_id != token_id or order.remaining <= 0:
                 continue
-            if now - o.created_ts < self._latency_sec:
+            level = size_at(bids, order.price)
+            queue, prev, got = advance_maker_fill(
+                queue_ahead=order.queue_ahead,
+                prev_level_size=order.prev_level,
+                level_size=level,
+                remaining=order.remaining,
+                price=order.price,
+                best_ask=best_ask,
+            )
+            order.queue_ahead = queue
+            order.prev_level = prev
+            if got <= 0:
                 continue
-            # If market moved through our price against us while resting — still maker if we were resting
-            if o.post_only and o.price >= best_ask - 1e-9:
-                # Book crossed us; cancel rather than take
-                o.status = "canceled"
-                self.cash += o.price * o.remaining  # release reserve
-                continue
-            # Queue decay from aggressive sells hitting the bid
-            if last_trade_price is not None and last_trade_side.upper() in ("SELL", "ASK", ""):
-                if last_trade_price <= o.price + 1e-9:
-                    o.queue_ahead = max(0.0, o.queue_ahead - last_trade_size)
-            # Fill when queue is gone and trade prints at or through our price
-            if o.queue_ahead <= 0 and last_trade_price is not None:
-                if last_trade_price <= o.price + 1e-9:
-                    fill_size = min(o.remaining, last_trade_size if last_trade_size > 0 else o.remaining)
-                    if fill_size >= 0.01:
-                        o.remaining = round(o.remaining - fill_size, 4)
-                        self.positions[asset_id] = self.positions.get(asset_id, 0.0) + fill_size
-                        # Maker fee = 0; reserved cash already deducted at limit price
-                        # Refund difference if any (we reserved at limit)
-                        fill = PaperFill(
-                            order_id=oid,
-                            asset_id=asset_id,
-                            price=o.price,
-                            size=fill_size,
-                            fee=0.0,
-                            role="MAKER",
-                            ts=now,
-                        )
-                        self.fills.append(fill)
-                        new_fills.append(fill)
-                        if o.remaining < 0.01:
-                            o.status = "filled"
-                            o.remaining = 0.0
-        return new_fills
+            order.remaining -= got
+            fills.append(
+                Fill(
+                    order_id=order.order_id,
+                    outcome=order.outcome,
+                    shares=got,
+                    price=order.price,
+                    fee=_ZERO,
+                    role="MAKER",
+                )
+            )
+            if order.remaining <= Decimal("0.0000005"):
+                # The portfolio lock stays until buy_fill spends it. The engine
+                # calls buy_fill with this order id immediately after.
+                self.orders.pop(order.order_id, None)
+        return fills
 
-    async def cancel_order(self, order_id: str) -> bool:
-        o = self.orders.get(order_id)
-        if not o or o.status != "open":
-            return False
-        o.status = "canceled"
-        self.cash += o.price * o.remaining
-        o.remaining = 0.0
-        return True
-
-    async def cancel_all(self, asset_ids: Optional[List[str]] = None) -> int:
-        n = 0
-        for oid, o in list(self.orders.items()):
-            if o.status != "open":
-                continue
-            if asset_ids and o.asset_id not in asset_ids:
-                continue
-            await self.cancel_order(oid)
-            n += 1
-        return n
-
-    async def merge_positions(self, condition_id: str, pairs: float) -> Dict[str, Any]:
-        """Simulate merge: burn equal Up+Down shares → $1.00 pUSD each pair."""
-        # Engine tracks inventory per outcome; here we just credit cash
-        pairs = round(pairs, 4)
-        if pairs < 1.0:
-            return {"ok": False, "pairs": 0}
-        self.cash += pairs * 1.0
-        return {"ok": True, "pairs": pairs, "tx": f"paper-merge-{uuid.uuid4().hex[:10]}"}
-
-    def get_open_orders(self, asset_id: Optional[str] = None) -> List[PaperOrder]:
-        out = []
-        for o in self.orders.values():
-            if o.status == "open" and (asset_id is None or o.asset_id == asset_id):
-                out.append(o)
-        return out
+    def open_orders(self) -> list[Resting]:
+        return list(self.orders.values())
 
 
-class LiveExecutor:
-    """Thin wrapper around polymarket AsyncSecureClient."""
+def quote_taker_fee(shares: Decimal, price: Decimal, fee_rate: Decimal, exponent: Decimal = Decimal(1)) -> Decimal:
+    """Kept so a taker path cannot forget the curve. The strategy does not take."""
+    return taker_fee_usdc(shares, price, fee_rate, exponent)
 
-    def __init__(self, cfg: Any) -> None:
+
+class LiveBroker:
+    """Post-only bids, merge, and redeem through the official SDK.
+
+    Fills are read from ``size_matched`` on the open order. The order of
+    collateral base units is handled by the SDK; we only consume share counts.
+    """
+
+    def __init__(self, cfg) -> None:
         self.cfg = cfg
         self.client = None
-        self._geoblocked = False
+        self._matched: dict[str, Decimal] = {}
+        self.ready = False
+        self.block_reason = ""
 
-    async def start(self) -> None:
-        from polymarket import AsyncSecureClient
-        # Geoblock check
+    async def start(self) -> bool:
         try:
             import aiohttp
-            async with aiohttp.ClientSession() as s:
-                async with s.get("https://polymarket.com/api/geoblock", timeout=10) as r:
-                    data = await r.json()
-                    if data.get("blocked") or data.get("geoblock"):
-                        self._geoblocked = True
-                        log.error("LIVE blocked by Polymarket geoblock: %s", data)
-                        return
-        except Exception as e:
-            log.warning("Geoblock check failed: %s", e)
+            from polymarket import AsyncSecureClient, BuilderApiKey, RelayerApiKey
+        except Exception as exc:  # noqa: BLE001
+            self.block_reason = f"SDK polymarket-client не установлен или сломан: {exc}"
+            log.error(self.block_reason)
+            return False
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get("https://polymarket.com/api/geoblock") as response:
+                    payload = await response.json(content_type=None)
+            if payload.get("blocked") is True:
+                self.block_reason = f"Polymarket закрыл этот IP: {payload}"
+                log.error(self.block_reason)
+                return False
+        except Exception as exc:  # noqa: BLE001
+            # A failed lookup is not proof of a block. Live still requires the
+            # key, and the operator can see the warning.
+            log.warning("geoblock check failed, continuing: %s", exc)
 
-        self.client = AsyncSecureClient(
-            private_key=self.cfg.private_key,
-            # wallet / funder address handled by client defaults
-        )
-        # Optional relayer / builder keys if present on cfg
-        log.info("LiveExecutor started (geoblock=%s)", self._geoblocked)
+        api_key = None
+        if self.cfg.relayer_api_key and self.cfg.relayer_api_key_address:
+            api_key = RelayerApiKey(key=self.cfg.relayer_api_key, address=self.cfg.relayer_api_key_address)
+        elif self.cfg.builder_api_key and self.cfg.builder_secret and self.cfg.builder_passphrase:
+            api_key = BuilderApiKey(
+                key=self.cfg.builder_api_key,
+                secret=self.cfg.builder_secret,
+                passphrase=self.cfg.builder_passphrase,
+            )
+        try:
+            self.client = await AsyncSecureClient.create(
+                private_key=self.cfg.private_key,
+                wallet=self.cfg.wallet_address,
+                api_key=api_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.block_reason = f"Не удалось открыть кошелёк: {exc}"
+            log.error(self.block_reason)
+            return False
+        self.ready = True
+        return True
 
-    async def place_post_only_buy(self, asset_id: str, price: float, size: float, **kwargs) -> Optional[str]:
-        if self._geoblocked or not self.client:
+    async def collateral_usdc(self) -> Decimal | None:
+        if not self.client:
             return None
         try:
-            # API surface may vary by client version — adapt to actual SDK
-            order = await self.client.create_and_post_order(
-                token_id=asset_id,
-                price=round(price, 2),
-                size=round(size, 2),
+            bal = await self.client.get_balance_allowance(asset_type="COLLATERAL")
+            return (Decimal(bal.balance) / Decimal(1_000_000)).quantize(Decimal("0.000001"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("balance: %s", exc)
+            return None
+
+    async def place(self, *, token_id: str, price: Decimal, shares: Decimal) -> tuple[str | None, str, Decimal]:
+        """Returns (order id, error, shares already matched at placement)."""
+        if not self.ready or self.client is None:
+            return None, self.block_reason or "live не готов", _ZERO
+        try:
+            resp = await self.client.place_limit_order(
+                token_id=token_id,
+                price=price,
+                size=shares,
                 side="BUY",
-                order_type="GTC",
                 post_only=True,
             )
-            return str(getattr(order, "id", order) or "")
-        except Exception as e:
-            log.error("Live place_post_only_buy: %s", e)
-            return None
+        except Exception as exc:  # noqa: BLE001
+            return None, str(exc), _ZERO
+        if getattr(resp, "ok", False) is not True:
+            return None, getattr(resp, "message", None) or getattr(resp, "code", "отклонено"), _ZERO
+        order_id = str(resp.order_id)
+        filled_now = _ZERO
+        if str(getattr(resp, "status", "")) == "matched":
+            taking = D(getattr(resp, "taking_amount", 0) or 0)
+            if taking > D(shares) * 50:
+                taking = taking / Decimal(1_000_000)
+            filled_now = min(D(shares), taking if taking > 0 else D(shares))
+        self._matched[order_id] = filled_now
+        return order_id, "", filled_now
 
-    async def place_market_buy(self, asset_id: str, size: float, **kwargs) -> Optional[Any]:
-        if self._geoblocked or not self.client:
-            return None
-        try:
-            order = await self.client.create_and_post_order(
-                token_id=asset_id,
-                price=0.99,  # aggressive
-                size=round(size, 2),
-                side="BUY",
-                order_type="FAK",
-            )
-            return order
-        except Exception as e:
-            log.error("Live place_market_buy: %s", e)
-            return None
-
-    async def cancel_order(self, order_id: str) -> bool:
+    async def cancel(self, order_id: str) -> None:
         if not self.client:
-            return False
+            return
         try:
-            await self.client.cancel(order_id)
-            return True
-        except Exception as e:
-            log.error("Live cancel: %s", e)
-            return False
+            await self.client.cancel_order(order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("cancel %s: %s", order_id, exc)
+        self._matched.pop(order_id, None)
 
-    async def cancel_all(self, asset_ids: Optional[List[str]] = None) -> int:
+    async def newly_matched(self, order_id: str) -> Decimal:
+        """Shares filled since the last poll. 0 if the order is gone or unchanged."""
         if not self.client:
-            return 0
+            return _ZERO
         try:
-            await self.client.cancel_all()
-            return 1
-        except Exception as e:
-            log.error("Live cancel_all: %s", e)
-            return 0
+            order = await self.client.get_order(order_id=order_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("get_order %s: %s", order_id, exc)
+            return _ZERO
+        matched = D(order.size_matched)
+        prev = self._matched.get(order_id, _ZERO)
+        if matched < prev:
+            return _ZERO
+        delta = matched - prev
+        self._matched[order_id] = matched
+        return delta
 
-    async def merge_positions(self, condition_id: str, pairs: float) -> Dict[str, Any]:
+    async def merge(self, condition_id: str) -> str:
         if not self.client:
-            return {"ok": False}
-        try:
-            # Client method name may be merge or merge_positions
-            tx = await self.client.merge(condition_id, amount=pairs)
-            return {"ok": True, "pairs": pairs, "tx": str(tx)}
-        except Exception as e:
-            log.error("Live merge: %s", e)
-            return {"ok": False, "error": str(e)}
+            raise RuntimeError("live не готов")
+        handle = await self.client.merge_positions(condition_id=condition_id, amount="max")
+        outcome = await handle.wait()
+        return str(getattr(outcome, "transaction_hash", "") or outcome)
+
+    async def redeem(self, condition_id: str) -> str:
+        if not self.client:
+            raise RuntimeError("live не готов")
+        handle = await self.client.redeem_positions(condition_id=condition_id)
+        outcome = await handle.wait()
+        return str(getattr(outcome, "transaction_hash", "") or outcome)
+
+    async def close(self) -> None:
+        if self.client is not None:
+            try:
+                await self.client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.client = None

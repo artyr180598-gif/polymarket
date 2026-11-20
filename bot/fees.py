@@ -1,92 +1,86 @@
-"""Exact Polymarket crypto fee & weighted-volume math with Nov 20, 2026 auto-switchover.
+"""Polymarket taker fees.
 
-Official specification:
-  https://docs.polymarket.com/trading/fees
-  https://docs.polymarket.com/programs/fee-and-rebate-changes-november-2026
+Official formula (docs.polymarket.com/trading/fees), still current on 2026-11-20:
 
-Formula:
-  taker_fee_usdc = round(shares * fee_rate * price * (1 - price), 5)
-  maker_fee_usdc = 0.0
+    fee = shares × feeRate × (price × (1 − price)) ** exponent
 
-Schedule transition at Friday, 2026-11-20 23:59:00 UTC (epoch 1795219140):
-  - Before switchover: all Crypto markets use fee_rate = 0.07
-  - After switchover:
-      * BTC 5m & 15m up/down -> fee_rate = 0.05
-      * All other Crypto markets (ETH/SOL/XRP/DOGE/BNB/HYPE 5m/15m, all 1h/4h/1d) -> fee_rate = 0.01
+exponent is 1 on crypto up/down markets (``feeSchedule.exponent``).
+The result is rounded half-up to 5 decimal places. Anything that rounds
+below 0.00001 USDC is charged as zero. Makers pay no platform fee.
+
+Schedule, until 2026-11-20 23:59 UTC:
+    every crypto market: feeRate 0.07, maker rebate 20% of the taker fee.
+
+After that timestamp (docs: fee-and-rebate-changes-november-2026):
+    BTC 5m and 15m up/down: 0.05
+    every other crypto market: 0.01
+    makers still pay 0.
+
+A market's own ``feeSchedule.rate`` from Gamma is the source of truth when
+the bot is placing an order. The table above is only the fallback.
 """
 
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
-NOV_20_2026_SWITCHOVER_TS = int(datetime(2026, 11, 20, 23, 59, 0, tzinfo=timezone.utc).timestamp())
+FEE_QUANTUM = Decimal("0.00001")
+MIN_FEE = Decimal("0.00001")
+SWITCH_AT = datetime(2026, 11, 20, 23, 59, tzinfo=timezone.utc)
+CRYPTO_RATE_BEFORE = Decimal("0.07")
+BTC_SHORT_RATE_AFTER = Decimal("0.05")
+OTHER_CRYPTO_RATE_AFTER = Decimal("0.01")
+
+# Display rounding for the docs table is to the cent. The charge itself is 5 dp.
+_ONE = Decimal(1)
 
 
-def get_crypto_taker_fee_rate(
-    asset: str,
-    timeframe: str,
-    now_ts: float | None = None,
-    market_override_rate: float | None = None,
-) -> float:
-    """Return the active taker fee coefficient for a crypto Up/Down market."""
-    if market_override_rate is not None and market_override_rate >= 0:
-        # Once Gamma publishes the updated per-market feeSchedule.rate, prefer it directly.
-        # Before switchover Gamma publishes 0.07; after switchover 0.05 or 0.01.
-        ts = now_ts if now_ts is not None else time.time()
-        if ts < NOV_20_2026_SWITCHOVER_TS or market_override_rate != 0.07:
-            return float(market_override_rate)
+def _d(value: Decimal | int | str | float) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    # float via str avoids binary residue (0.07 is not exact in binary).
+    return Decimal(str(value))
 
-    ts = now_ts if now_ts is not None else time.time()
-    if ts < NOV_20_2026_SWITCHOVER_TS:
-        return 0.07
 
+def fallback_taker_fee_rate(asset: str, timeframe: str, now: datetime | None = None) -> Decimal:
+    """Rate used only when Gamma did not publish feeSchedule.rate."""
+    ts = now or datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    if ts < SWITCH_AT:
+        return CRYPTO_RATE_BEFORE
     if asset.upper() == "BTC" and timeframe.lower() in ("5m", "15m"):
-        return 0.05
-    return 0.01
+        return BTC_SHORT_RATE_AFTER
+    return OTHER_CRYPTO_RATE_AFTER
 
 
-def calc_taker_fee_usdc(
-    shares: float,
-    price: float,
-    asset: str,
-    timeframe: str,
-    now_ts: float | None = None,
-    market_override_rate: float | None = None,
-) -> float:
-    """Exact Polymarket taker fee in USDC (rounded to 5 decimals; <0.00001 -> 0)."""
-    if shares <= 0 or price <= 0 or price >= 1:
-        return 0.0
-    rate = get_crypto_taker_fee_rate(asset, timeframe, now_ts=now_ts, market_override_rate=market_override_rate)
-    raw = shares * rate * price * (1.0 - price)
-    fee = round(raw, 5)
-    return fee if fee >= 0.00001 else 0.0
+def taker_fee_usdc(
+    shares: Decimal | int | str | float,
+    price: Decimal | int | str | float,
+    fee_rate: Decimal | int | str | float,
+    exponent: Decimal | int | str | float = 1,
+) -> Decimal:
+    """Taker fee in USDC. Maker trades must pass fee_rate 0 (returns 0)."""
+    qty = _d(shares)
+    px = _d(price)
+    rate = _d(fee_rate)
+    exp = _d(exponent)
+    if qty <= 0 or px <= 0 or px >= 1 or rate <= 0 or exp < 0:
+        return Decimal(0)
+    curve = (px * (_ONE - px)) ** exp
+    raw = qty * rate * curve
+    fee = raw.quantize(FEE_QUANTUM, rounding=ROUND_HALF_UP)
+    if fee < MIN_FEE:
+        return Decimal(0)
+    return fee
 
 
-def calc_taker_fee_per_share(
-    price: float,
-    asset: str,
-    timeframe: str,
-    now_ts: float | None = None,
-    market_override_rate: float | None = None,
-) -> float:
-    """Taker fee per single share in USD."""
-    if price <= 0 or price >= 1:
-        return 0.0
-    rate = get_crypto_taker_fee_rate(asset, timeframe, now_ts=now_ts, market_override_rate=market_override_rate)
-    return rate * price * (1.0 - price)
-
-
-def calc_weighted_volume(shares: float, price: float) -> float:
-    """Polymarket price-weighted volume contribution: shares * price * (1 - price)."""
-    if shares <= 0 or price <= 0 or price >= 1:
-        return 0.0
-    return shares * price * (1.0 - price)
-
-
-def fee_regime_label(now_ts: float | None = None) -> str:
-    ts = now_ts if now_ts is not None else time.time()
-    if ts < NOV_20_2026_SWITCHOVER_TS:
-        hours_left = max(0.0, (NOV_20_2026_SWITCHOVER_TS - ts) / 3600.0)
-        return f"0.07 (снижение до 0.05/0.01 через {hours_left:.0f}ч)"
-    return "BTC 5m/15m: 0.05 | ETH/SOL/1h+: 0.01"
+def fee_regime_label(now: datetime | None = None) -> str:
+    ts = now or datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    if ts < SWITCH_AT:
+        hours = (SWITCH_AT - ts).total_seconds() / 3600
+        return f"крипто 0.07 до переключения (через {hours:.0f} ч) · мейкер 0"
+    return "BTC 5m/15m: 0.05 · остальная крипта: 0.01 · мейкер 0"

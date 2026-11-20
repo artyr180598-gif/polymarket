@@ -1,299 +1,244 @@
-"""SQLite persistent ledger for trades, merges, resolved windows, and PnL curve."""
+"""SQLite history. The portfolio snapshot is the source of truth across restarts."""
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+import threading
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any
 
 
 class Ledger:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         parent = os.path.dirname(os.path.abspath(db_path))
-        try:
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        except Exception:
-            fallback = "/tmp/polybot.db"
-            self.db_path = fallback
-            self.conn = sqlite3.connect(fallback, check_same_thread=False)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self._lock = threading.Lock()
+        self._init()
 
-    def _init_schema(self) -> None:
-        cur = self.conn.cursor()
-        cur.executescript(
-            """
-            PRAGMA journal_mode=WAL;
+    def _init(self) -> None:
+        with self._lock:
+            self.conn.executescript(
+                """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS kv (
+                    k TEXT PRIMARY KEY,
+                    v TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS fills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    mode TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    condition_id TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    shares TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    notional TEXT NOT NULL,
+                    fee TEXT NOT NULL,
+                    order_id TEXT DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS merges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    mode TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    pairs TEXT NOT NULL,
+                    pnl TEXT NOT NULL,
+                    tx TEXT DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS resolutions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    mode TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    condition_id TEXT NOT NULL,
+                    asset TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    winner TEXT NOT NULL,
+                    pnl TEXT NOT NULL,
+                    payout TEXT NOT NULL,
+                    UNIQUE(mode, slug)
+                );
+                CREATE TABLE IF NOT EXISTS equity_points (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    mode TEXT NOT NULL,
+                    equity TEXT NOT NULL,
+                    cash TEXT NOT NULL,
+                    realized TEXT NOT NULL
+                );
+                """
+            )
+            self.conn.commit()
 
-            CREATE TABLE IF NOT EXISTS fills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                mode TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                condition_id TEXT NOT NULL,
-                asset TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                role TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                shares REAL NOT NULL,
-                price REAL NOT NULL,
-                notional REAL NOT NULL,
-                fee REAL NOT NULL,
-                fair_prob REAL NOT NULL,
-                tx_or_order_id TEXT DEFAULT ''
-            );
+    def save_portfolio(self, mode: str, blob: dict) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (f"portfolio:{mode}", json.dumps(blob)),
+            )
+            self.conn.commit()
 
-            CREATE TABLE IF NOT EXISTS merges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                mode TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                condition_id TEXT NOT NULL,
-                pairs REAL NOT NULL,
-                cost_basis REAL NOT NULL,
-                locked_pnl REAL NOT NULL,
-                tx_hash TEXT DEFAULT ''
-            );
+    def load_portfolio(self, mode: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute("SELECT v FROM kv WHERE k = ?", (f"portfolio:{mode}",)).fetchone()
+        if not row:
+            return None
+        return json.loads(row["v"])
 
-            CREATE TABLE IF NOT EXISTS resolutions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                mode TEXT NOT NULL,
-                slug TEXT NOT NULL,
-                condition_id TEXT NOT NULL,
-                asset TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                winner TEXT NOT NULL,
-                price_to_beat REAL,
-                final_price REAL,
-                up_shares_total REAL NOT NULL,
-                down_shares_total REAL NOT NULL,
-                merged_pairs REAL NOT NULL,
-                gross_cost REAL NOT NULL,
-                total_fees REAL NOT NULL,
-                total_payout REAL NOT NULL,
-                gross_pnl REAL NOT NULL,
-                net_pnl REAL NOT NULL,
-                UNIQUE(mode, slug)
-            );
+    def record_fill(self, **row: Any) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role,
+                                   shares, price, notional, fee, order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("ts", time.time()), row["mode"], row["slug"], row["condition_id"],
+                    row["asset"], row["timeframe"], row["outcome"], row["role"],
+                    str(row["shares"]), str(row["price"]), str(row["notional"]), str(row["fee"]),
+                    row.get("order_id", ""),
+                ),
+            )
+            self.conn.commit()
 
-            CREATE TABLE IF NOT EXISTS equity_points (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                mode TEXT NOT NULL,
-                equity REAL NOT NULL,
-                cash REAL NOT NULL,
-                realized_net_pnl REAL NOT NULL,
-                fees_paid REAL NOT NULL
-            );
-            """
-        )
-        self.conn.commit()
+    def record_merge(self, **row: Any) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO merges (ts, mode, slug, pairs, pnl, tx) VALUES (?, ?, ?, ?, ?, ?)",
+                (time.time(), row["mode"], row["slug"], str(row["pairs"]), str(row["pnl"]), row.get("tx", "")),
+            )
+            self.conn.commit()
 
-    def record_fill(
-        self,
-        *,
-        mode: str,
-        slug: str,
-        condition_id: str,
-        asset: str,
-        timeframe: str,
-        outcome: str,
-        role: str,
-        reason: str,
-        shares: float,
-        price: float,
-        fee: float,
-        fair_prob: float,
-        tx_or_order_id: str = "",
-        ts: float | None = None,
-    ) -> None:
-        t = ts if ts is not None else time.time()
-        self.conn.execute(
-            """
-            INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
-                               shares, price, notional, fee, fair_prob, tx_or_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                t, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
-                round(shares, 4), round(price, 4), round(shares * price, 4),
-                round(fee, 5), round(fair_prob, 4), tx_or_order_id,
-            ),
-        )
-        self.conn.commit()
+    def record_resolution(self, **row: Any) -> None:
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO resolutions (ts, mode, slug, condition_id, asset, timeframe, winner, pnl, payout)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mode, slug) DO UPDATE SET
+                    ts = excluded.ts, winner = excluded.winner, pnl = excluded.pnl, payout = excluded.payout
+                """,
+                (
+                    time.time(), row["mode"], row["slug"], row["condition_id"], row["asset"],
+                    row["timeframe"], row["winner"], str(row["pnl"]), str(row["payout"]),
+                ),
+            )
+            self.conn.commit()
 
-    def record_merge(
-        self,
-        *,
-        mode: str,
-        slug: str,
-        condition_id: str,
-        pairs: float,
-        cost_basis: float,
-        locked_pnl: float,
-        tx_hash: str = "",
-    ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO merges (ts, mode, slug, condition_id, pairs, cost_basis, locked_pnl, tx_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (time.time(), mode, slug, condition_id, round(pairs, 4), round(cost_basis, 4), round(locked_pnl, 4), tx_hash),
-        )
-        self.conn.commit()
+    def record_equity(self, *, mode: str, equity: str, cash: str, realized: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO equity_points (ts, mode, equity, cash, realized) VALUES (?, ?, ?, ?, ?)",
+                (time.time(), mode, equity, cash, realized),
+            )
+            self.conn.commit()
 
-    def record_resolution(
-        self,
-        *,
-        mode: str,
-        slug: str,
-        condition_id: str,
-        asset: str,
-        timeframe: str,
-        winner: str,
-        price_to_beat: float | None,
-        final_price: float | None,
-        up_shares_total: float,
-        down_shares_total: float,
-        merged_pairs: float,
-        gross_cost: float,
-        total_fees: float,
-        total_payout: float,
-    ) -> float:
-        gross_pnl = total_payout - gross_cost
-        net_pnl = gross_pnl - total_fees
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO resolutions (
-                ts, mode, slug, condition_id, asset, timeframe, winner, price_to_beat, final_price,
-                up_shares_total, down_shares_total, merged_pairs, gross_cost, total_fees,
-                total_payout, gross_pnl, net_pnl
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                time.time(), mode, slug, condition_id, asset, timeframe, winner,
-                price_to_beat, final_price, up_shares_total, down_shares_total,
-                merged_pairs, gross_cost, total_fees, total_payout, gross_pnl, net_pnl,
-            ),
-        )
-        self.conn.commit()
-        return net_pnl
+    def recent_fills(self, mode: str, limit: int = 40) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM fills WHERE mode = ? ORDER BY id DESC LIMIT ?", (mode, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
-    def record_equity(
-        self,
-        *,
-        mode: str,
-        equity: float,
-        cash: float,
-        realized_net_pnl: float,
-        fees_paid: float,
-    ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO equity_points (ts, mode, equity, cash, realized_net_pnl, fees_paid)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (time.time(), mode, round(equity, 2), round(cash, 2), round(realized_net_pnl, 2), round(fees_paid, 4)),
-        )
-        self.conn.commit()
+    def recent_merges(self, mode: str, limit: int = 20) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM merges WHERE mode = ? ORDER BY id DESC LIMIT ?", (mode, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
-    def get_stats(self, mode: str) -> Dict[str, Any]:
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    def recent_resolutions(self, mode: str, limit: int = 30) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM resolutions WHERE mode = ? ORDER BY id DESC LIMIT ?", (mode, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
-        f_row = self.conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total_fills,
-                COALESCE(SUM(CASE WHEN role='MAKER' THEN 1 ELSE 0 END), 0) AS maker_fills,
-                COALESCE(SUM(notional), 0) AS total_notional,
-                COALESCE(SUM(CASE WHEN role='MAKER' THEN notional ELSE 0 END), 0) AS maker_notional,
-                COALESCE(SUM(fee), 0) AS total_fees,
-                COALESCE(SUM(shares * price * (1.0 - price)), 0) AS weighted_vol
-            FROM fills WHERE mode = ?
-            """,
-            (mode,),
-        ).fetchone()
+    def equity_series(self, mode: str, limit: int = 180) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT ts, equity, cash, realized FROM (
+                    SELECT * FROM equity_points WHERE mode = ? ORDER BY id DESC LIMIT ?
+                ) ORDER BY id ASC
+                """,
+                (mode, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
-        r_row = self.conn.execute(
-            """
-            SELECT
-                COUNT(*) AS resolved_mkts,
-                COALESCE(SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END), 0) AS win_mkts,
-                COALESCE(SUM(gross_pnl), 0) AS gross_pnl,
-                COALESCE(SUM(net_pnl), 0) AS net_pnl,
-                COALESCE(SUM(CASE WHEN ts >= ? THEN net_pnl ELSE 0 END), 0) AS today_net_pnl
-            FROM resolutions WHERE mode = ?
-            """,
-            (today_start, mode),
-        ).fetchone()
-
-        m_row = self.conn.execute(
-            """
-            SELECT COUNT(*) AS merge_count, COALESCE(SUM(pairs), 0) AS merged_usd,
-                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl
-            FROM merges WHERE mode = ?
-            """,
-            (mode,),
-        ).fetchone()
-
-        total_fills = int(f_row["total_fills"])
-        total_notional = float(f_row["total_notional"])
-        resolved_mkts = int(r_row["resolved_mkts"])
-
+    def stats(self, mode: str, now: float | None = None) -> dict[str, Any]:
+        now = now if now is not None else time.time()
+        day = now - (now % 86400)
+        week = now - 7 * 86400
+        with self._lock:
+            fills = self.conn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       COALESCE(SUM(CAST(notional AS REAL)), 0) AS notional,
+                       COALESCE(SUM(CAST(fee AS REAL)), 0) AS fees,
+                       COALESCE(SUM(CASE WHEN role = 'MAKER' THEN 1 ELSE 0 END), 0) AS makers
+                FROM fills WHERE mode = ?
+                """,
+                (mode,),
+            ).fetchone()
+            resolved = self.conn.execute(
+                """
+                SELECT COUNT(*) AS n,
+                       COALESCE(SUM(CASE WHEN CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                       COALESCE(SUM(CAST(pnl AS REAL)), 0) AS pnl,
+                       COALESCE(SUM(CASE WHEN ts >= ? THEN CAST(pnl AS REAL) ELSE 0 END), 0) AS today,
+                       COALESCE(SUM(CASE WHEN ts >= ? THEN CAST(pnl AS REAL) ELSE 0 END), 0) AS week
+                FROM resolutions WHERE mode = ?
+                """,
+                (day, week, mode),
+            ).fetchone()
+            merges = self.conn.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(CAST(pnl AS REAL)), 0) AS pnl FROM merges WHERE mode = ?",
+                (mode,),
+            ).fetchone()
+        n = int(resolved["n"])
+        wins = int(resolved["wins"])
+        fn = int(fills["n"])
         return {
-            "total_fills": total_fills,
-            "maker_fills": int(f_row["maker_fills"]),
-            "maker_fill_pct": round(100.0 * f_row["maker_fills"] / total_fills, 1) if total_fills else 0.0,
-            "total_notional": round(total_notional, 2),
-            "maker_usdc_pct": round(100.0 * f_row["maker_notional"] / total_notional, 1) if total_notional else 0.0,
-            "total_fees": round(float(f_row["total_fees"]), 4),
-            "weighted_vol": round(float(f_row["weighted_vol"]), 2),
-            "resolved_markets": resolved_mkts,
-            "win_markets": int(r_row["win_mkts"]),
-            "win_rate_pct": round(100.0 * r_row["win_mkts"] / resolved_mkts, 1) if resolved_mkts else 0.0,
-            "realized_gross_pnl": round(float(r_row["gross_pnl"]), 2),
-            "realized_net_pnl": round(float(r_row["net_pnl"]), 2),
-            "today_net_pnl": round(float(r_row["today_net_pnl"]), 2),
-            "merge_count": int(m_row["merge_count"]),
-            "merged_usd": round(float(m_row["merged_usd"]), 2),
-            "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
+            "fills": fn,
+            "maker_fills": int(fills["makers"]),
+            "notional": round(float(fills["notional"]), 2),
+            "fees": round(float(fills["fees"]), 4),
+            "markets": n,
+            "wins": wins,
+            "losses": max(0, n - wins),
+            "win_rate_pct": round(100.0 * wins / n, 1) if n else 0.0,
+            "realized_pnl": round(float(resolved["pnl"]), 2),
+            "today_realized": round(float(resolved["today"]), 2),
+            "week_realized": round(float(resolved["week"]), 2),
+            "merges": int(merges["n"]),
+            "merge_pnl": round(float(merges["pnl"]), 2),
         }
 
-    def recent_fills(self, mode: str, limit: int = 30) -> List[Dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM fills WHERE mode = ? ORDER BY id DESC LIMIT ?",
-            (mode, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def recent_merges(self, mode: str, limit: int = 15) -> List[Dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM merges WHERE mode = ? ORDER BY id DESC LIMIT ?",
-            (mode, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def recent_resolutions(self, mode: str, limit: int = 20) -> List[Dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM resolutions WHERE mode = ? ORDER BY id DESC LIMIT ?",
-            (mode, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-    def equity_series(self, mode: str, limit: int = 120) -> List[Dict[str, Any]]:
-        rows = self.conn.execute(
-            """
-            SELECT ts, equity, cash, realized_net_pnl, fees_paid
-            FROM (SELECT * FROM equity_points WHERE mode = ? ORDER BY id DESC LIMIT ?)
-            ORDER BY id ASC
-            """,
-            (mode, limit),
-        ).fetchall()
+    def breakdown(self, mode: str, limit: int = 12) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT asset || ' ' || timeframe AS bucket,
+                       COUNT(*) AS markets,
+                       SUM(CASE WHEN CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END) AS wins,
+                       ROUND(SUM(CAST(pnl AS REAL)), 2) AS pnl
+                FROM resolutions WHERE mode = ?
+                GROUP BY asset, timeframe
+                ORDER BY pnl DESC
+                LIMIT ?
+                """,
+                (mode, limit),
+            ).fetchall()
         return [dict(r) for r in rows]
