@@ -959,10 +959,8 @@ class TradingEngine:
             except Exception as exc:
                 log.debug("resolution API not ready for %s: %s", w.slug, exc)
 
-        # Fallback is permitted only with a Chainlink sample captured after the
-        # window ended. Never infer a winner from current spot or inventory size.
-        if winner is None and w.final_price is not None and w.price_to_beat is not None:
-            winner = "Up" if w.final_price >= w.price_to_beat else "Down"
+        # Chainlink samples around the boundary are retained for audit only.
+        # They are not a substitute for Polymarket's authoritative resolution.
         if winner is None:
             return
         if w.up_shares < 0.01 and w.down_shares < 0.01:
