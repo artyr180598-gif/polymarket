@@ -72,7 +72,7 @@ class TelegramController:
         self._task = asyncio.create_task(self._poll_loop(), name="telegram_poll")
         bank = self.engine.cfg.bankroll_usd
         await self.send(
-            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: PolyBolt / legacy RTDS + CLOB REST",
+            f"🟢 <b>PolyBot онлайн</b>\nСтратегия: <b>mo-money</b>\nБанк: <b>${bank:,.0f}</b>\nЦены: PolyBolt Chainlink + CLOB REST",
             keyboard=_kb_main(),
         )
 
@@ -228,7 +228,7 @@ class TelegramController:
             f"💵 Equity at cost: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
-            f"Price feed: {('PolyBolt' if st.get('price_feed_mode') == 'polybolt' else ('Legacy RTDS (deprecated)' if st.get('price_feed_mode') == 'legacy_rtds' else 'не подключён'))} · {'OK' if st.get('chainlink_twap_ready') else 'ожидание'}",
+            f"Price feed: {('PolyBolt' if st.get('price_feed_mode') == 'polybolt' else ('PolyBolt: нет CLOB API credentials' if st.get('price_feed_mode') == 'polybolt_unconfigured' else 'не подключён'))} · {'OK' if st.get('chainlink_twap_ready') else 'ожидание'}",
             f"Комиссии: −${fees:.2f}",
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
@@ -347,7 +347,7 @@ class TelegramController:
             "2) При подходящей цене добавляет дешёвую противоположную ногу примерно до 22% стоимости фаворита\n"
             "3) MERGE закрывает только совпавшие пары; остаток держит до подтверждённого резолва\n"
             "4) SELL не используется. Комиссии taker учитываются отдельно.\n\n"
-            "Источник цен: PolyBolt при наличии API/Chainlink ключей; иначе legacy RTDS (deprecated). PAPER-исполнение виртуальное; это не гарантия реального исполнения или прибыли."
+            "Источник цен: PolyBolt требует CLOB API key/secret/passphrase; при отсутствии ключей новые входы заблокированы. PAPER-исполнение виртуальное; это не гарантия реального исполнения или прибыли."
         )
 
     def _fmt_presets(self) -> str:
