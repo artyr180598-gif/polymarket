@@ -724,6 +724,7 @@ class TradingEngine:
                         delay = 1.0
                         self._log_event("INFO", "PolyBolt authenticated · Chainlink spot + native 60s TWAP", notify=True)
                         last_ping = time.monotonic()
+                        last_seq: Dict[str, int] = {}
                         while self.running:
                             try:
                                 msg = await ws.receive(timeout=5.0)
@@ -744,6 +745,13 @@ class TradingEngine:
                                             raise ConnectionError("PolyBolt returned invalid dropped-frame metadata")
                                         if dropped > 0:
                                             raise ConnectionError(f"PolyBolt dropped {dropped} {channel} updates")
+                                        seq = frame.get("seq")
+                                        if type(seq) is not int or seq < 0:
+                                            raise ConnectionError(f"PolyBolt returned invalid sequence for {channel}")
+                                        previous = last_seq.get(channel)
+                                        if previous is not None and seq != previous + 1:
+                                            raise ConnectionError(f"PolyBolt {channel} sequence gap: {previous} -> {seq}")
+                                        last_seq[channel] = seq
                                     try:
                                         self._handle_polybolt_frame(frame)
                                     except Exception as exc:
