@@ -67,8 +67,8 @@ main.py                 FastAPI + Uvicorn + Engine + Telegram
 bot/
   config.py             BotConfig + 3 strategy presets
   fees.py               Exact Polymarket fee formula + 2026-11-20 switchover
-  twap_model.py         Rolling 60-second Chainlink TWAP + Binance lead-lag
-  engine.py             PolyBolt Chainlink spot/TWAP when credentials exist; legacy RTDS fallback + CLOB REST
+  twap_model.py         Chainlink spot + native PolyBolt 60-second TWAP fair-value model
+  engine.py             Authenticated PolyBolt Chainlink spot/TWAP + CLOB REST quotes; fail-closed without credentials
   ledger.py             SQLite WAL (fills / merges / resolutions / equity)
   execution.py          PaperExecutor (queue-aware) + LiveExecutor
   engine.py             discovery + mo-money-inspired PAPER strategy + risk
