@@ -179,7 +179,7 @@ class TelegramController:
             f"Стратегия: <b>mo-money</b> · RTDS + CLOB REST",
             f"Режим: <b>{mode}</b>",
             f"",
-            f"💵 Equity: <b>${equity:,.2f}</b>",
+            f"💵 Equity at cost: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
             f"RTDS Chainlink/TWAP: {'OK' if st.get('chainlink_twap_ready') else 'ожидание'}",
@@ -215,10 +215,10 @@ class TelegramController:
         n_merge = int(stats.get("merge_count", 0) or len(st.get("merge_history") or []))
         emoji = "📈" if pnl >= 0 else "📉"
         return (
-            f"💰 <b>Прибыль и убытки (демо)</b>\n"
+            f"💰 <b>PAPER PnL (учёт по себестоимости)</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Старт: <b>${bank:,.0f}</b>\n"
-            f"Equity: <b>${equity:,.2f}</b>\n"
+            f"Equity (инвентарь по себестоимости): <b>${equity:,.2f}</b>\n"
             f"Cash: ${cash:,.2f}\n"
             f"{emoji} Итого: <b>${pnl:+.2f}</b> ({(pnl/bank*100) if bank else 0:+.1f}%)\n"
             f"Сегодня: <b>${day:+.2f}</b>\n"
@@ -226,13 +226,13 @@ class TelegramController:
             f"<b>Откуда плюс/минус</b>\n"
             f"· MERGE (пары): <b>${merge_pnl:+.2f}</b>\n"
             f"· Окна до конца: <b>${res_pnl:+.2f}</b>\n"
-            f"· Чистыми ≈ Equity − старт (уже минус fee)\n\n"
+            f"· Книга: cash + открытые позиции по себестоимости, комиссии уже учтены\n"
             f"📊 Журнал\n"
             f"· Ставок: <b>{n_fills}</b>\n"
             f"· MERGE: <b>{n_merge}</b>\n"
             f"· Окон до резолва: <b>{resolved}</b> (✅ {wins} / ❌ {losses})\n\n"
             f"ℹ️ ✅/❌ только если позиция дождалась конца окна.\n"
-            f"Если всё закрыли MERGE — там 0, это нормально."
+            f"Открытый инвентарь не переоценён по текущему bid/ask: это не mark-to-market и не цена ликвидации."
         )
 
     def _fmt_positions(self) -> str:
