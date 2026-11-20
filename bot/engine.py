@@ -748,7 +748,7 @@ class TradingEngine:
                     # onto a window that has not started yet.
                     if w.price_to_beat is None:
                         tr = self.trackers.get(asset)
-                        feed_ts = getattr(tr, "cl_spot_ts", 0.0) if tr else 0.0
+                        feed_ts = getattr(tr, "cl_received_ts", 0.0) if tr else 0.0
                         ptb = getattr(tr, "cl_spot", None) if tr else None
                         if ptb and 0 <= (feed_ts - float(start)) <= 20:
                             w.price_to_beat = float(ptb)
@@ -910,7 +910,7 @@ class TradingEngine:
         if tr is None:
             return
         spot = getattr(tr, "cl_spot", None)
-        if w.price_to_beat is None and spot and 0 <= (tr.cl_spot_ts - w.start_ts) <= 20:
+        if w.price_to_beat is None and spot and 0 <= (tr.cl_received_ts - w.start_ts) <= 20:
             w.price_to_beat = float(spot)
         if (
             w.price_to_beat is None or spot is None or tr.cl_twap60 is None
