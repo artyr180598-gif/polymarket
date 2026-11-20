@@ -52,6 +52,7 @@ class AssetPriceTracker:
         self.cl_twap60: Optional[float] = None
         self.cl_twap60_ts: float = 0.0
         self.cl_twap_recv_mono: float = 0.0
+        self.cl_twap_received_ts: float = 0.0
         self.bn_spot: Optional[float] = None
         self.bn_spot_ts: float = 0.0
         self.bn_recv_mono: float = 0.0
@@ -93,6 +94,7 @@ class AssetPriceTracker:
         self.cl_spot = price
         self.cl_spot_ts = ts
         self.cl_recv_mono = now_m
+        self.cl_received_ts = received_ts
         if not self.cl_spot_hist or ts > self.cl_spot_hist[-1][0]:
             self.cl_spot_hist.append((ts, price))
             if compute_twap:
@@ -127,13 +129,23 @@ class AssetPriceTracker:
         integral += price * (now_ts - cursor)
         self.on_chainlink_twap60(integral / 60.0, int(now_ts * 1000))
 
-    def on_chainlink_twap60(self, twap_val: float, feed_ts_ms: int) -> None:
+    def on_chainlink_twap60(
+        self, twap_val: float, feed_ts_ms: int, *, received_at_ms: int | None = None,
+    ) -> None:
         ts = feed_ts_ms / 1000.0
-        if self.cl_twap60_ts and ts <= self.cl_twap60_ts:
+        received_ts = (received_at_ms / 1000.0) if received_at_ms else ts
+        now_m = time.monotonic()
+        if self.cl_twap60_ts and ts < self.cl_twap60_ts:
+            return
+        if self.cl_twap60_ts and ts == self.cl_twap60_ts:
+            if received_ts > self.cl_twap_received_ts:
+                self.cl_twap_received_ts = received_ts
+                self.cl_twap_recv_mono = now_m
             return
         self.cl_twap60 = twap_val
         self.cl_twap60_ts = ts
-        self.cl_twap_recv_mono = time.monotonic()
+        self.cl_twap_recv_mono = now_m
+        self.cl_twap_received_ts = received_ts
         if not self.cl_twap_hist or ts >= self.cl_twap_hist[-1][0]:
             self.cl_twap_hist.append((ts, twap_val))
         sec = int(round(ts))
