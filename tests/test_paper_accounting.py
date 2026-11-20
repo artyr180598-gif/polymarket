@@ -52,6 +52,23 @@ class SettlementClockTests(unittest.TestCase):
         self.assertGreaterEqual(window.seconds_after_end, 9.0)
 
 
+class LedgerStatsTests(unittest.TestCase):
+    def test_realized_stats_include_net_merge_pnl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger(str(Path(tmp) / "stats.db"))
+            ledger.record_merge(
+                mode="paper", slug="btc-updown-5m-1800000000",
+                condition_id="condition", pairs=5.0, cost_basis=4.0,
+                locked_pnl=1.0, fees=0.2,
+            )
+            stats = ledger.get_stats("paper")
+            self.assertEqual(stats["realized_gross_pnl"], 1.0)
+            self.assertEqual(stats["realized_net_pnl"], 0.8)
+            self.assertEqual(stats["today_net_pnl"], 0.8)
+            self.assertEqual(stats["merged_net_pnl"], 0.8)
+            ledger.conn.close()
+
+
 class StrategySafetyTests(unittest.TestCase):
     def test_mo_money_preset_cannot_be_switched_by_runtime_command(self):
         with tempfile.TemporaryDirectory() as tmp:
