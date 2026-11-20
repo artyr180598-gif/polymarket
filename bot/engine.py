@@ -826,27 +826,33 @@ class TradingEngine:
         try:
             up_part = (pairs / w.up_shares) * w.up_cost if w.up_shares else 0.0
             dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares else 0.0
+            up_fee_part = (pairs / w.up_shares) * w.up_fees if w.up_shares else 0.0
+            dn_fee_part = (pairs / w.down_shares) * w.down_fees if w.down_shares else 0.0
+            allocated_fees = up_fee_part + dn_fee_part
             cost = up_part + dn_part
             locked = pairs - cost
+            self._roll_day()
             w.up_shares = max(0.0, w.up_shares - pairs)
             w.down_shares = max(0.0, w.down_shares - pairs)
             w.up_cost = max(0.0, w.up_cost - up_part)
             w.down_cost = max(0.0, w.down_cost - dn_part)
+            w.up_fees = max(0.0, w.up_fees - up_fee_part)
+            w.down_fees = max(0.0, w.down_fees - dn_fee_part)
             self.cash += pairs
             self.realized_pnl += locked
             self.day_pnl += locked
-            self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked})
+            self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked, "fees": allocated_fees, "net_pnl": locked - allocated_fees})
             self._merge_history = self._merge_history[:40]
             try:
                 self.ledger.record_merge(
                     mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}",
+                    pairs=pairs, cost_basis=cost, locked_pnl=locked, fees=allocated_fees, tx_hash=f"m-{int(time.time())}",
                 )
             except Exception as e:
                 log.warning("record_merge: %s", e)
             self._log_event(
                 "INFO",
-                f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>",
+                f"♻️ MERGE: закрыл {pairs:.1f} пар\nGross: ${locked:+.2f} · fees: ${allocated_fees:.2f}\nNet по этим парам: ${locked-allocated_fees:+.2f}\n<code>{w.slug}</code>",
                 notify=True,
             )
             return pairs
