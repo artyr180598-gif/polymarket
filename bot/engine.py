@@ -139,12 +139,15 @@ def _choose_entry(ask_up, ask_dn, fair_up: float, late: bool, min_fair: float = 
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
-        self.params: StrategyParams = cfg.params
-        # Tape of 0x32ed… (@mo-money), 9h / 2164 buys / $86k: 98% BTC,
-        # 5m+15m, zero SELLs. This preset is locked to that universe.
-        if cfg.strategy_preset == "mo_money":
-            cfg.enabled_assets = ["BTC"]
-            cfg.enabled_timeframes = ["5m", "15m"]
+        # This instance is intentionally a single-strategy PAPER experiment.
+        # Ignore a stale/accidental environment preset rather than silently
+        # changing the strategy or widening the market universe.
+        if cfg.strategy_preset != "mo_money":
+            log.warning("Ignoring configured strategy preset %r; locking to mo_money", cfg.strategy_preset)
+        cfg.strategy_preset = "mo_money"
+        cfg.enabled_assets = ["BTC"]
+        cfg.enabled_timeframes = ["5m", "15m"]
+        self.params: StrategyParams = PRESETS["mo_money"]
         self.ledger = Ledger(cfg.db_path)
         self.trackers = {a: AssetPriceTracker(a) for a in cfg.enabled_assets}
         self.windows: Dict[str, WindowState] = {}
