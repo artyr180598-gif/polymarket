@@ -56,6 +56,12 @@ class LedgerStatsTests(unittest.TestCase):
     def test_realized_stats_include_net_merge_pnl(self):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Ledger(str(Path(tmp) / "stats.db"))
+            ledger.record_fill(
+                mode="paper", slug="btc-updown-5m-1800000000",
+                condition_id="condition", asset="BTC", timeframe="5m",
+                outcome="Up", role="TAKER_CLOB", reason="favorite",
+                shares=5.0, price=0.8, fee=0.2, fair_prob=0.8,
+            )
             ledger.record_merge(
                 mode="paper", slug="btc-updown-5m-1800000000",
                 condition_id="condition", pairs=5.0, cost_basis=4.0,
