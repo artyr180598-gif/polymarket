@@ -469,18 +469,23 @@ class TradingEngine:
                 raise ConnectionError("PolyBolt connection closed during handshake")
 
     def _handle_polybolt_frame(self, frame: Dict[str, Any]) -> None:
-        if frame.get("v") != 1:
+        if type(frame.get("v")) is not int or frame.get("v") != 1:
             return
+        raw_snapshot = frame.get("snapshot", False)
+        if not isinstance(raw_snapshot, bool):
+            return
+        snapshot = raw_snapshot
         channel = str(frame.get("channel") or "")
         payload = frame.get("payload") or {}
         if channel not in ("price.crypto", "price.crypto.twap") or not isinstance(payload, dict):
+            return
+        if channel == "price.crypto.twap" and int(payload.get("window_seconds") or 0) != 60:
             return
         symbol = str(payload.get("symbol") or "").lower()
         source = str(payload.get("source") or "").lower()
         if symbol != "btcusd" or source != "chainlink":
             return
 
-        snapshot = bool(frame.get("snapshot", False))
         frame_ts = int(frame.get("ts") or 0)
         if snapshot:
             points = payload.get("data") or []
@@ -514,8 +519,6 @@ class TradingEngine:
         if tracker is None:
             return
         if channel == "price.crypto.twap":
-            if not snapshot and int(payload.get("window_seconds") or 0) != 60:
-                return
             if frame_ts <= 0:
                 return
             tracker.on_chainlink_twap60(price, frame_ts)
