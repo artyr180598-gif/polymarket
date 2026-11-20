@@ -184,19 +184,30 @@ class StrategyTests(unittest.TestCase):
         args.update(kw)
         return plan_quotes(sides, **args)
 
-    def test_cheap_wing_and_favourite_both_quote_when_the_pair_is_under_a_dollar(self) -> None:
-        # Opening bids stay inside 5–55¢. A 4¢ lottery and a 93¢ favourite
-        # are not how a sub-dollar pair gets started.
-        quotes = self._quote("0.20", "0.45")
-        prices = {q.outcome: q.price for q in quotes}
-        self.assertIn("Up", prices)
-        self.assertIn("Down", prices)
-        self.assertLessEqual(max(q.price for q in quotes if q.outcome == "Up")
-                             + max(q.price for q in quotes if q.outcome == "Down"), Decimal("0.99"))
-        self.assertEqual(self._quote("0.04", "0.93"), [])
+    def test_pair_sum_hedge_accepts_97_cents(self) -> None:
+        import os
+        from bot.config import BotConfig
+        os.environ["PAIR_SUM_HEDGE"] = "0.97"
+        try:
+            self.assertEqual(BotConfig.from_env().pair_sum_hedge, 0.97)
+        finally:
+            os.environ.pop("PAIR_SUM_HEDGE", None)
+        os.environ["PAIR_SUM_HEDGE"] = "0.50"
+        try:
+            self.assertEqual(BotConfig.from_env().pair_sum_hedge, 0.90)
+        finally:
+            os.environ.pop("PAIR_SUM_HEDGE", None)
+
+    def test_opens_only_on_the_favourite_between_55_and_90(self) -> None:
+        quotes = self._quote("0.70", "0.30")
+        self.assertTrue(quotes)
+        self.assertTrue(all(q.outcome == "Up" for q in quotes))
+        self.assertTrue(all(Decimal("0.55") <= q.price <= Decimal("0.90") for q in quotes))
+        self.assertEqual(self._quote("0.50", "0.20"), [])
+        self.assertEqual(self._quote("0.92", "0.20"), [])
 
     def test_shades_or_drops_when_touches_sum_over_99_cents(self) -> None:
-        quotes = self._quote("0.50", "0.50")
+        quotes = self._quote("0.60", "0.60")
         if not quotes:
             return
         by = {}
@@ -206,14 +217,14 @@ class StrategyTests(unittest.TestCase):
             self.assertLessEqual(by["Up"] + by["Down"], Decimal("0.99"))
 
     def test_keeps_a_single_side_when_the_other_cannot_fit(self) -> None:
-        # 30¢ can open. 80¢ cannot, until the cheap side is actually held.
+        # 80¢ can open. 30¢ cannot, until it is the hedge for a leg we hold.
         quotes = self._quote("0.30", "0.80")
         outcomes = {q.outcome for q in quotes}
-        self.assertEqual(outcomes, {"Up"})
-        self.assertTrue(all(q.price <= Decimal("0.30") for q in quotes))
+        self.assertEqual(outcomes, {"Down"})
+        self.assertTrue(all(Decimal("0.55") <= q.price <= Decimal("0.80") for q in quotes))
 
     def test_ladder_has_more_than_one_price(self) -> None:
-        quotes = [q for q in self._quote("0.40", "0.40") if q.outcome == "Up"]
+        quotes = [q for q in self._quote("0.70", "0.20") if q.outcome == "Up"]
         self.assertGreaterEqual(len({q.price for q in quotes}), 2)
 
     def test_respects_cash_and_min_size(self) -> None:
@@ -283,7 +294,32 @@ class StrategyTests(unittest.TestCase):
         self.assertGreaterEqual(total, Decimal("10"))
         self.assertLessEqual(total, Decimal("12"))
         self.assertTrue(all(q.price <= Decimal("0.60") for q in down))
-        self.assertTrue(all(q.price >= Decimal("0.05") for q in self._quote("0.02", "0.40")))
+
+    def test_hedge_stays_under_97_minus_the_filled_average(self) -> None:
+        quotes = self._quote(
+            "0.92", "0.40",
+            held_avg={"Up": Decimal("0.70")},
+            held_shares={"Up": Decimal("12")},
+            hedge_cap=Decimal("0.97"),
+        )
+        down = [q for q in quotes if q.outcome == "Down"]
+        self.assertTrue(down)
+        self.assertTrue(all(q.price <= Decimal("0.97") - Decimal("0.70") for q in down))
+
+    def test_filled_side_is_not_averaged_outside_55_to_90(self) -> None:
+        held = dict(held_avg={"Up": Decimal("0.70")}, held_shares={"Up": Decimal("12")}, hedge_cap=Decimal("0.97"))
+        faded = self._quote("0.50", "0.20", **held)
+        self.assertTrue(all(q.outcome != "Up" for q in faded))
+        rich = self._quote("0.92", "0.20", **held)
+        self.assertTrue(all(q.outcome != "Up" for q in rich))
+        still = self._quote("0.72", "0.20", **held)
+        self.assertTrue(any(q.outcome == "Up" for q in still))
+        capped = self._quote(
+            "0.72", "0.20",
+            window_cap=Decimal("80"), window_spent=Decimal("80"),
+            **held,
+        )
+        self.assertEqual(capped, [])
 
     def test_four_hour_windows_follow_us_eastern(self) -> None:
         from bot.engine import _window_bases

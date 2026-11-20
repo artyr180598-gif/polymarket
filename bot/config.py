@@ -126,7 +126,7 @@ class BotConfig:
             max_daily_loss_usd=max(5.0, float(os.getenv("MAX_DAILY_LOSS_USD", "160"))),
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
             min_merge_shares=max(0.01, float(os.getenv("MIN_MERGE_SHARES", "1"))),
-            pair_sum_hedge=min(1.20, max(0.99, float(os.getenv("PAIR_SUM_HEDGE", "1")))),
+            pair_sum_hedge=min(1.20, max(0.90, float(os.getenv("PAIR_SUM_HEDGE", "1")))),
             onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
