@@ -52,6 +52,18 @@ class SettlementClockTests(unittest.TestCase):
         self.assertGreaterEqual(window.seconds_after_end, 9.0)
 
 
+class StrategySafetyTests(unittest.TestCase):
+    def test_mo_money_preset_cannot_be_switched_by_runtime_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "preset.db"))
+            engine = TradingEngine(cfg)
+            self.assertFalse(engine.set_preset("hybrid"))
+            self.assertEqual(engine.cfg.strategy_preset, "mo_money")
+            self.assertEqual(engine.cfg.enabled_assets, ["BTC"])
+            self.assertEqual(engine.cfg.enabled_timeframes, ["5m", "15m"])
+            engine.ledger.conn.close()
+
+
 class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_restores_cash_inventory_and_fees(self):
         with tempfile.TemporaryDirectory() as tmp:
