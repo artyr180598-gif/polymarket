@@ -628,13 +628,12 @@ class TradingEngine:
         return cap
 
     async def _run(self, w: WindowState) -> None:
-        """Scaled copy of 0x32ed… (@mo-money).
+        """mo-money-inspired PAPER behavior, not a 1:1 execution clone.
 
-        Sample: 9.2h, 2164 buys, $86 304, 0 sells, 197 markets.
-        98% BTC (5m $60.6k, 15m $20.5k). Median hedge is 22% of the
-        dominant leg. Four bursts per window, gap ~19s, through the close.
-        Exit = MERGE + REDEEM. Dollar size is scaled to BANKROLL — that
-        wallet turns about $9k/hour, which a $2.7k account cannot copy.
+        Universe is BTC 5m/15m. Entries are TAKER at observed CLOB REST ask,
+        with a Chainlink-derived 60s TWAP filter; the opposite leg is a small
+        hedge, matched pairs MERGE, residual shares wait for verified resolution.
+        Fills are virtual and do not model queue position or exchange latency.
         """
         if self.params.key == "mo_money" and w.asset != "BTC":
             return
