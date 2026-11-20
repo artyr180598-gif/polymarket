@@ -1,4 +1,15 @@
-"""TradingEngine — honest paper: real CLOB best-ask + depth + taker fees."""
+"""Discovers crypto up/down windows and runs the measured maker strategy.
+
+The loop is deliberately boring:
+
+1. Find the current and next window for each enabled asset and timeframe.
+2. Rest post-only bids from strategy.plan_quotes.
+3. Apply fills (paper queue, or live size_matched) to the portfolio.
+4. Merge a matched pair as soon as it exists. PnL equals holding both to
+   resolution; cash comes back immediately.
+5. After the official resolution, redeem. The winner is never guessed from a
+   spot price. A missing oracle means we wait.
+"""
 
 from __future__ import annotations
 
@@ -6,306 +17,258 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Any, Callable
 
 import aiohttp
 
-from .config import BotConfig, PRESETS, StrategyParams
-from .execution import PaperExecutor, LiveExecutor
-from .fees import calc_taker_fee_usdc, fee_regime_label
+from .accounting import D, Portfolio, usdc
+from .books import touch
+from .config import BotConfig
+from .execution import Fill, LiveBroker, PaperBroker, Resting
+from .fees import fallback_taker_fee_rate, fee_regime_label
 from .ledger import Ledger
-from .twap_model import AssetPriceTracker
+from .strategy import in_entry_window, plan_quotes
 
 log = logging.getLogger(__name__)
-NotifyFn = Callable[[str], Any]
+
+Notify = Callable[[str], Any]
+_ZERO = Decimal(0)
+WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 
 @dataclass
-class WindowState:
+class Window:
     slug: str
     asset: str
     timeframe: str
     condition_id: str
-    up_token: str
-    down_token: str
+    tokens: dict[str, str]
     start_ts: float
     end_ts: float
-    price_to_beat: Optional[float] = None
-    final_price: Optional[float] = None
-    up_shares: float = 0.0
-    down_shares: float = 0.0
-    up_cost: float = 0.0
-    down_cost: float = 0.0
-    gross_buy: float = 0.0
-    last_trade_mono: float = 0.0
+    tick: Decimal
+    min_shares: Decimal
+    fee_rate: Decimal
+    fee_exponent: Decimal
+    orders: dict[str, str] = field(default_factory=dict)  # "Up@0.42" -> order id
+    seen_prints: set[str] = field(default_factory=set)
+    prints_seeded: bool = False
     resolved: bool = False
-    merge_in_flight: bool = False
+    reported: bool = False
 
     @property
-    def remain_sec(self) -> float:
-        return max(0.0, self.end_ts - time.time())
+    def seconds_from_start(self) -> float:
+        return time.time() - self.start_ts
 
     @property
-    def net_shares(self) -> float:
-        return self.up_shares - self.down_shares
-
-    @property
-    def mergeable_pairs(self) -> float:
-        return min(self.up_shares, self.down_shares)
-
-
-
-def _max_pay(fair: float, late: bool) -> float:
-    """Highest ask the tape-matching rule will cross for a given model fair."""
-    if late and fair >= 0.88:
-        return 0.99
-    if fair >= 0.93:
-        return 0.97
-    if fair >= 0.85:
-        return 0.94
-    if fair >= 0.72:
-        return 0.88
-    if fair >= 0.58:
-        return 0.76
-    return 0.64
-
-
-def _choose_entry(ask_up, ask_dn, fair_up: float, late: bool, min_fair: float = 0.52):
-    """Pick the side to lift. (outcome, reason) or None.
-
-    Favorite = book's expensive side. Mid = both legs near 50c and the model
-    has a lean. The cheap wing is bought later as a hedge, not here.
-    """
-    fair_dn = 1.0 - fair_up
-    cands = []
-    if ask_up is not None and ask_up > 0:
-        cands.append(("Up", float(ask_up), fair_up))
-    if ask_dn is not None and ask_dn > 0:
-        cands.append(("Down", float(ask_dn), fair_dn))
-    if not cands:
-        return None
-    cands.sort(key=lambda x: x[1], reverse=True)
-    outcome, ask, fair = cands[0]
-    other = cands[1][1] if len(cands) > 1 else 1.0 - ask
-    if fair < 0.40 and ask >= 0.60:
-        return None
-    if ask >= 0.52 and ask <= _max_pay(fair, late) and fair >= min_fair:
-        return outcome, "favorite"
-    if (
-        min_fair <= 0.60
-        and 0.35 <= ask <= 0.66
-        and other <= 0.68
-        and fair >= max(min_fair, 0.54)
-        and ask <= fair + 0.02
-    ):
-        return outcome, "mid"
-    return None
+    def seconds_to_end(self) -> float:
+        return self.end_ts - time.time()
 
 
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
-        self.params: StrategyParams = cfg.params
-        # Tape of 0x32ed… (@mo-money), 9h / 2164 buys / $86k: 98% BTC,
-        # 5m+15m, zero SELLs. This preset is locked to that universe.
-        if cfg.strategy_preset == "mo_money":
-            if "BTC" not in [a.upper() for a in cfg.enabled_assets]:
-                cfg.enabled_assets.insert(0, "BTC")
-            if "15m" not in cfg.enabled_timeframes:
-                cfg.enabled_timeframes.append("15m")
         self.ledger = Ledger(cfg.db_path)
-        self.trackers = {a: AssetPriceTracker(a) for a in cfg.enabled_assets}
-        self.windows: Dict[str, WindowState] = {}
+        self.mode = "paper" if not cfg.live_requested else "live"
+        saved = self.ledger.load_portfolio(self.mode)
+        self.consecutive_losses = 0
+        if saved and "portfolio" in saved:
+            self.portfolio = Portfolio.from_dict(saved["portfolio"])
+            self.consecutive_losses = int(saved.get("consecutive_losses") or 0)
+        elif saved and "cash" in saved:
+            self.portfolio = Portfolio.from_dict(saved)
+        else:
+            bank = D(str(cfg.bankroll_usd))
+            self.portfolio = Portfolio(initial_cash=bank, cash=bank)
+        self.paper = PaperBroker(self.portfolio)
+        self.live = LiveBroker(cfg)
+        self.windows: dict[str, Window] = {}
+        self.marks: dict[tuple[str, str], Decimal] = {}
         self.running = False
         self.paused = not cfg.auto_start
-        self._tasks: List[asyncio.Task] = []
-        self.executor: Any = None
-        self.cash = float(cfg.bankroll_usd)
-        self.realized_pnl = 0.0
-        self.fees_paid = 0.0
-        self.consecutive_losses = 0
-        self.day_pnl = 0.0
-        self.events: List[str] = []
-        self._notify_cb: Optional[NotifyFn] = None
-        self._streams_ok = False
-        self._price_ok = False
-        self._fill_history: List[Dict[str, Any]] = []
-        self._merge_history: List[Dict[str, Any]] = []
-        self._resolve_history: List[Dict[str, Any]] = []
+        self.halt_reason = ""
+        self.errors: list[str] = []
+        self.events: list[str] = []
+        self._tasks: list[asyncio.Task] = []
+        self._session: aiohttp.ClientSession | None = None
+        self._notify: Notify | None = None
+        self._last_equity_ts = 0.0
+        self._live_prices: dict[str, Decimal] = {}
+        self._live_left: dict[str, Decimal] = {}
+        self._stuck_noted: set[str] = set()
+        self._preset_note = ""
+        if cfg.strategy_preset not in ("mo_money",):
+            self._preset_note = (
+                f"Пресет «{cfg.strategy_preset}» больше не используется. "
+                "Работают измеренные правила mo-money."
+            )
+        if cfg.paper_reset_requested:
+            self._note(
+                "INFO",
+                "PAPER_RESET_ONCE / PAPER_RESET_ID проигнорированы: база на томе не стирается при старте.",
+            )
 
-    def set_notifier(self, fn: NotifyFn) -> None:
-        self._notify_cb = fn
+    def set_notifier(self, fn: Notify) -> None:
+        self._notify = fn
 
-    def _log_event(self, level: str, msg: str, notify: bool = False) -> None:
-        self.events.append(f"{time.strftime('%H:%M:%S')} | {level} | {msg}")
-        if len(self.events) > 200:
-            self.events = self.events[-150:]
-        log.info("%s", msg)
-        if notify and self._notify_cb is not None:
+    def _note(self, level: str, msg: str, notify: bool = False) -> None:
+        line = f"{time.strftime('%H:%M:%S')} | {msg}"
+        self.events.append(line)
+        self.events = self.events[-80:]
+        if level == "ERROR":
+            self.errors.append(line)
+            self.errors = self.errors[-40:]
+            log.error("%s", msg)
+        else:
+            log.info("%s", msg)
+        if notify and self._notify is not None:
             try:
-                result = self._notify_cb(msg)
+                result = self._notify(msg)
                 if asyncio.iscoroutine(result):
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(result)
-            except Exception:
-                pass
+                    asyncio.get_running_loop().create_task(result)
+            except Exception:  # noqa: BLE001
+                log.exception("notify failed")
+
+    def _persist(self) -> None:
+        try:
+            self.ledger.save_portfolio(
+                self.mode,
+                {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("persist: %s", exc)
 
     async def start(self) -> None:
-        if self.cfg.trading_mode == "live" and getattr(self.cfg, "has_live_credentials", False):
-            self.executor = LiveExecutor(self.cfg)
-            await self.executor.start()
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+        if self._preset_note:
+            self._note("INFO", self._preset_note, notify=True)
+        if self.cfg.live_requested:
+            if not self.cfg.has_live_credentials:
+                self.paused = True
+                self._note("ERROR", "LIVE без POLYMARKET_PRIVATE_KEY и POLYMARKET_WALLET_ADDRESS. Торговля остановлена.", notify=True)
+            else:
+                ok = await self.live.start()
+                if not ok:
+                    self.paused = True
+                    self.mode = "live"
+                    self._note("ERROR", self.live.block_reason or "LIVE не запустился", notify=True)
+                else:
+                    bal = await self.live.collateral_usdc()
+                    self._note("INFO", f"LIVE кошелёк. Свободный залог на бирже: {bal if bal is not None else 'не прочитан'}", notify=True)
+                    if bal is not None and self.portfolio.cash == self.portfolio.initial_cash and not self.portfolio.markets:
+                        # First boot: mirror the free collateral. Later boots keep the ledger.
+                        self.portfolio = Portfolio(initial_cash=bal, cash=bal)
+                        self.paper = PaperBroker(self.portfolio)
+                        self._persist()
         else:
-            self.executor = PaperExecutor(self.cfg.bankroll_usd)
-            self.cash = getattr(self.executor, "cash", self.cfg.bankroll_usd)
-            self._log_event("INFO", f"Демо ${self.cfg.bankroll_usd:.0f} · CLOB depth + taker fee", notify=True)
-        self.running = True
-        self._tasks = [
-            asyncio.create_task(self._rest_price_loop(), name="prices"),
-            asyncio.create_task(self._discovery_loop(), name="discovery"),
-            asyncio.create_task(self._strategy_loop(), name="strategy"),
-            asyncio.create_task(self._resolve_loop(), name="resolve"),
-        ]
-        self._log_event("INFO", "Старт · honest paper (best-ask fix)", notify=True)
-        if self.cfg.strategy_preset == "mo_money":
-            self._log_event(
+            why = "DRY_RUN" if self.cfg.dry_run else "paper"
+            self._note(
                 "INFO",
-                "mo-money: только BTC 5m+15m · BUY фаворита · хедж ~22% · MERGE+REDEEM · без SELL",
+                f"{why}: банк ${self.portfolio.cash} · мейкер BTC-окна · без SELL",
                 notify=True,
             )
+        self.running = True
+        self._tasks = [
+            asyncio.create_task(self._discover_loop(), name="discover"),
+            asyncio.create_task(self._trade_loop(), name="trade"),
+            asyncio.create_task(self._housekeep_loop(), name="housekeep"),
+        ]
 
     async def stop(self) -> None:
         self.running = False
-        for t in self._tasks:
-            t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._cancel_all()
+        self._persist()
+        if self.mode == "live":
+            await self.live.close()
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
 
     def pause(self) -> None:
         self.paused = True
-        self._log_event("INFO", "Пауза", notify=True)
+        self._cancel_all()
+        self._note("INFO", "Пауза. Новые заявки не ставятся.", notify=True)
 
     def resume(self) -> None:
+        if self.cfg.live_requested and not self.live.ready:
+            self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
+            return
         self.paused = False
-        self._log_event("INFO", "Торговля возобновлена", notify=True)
+        self.halt_reason = ""
+        self._note("INFO", "Торговля включена", notify=True)
 
     def set_preset(self, key: str) -> bool:
-        if key not in PRESETS:
-            return False
-        self.cfg.strategy_preset = key
-        self.params = PRESETS[key]
-        self._log_event("INFO", f"Пресет → {PRESETS[key].title_ru}", notify=True)
-        return True
+        # One measured strategy. The button stays so old menus do not 400.
+        self._note("INFO", "Стратегия одна: mo-money (лестница мейкер-бидов, пара ≤ 99¢, MERGE, REDEEM).", notify=True)
+        return key == "mo_money"
 
-    async def emergency_kill(self) -> Dict[str, Any]:
+    def update_risk_limits(
+        self,
+        order_clip_usd: float | None = None,
+        max_window_risk_usd: float | None = None,
+        max_daily_loss_usd: float | None = None,
+        enabled_assets: list[str] | None = None,
+    ) -> None:
+        if order_clip_usd is not None:
+            self.cfg.order_clip_usd = max(1.0, float(order_clip_usd))
+        if max_window_risk_usd is not None:
+            self.cfg.max_window_risk_usd = max(5.0, float(max_window_risk_usd))
+        if max_daily_loss_usd is not None:
+            self.cfg.max_daily_loss_usd = max(5.0, float(max_daily_loss_usd))
+        if enabled_assets:
+            from .config import ASSETS
+            self.cfg.enabled_assets = [a.upper() for a in enabled_assets if a.upper() in ASSETS] or self.cfg.enabled_assets
+        self._note("INFO", "Лимиты обновлены", notify=False)
+
+    async def emergency_kill(self) -> dict[str, Any]:
         self.paused = True
-        merged = 0.0
-        for w in list(self.windows.values()):
-            if w.mergeable_pairs >= 1.0 and not w.merge_in_flight:
-                merged += await self._execute_merge(w)
-        self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
-        return {"canceled": 0, "merged_usd": round(merged, 2)}
+        self._cancel_all()
+        merged = _ZERO
+        for window in list(self.windows.values()):
+            pnl = await self._merge(window)
+            merged += pnl
+        self._note("ERROR", f"Аварийный стоп. Зафиксировано merge на ${merged}", notify=True)
+        self._persist()
+        return {"merged_pnl": float(merged)}
 
-    async def _fetch_spot(self, asset: str) -> Optional[float]:
-        timeout = aiohttp.ClientTimeout(total=8)
-        cb = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}.get(asset)
-        if cb:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(f"https://api.coinbase.com/v2/prices/{cb}/spot") as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            px = float((d.get("data") or {}).get("amount") or 0)
-                            if px > 0:
-                                return px
-            except Exception:
-                pass
-        kr = {"BTC": "XBTUSD", "ETH": "ETHUSD", "SOL": "SOLUSD"}.get(asset)
-        if kr:
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(f"https://api.kraken.com/0/public/Ticker?pair={kr}") as r:
-                        if r.status == 200:
-                            d = await r.json()
-                            for v in (d.get("result") or {}).values():
-                                c0 = (v.get("c") or [None])[0]
-                                if c0:
-                                    px = float(c0)
-                                    if px > 0:
-                                        return px
-            except Exception:
-                pass
-        return None
+    def _cancel_all(self) -> None:
+        if self.mode == "paper":
+            self.paper.cancel_all()
+        for window in self.windows.values():
+            for order_id in list(window.orders.values()):
+                if self.mode == "live":
+                    asyncio.get_running_loop().create_task(self.live.cancel(order_id))
+                    self.portfolio.unlock(order_id)
+                    self._live_prices.pop(order_id, None)
+                    self._live_left.pop(order_id, None)
+            window.orders.clear()
 
-    async def _rest_price_loop(self) -> None:
-        notified = False
-        while self.running:
-            try:
-                now = time.time()
-                ok_any = False
-                for asset in list(self.cfg.enabled_assets):
-                    tr = self.trackers.get(asset)
-                    if not tr:
-                        continue
-                    px = await self._fetch_spot(asset)
-                    if not px:
-                        continue
-                    ok_any = True
-                    ts_ms = int(now * 1000)
-                    tr.on_binance_spot(px, ts_ms)
-                    tr.on_chainlink_spot(px, ts_ms)
-                    tr.on_chainlink_twap60(px, ts_ms)
-                    for w in self.windows.values():
-                        if w.asset != asset:
-                            continue
-                        if w.price_to_beat is None and -5 <= (now - w.start_ts) <= 30:
-                            w.price_to_beat = px
-                        if w.final_price is None and -5 <= (now - w.end_ts) <= 30:
-                            w.final_price = px
-                for w in list(self.windows.values()):
-                    if w.resolved or w.price_to_beat is not None:
-                        continue
-                    tr = self.trackers.get(w.asset)
-                    if not tr:
-                        continue
-                    ptb = getattr(tr, "cl_spot", None) or getattr(tr, "cl_twap60", None)
-                    if ptb:
-                        w.price_to_beat = float(ptb)
-                if ok_any:
-                    self._price_ok = True
-                    self._streams_ok = True
-                    if not notified:
-                        self._log_event("INFO", "Spot + CLOB book OK", notify=True)
-                        notified = True
-            except Exception as e:
-                log.warning("prices: %s", e)
-            await asyncio.sleep(2.0)
-
-    async def _discovery_loop(self) -> None:
+    async def _discover_loop(self) -> None:
         while self.running:
             try:
                 await self._discover()
-                now = time.time()
-                dead = [s for s, w in self.windows.items() if w.resolved or (w.end_ts < now - 180)]
-                for s in dead:
-                    del self.windows[s]
-            except Exception as e:
-                log.warning("discovery: %s", e)
-            await asyncio.sleep(4)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Поиск окон: {exc}")
+            await asyncio.sleep(8)
 
     async def _discover(self) -> None:
         now = time.time()
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
-                sec = {"5m": 300, "15m": 900}.get(tf)
+                sec = WINDOW_SECONDS.get(tf)
                 if not sec:
                     continue
                 base = int(now // sec) * sec
                 for offset in (0, 1):
                     start = base + offset * sec
                     end = start + sec
-                    if end <= now + 5:
+                    if end < now - 30:
                         continue
                     slug = f"{asset.lower()}-updown-{tf}-{int(start)}"
                     if slug in self.windows:
@@ -313,490 +276,652 @@ class TradingEngine:
                     meta = await self._gamma(slug)
                     if not meta:
                         continue
-                    w = WindowState(
-                        slug=slug, asset=asset, timeframe=tf,
+                    self.windows[slug] = Window(
+                        slug=slug,
+                        asset=asset,
+                        timeframe=tf,
                         condition_id=meta["condition_id"],
-                        up_token=meta["up_token"], down_token=meta["down_token"],
-                        start_ts=float(start), end_ts=float(end),
-                        price_to_beat=meta.get("price_to_beat"),
+                        tokens=meta["tokens"],
+                        start_ts=float(start),
+                        end_ts=float(end),
+                        tick=meta["tick"],
+                        min_shares=meta["min_shares"],
+                        fee_rate=meta["fee_rate"],
+                        fee_exponent=meta["fee_exponent"],
                     )
-                    # Strike is the open of THIS window. Never stamp spot
-                    # onto a window that has not started yet.
-                    if w.price_to_beat is None and -2 <= (now - float(start)) <= 20:
-                        tr = self.trackers.get(asset)
-                        ptb = getattr(tr, "cl_spot", None) if tr else None
-                        if ptb:
-                            w.price_to_beat = float(ptb)
-                    self.windows[slug] = w
 
-    async def _gamma(self, slug: str):
-        try:
-            timeout = aiohttp.ClientTimeout(total=12)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(f"https://gamma-api.polymarket.com/events?slug={slug}") as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-                    if not data:
-                        return None
-                    ev = data[0] if isinstance(data, list) else data
-                    markets = ev.get("markets") or []
-                    if not markets:
-                        return None
-                    m = markets[0]
-                    ids = m.get("clobTokenIds")
-                    if isinstance(ids, str):
-                        ids = json.loads(ids)
-                    if not ids or len(ids) < 2:
-                        return None
-                    ptb = None
-                    md = ev.get("eventMetadata") or {}
-                    if md.get("priceToBeat"):
-                        try:
-                            ptb = float(md["priceToBeat"])
-                        except Exception:
-                            pass
-                    return {
-                        "condition_id": str(m.get("conditionId") or ""),
-                        "up_token": str(ids[0]),
-                        "down_token": str(ids[1]),
-                        "price_to_beat": ptb,
-                    }
-        except Exception:
-            return None
-
-    async def _clob_ask_info(self, token_id: str):
-        """(best_ask, size_at_best_ask). Book asks are often high→low; use /price for best."""
-        if not token_id:
+    async def _gamma(self, slug: str) -> dict | None:
+        if self._session is None:
             return None
         try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                best_px = None
-                depth = 12.0
-                async with s.get(
-                    f"https://clob.polymarket.com/price?token_id={token_id}&side=BUY"
-                ) as r:
-                    if r.status == 200:
-                        pd = await r.json()
-                        if pd.get("price") is not None:
-                            best_px = float(pd["price"])
-                async with s.get(f"https://clob.polymarket.com/book?token_id={token_id}") as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        asks = d.get("asks") or []
-                        levels = []
-                        for a in asks:
-                            try:
-                                px = float(a.get("price") or 0)
-                                sz = float(a.get("size") or 0)
-                            except Exception:
-                                continue
-                            if px > 0 and sz > 0:
-                                levels.append((px, sz))
-                        if levels:
-                            min_px = min(px for px, _ in levels)
-                            if best_px is None:
-                                best_px = min_px
-                            depth = sum(sz for px, sz in levels if abs(px - best_px) < 0.015)
-                            depth = max(depth, 5.0)
-                if best_px is None or best_px <= 0:
+            async with self._session.get(f"https://gamma-api.polymarket.com/events?slug={slug}") as response:
+                if response.status != 200:
                     return None
-                return (best_px, float(depth))
-        except Exception:
+                payload = await response.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            self._note("ERROR", f"Gamma {slug}: {exc}")
             return None
+        if not payload:
+            return None
+        event = payload[0] if isinstance(payload, list) else payload
+        markets = event.get("markets") or []
+        if not markets:
+            return None
+        market = markets[0]
+        outcomes = market.get("outcomes")
+        token_ids = market.get("clobTokenIds")
+        if isinstance(outcomes, str):
+            outcomes = json.loads(outcomes)
+        if isinstance(token_ids, str):
+            token_ids = json.loads(token_ids)
+        if not outcomes or not token_ids or len(outcomes) != len(token_ids):
+            return None
+        tokens = {str(name): str(token) for name, token in zip(outcomes, token_ids)}
+        if "Up" not in tokens or "Down" not in tokens:
+            return None
+        schedule = market.get("feeSchedule") or {}
+        asset = slug.split("-")[0].upper()
+        tf = slug.split("-")[2] if slug.count("-") >= 3 else "5m"
+        if schedule.get("rate") is not None:
+            fee_rate = D(schedule.get("rate"))
+        else:
+            fee_rate = fallback_taker_fee_rate(asset, tf)
+        fee_exp = D(schedule.get("exponent") or 1)
+        return {
+            "condition_id": str(market.get("conditionId") or ""),
+            "tokens": tokens,
+            "tick": D(market.get("orderPriceMinTickSize") or "0.01"),
+            "min_shares": D(market.get("orderMinSize") or "5"),
+            "fee_rate": fee_rate,
+            "fee_exponent": fee_exp,
+        }
 
-    async def _clob_best_ask(self, token_id: str):
-        info = await self._clob_ask_info(token_id)
-        return info[0] if info else None
+    async def _book(self, token_id: str) -> tuple[list, list]:
+        if self._session is None or not token_id:
+            return [], []
+        try:
+            async with self._session.get("https://clob.polymarket.com/book", params={"token_id": token_id}) as response:
+                if response.status != 200:
+                    return [], []
+                payload = await response.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            self._note("ERROR", f"Стакан: {exc}")
+            return [], []
+        return payload.get("bids") or [], payload.get("asks") or []
 
-    async def _strategy_loop(self) -> None:
+    async def _trade_loop(self) -> None:
         while self.running:
             try:
-                if not self.paused and not self._risk_halted():
-                    for w in list(self.windows.values()):
-                        if w.resolved:
-                            continue
-                        if w.remain_sec < 4:
-                            await self._try_merge(w)
-                            continue
-                        await self._run(w)
-                        await self._try_merge(w)
-            except Exception as e:
-                log.warning("strategy: %s", e)
-            await asyncio.sleep(1.5)
+                self._refresh_halt()
+                for window in list(self.windows.values()):
+                    if window.resolved:
+                        continue
+                    await self._on_window(window)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Торговля: {exc}")
+            await asyncio.sleep(2)
 
-    def _risk_halted(self) -> bool:
-        if self.day_pnl <= -self.cfg.max_daily_loss_usd:
-            return True
-        if self.cfg.max_consecutive_losses > 0 and self.consecutive_losses >= self.cfg.max_consecutive_losses:
-            return True
-        return False
+    def _refresh_halt(self) -> None:
+        equity = self.portfolio.equity(self.marks)
+        self.portfolio.roll_day(equity)
+        reason = ""
+        if self.portfolio.day_pnl(equity) <= -D(str(self.cfg.max_daily_loss_usd)):
+            reason = f"дневной лимит −${self.cfg.max_daily_loss_usd:.0f}"
+        elif self.cfg.max_consecutive_losses and self.consecutive_losses >= self.cfg.max_consecutive_losses:
+            reason = f"{self.consecutive_losses} убыточных окон подряд"
+        if reason and reason != self.halt_reason:
+            self.halt_reason = reason
+            self._cancel_all()
+            self._note("ERROR", f"Стоп риска: {reason}", notify=True)
+        elif not reason:
+            self.halt_reason = ""
 
-    def _inventory_usd(self) -> float:
-        return sum((w.up_cost + w.down_cost) for w in self.windows.values() if not w.resolved)
+    async def _on_window(self, window: Window) -> None:
+        books: dict[str, tuple[list, list]] = {}
+        for outcome, token in window.tokens.items():
+            bids, asks = await self._book(token)
+            books[outcome] = (bids, asks)
+            best_bid, _, _ = touch(bids, asks)
+            if best_bid is not None:
+                self.marks[(window.slug, outcome)] = best_bid
+        if self.mode == "paper":
+            for fill in await self._paper_prints(window):
+                self._apply_fill(window, fill)
+        if self.mode == "live":
+            await self._pull_live_fills(window)
+        self._drop_finished_orders(window)
 
-    def _window_cap(self, w: WindowState) -> float:
-        cap = float(self.cfg.max_window_risk_usd)
-        if w.timeframe == "15m":
-            cap *= 1.35
-        if w.asset != "BTC":
-            cap *= 0.25
-        return cap
-
-    async def _run(self, w: WindowState) -> None:
-        """Scaled copy of 0x32ed… (@mo-money).
-
-        Sample: 9.2h, 2164 buys, $86 304, 0 sells, 197 markets.
-        98% BTC (5m $60.6k, 15m $20.5k). Median hedge is 22% of the
-        dominant leg. Four bursts per window, gap ~19s, through the close.
-        Exit = MERGE + REDEEM. Dollar size is scaled to BANKROLL — that
-        wallet turns about $9k/hour, which a $2.7k account cannot copy.
-        """
-        if self.params.key == "mo_money" and w.asset != "BTC":
+        if window.seconds_to_end <= 0:
+            self._cancel_window(window)
+            await self._merge(window)
+            if window.seconds_to_end < -8:
+                await self._resolve(window)
             return
-        if time.time() < w.start_ts - 1:
+
+        if self.paused or self.halt_reason or not in_entry_window(window.seconds_from_start, window.seconds_to_end):
+            self._cancel_window(window)
+            await self._merge(window)
             return
-        tr = self.trackers.get(w.asset)
-        if tr is None:
+
+        from .strategy import SideBook
+
+        sides = []
+        for outcome in ("Up", "Down"):
+            bids, asks = books.get(outcome, ([], []))
+            best_bid, best_ask, bid_size = touch(bids, asks)
+            sides.append(SideBook(outcome, best_bid, best_ask, bid_size))
+        book = self.portfolio.markets.get(window.slug)
+        side_spent = {}
+        held_avg = {}
+        held_shares = {}
+        if book:
+            for name, lot in book.outcomes.items():
+                side_spent[name] = lot.cost
+                held_avg[name] = lot.avg_price()
+                held_shares[name] = lot.shares
+        # Collateral already locked by this window's own resting bids is still
+        # available to those bids: a re-quote cancels them first.
+        locked_here = sum((self.portfolio.locks.get(oid, _ZERO) for oid in window.orders.values()), _ZERO)
+        quotes = plan_quotes(
+            sides,
+            tick=window.tick,
+            min_shares=window.min_shares,
+            share_step=Decimal("0.01"),
+            clip_usd=D(str(self.cfg.order_clip_usd)),
+            window_spent=book.cost_basis() if book else _ZERO,
+            window_cap=D(str(self.cfg.max_window_risk_usd)),
+            side_spent=side_spent,
+            free_cash=self.portfolio.cash + locked_here,
+            total_exposure=self.portfolio.exposure_cost() + self.portfolio.reserved - locked_here,
+            exposure_cap=D(str(self.cfg.max_total_exposure_usd)),
+            held_avg=held_avg,
+            held_shares=held_shares,
+        )
+        await self._sync_quotes(window, quotes, books)
+        await self._merge(window)
+
+    async def _sync_quotes(self, window: Window, quotes, books) -> None:
+        from .books import size_at
+
+        wanted = {f"{q.outcome}@{q.price}": q for q in quotes}
+        for key, order_id in list(window.orders.items()):
+            if key not in wanted:
+                await self._cancel_order(order_id)
+                window.orders.pop(key, None)
+        for key, quote in wanted.items():
+            if key in window.orders:
+                continue
+            bids, asks = books.get(quote.outcome, ([], []))
+            _, best_ask, _ = touch(bids, asks)
+            if self.mode == "paper":
+                order_id = self.paper.place(
+                    outcome=quote.outcome,
+                    token_id=window.tokens[quote.outcome],
+                    price=quote.price,
+                    shares=quote.shares,
+                    best_ask=best_ask,
+                    bid_size_at_price=size_at(bids, quote.price),
+                )
+                if order_id:
+                    window.orders[key] = order_id
+            else:
+                order_id, err, filled_now = await self.live.place(
+                    token_id=window.tokens[quote.outcome], price=quote.price, shares=quote.shares
+                )
+                if not order_id:
+                    self._note("ERROR", f"Заявка {window.asset} {quote.outcome} не принята: {err}")
+                    continue
+                if not self.portfolio.lock(order_id, quote.notional):
+                    await self.live.cancel(order_id)
+                    self._note("ERROR", "Не хватило свободного USDC на залог заявки")
+                    continue
+                self._live_prices[order_id] = quote.price
+                self._live_left[order_id] = quote.shares
+                if filled_now > 0:
+                    self._apply_fill(
+                        window,
+                        Fill(
+                            order_id=order_id, outcome=quote.outcome, shares=filled_now,
+                            price=quote.price, fee=_ZERO, role="MAKER",
+                        ),
+                    )
+                    self._live_left[order_id] = quote.shares - filled_now
+                if self._live_left.get(order_id, _ZERO) > 0:
+                    window.orders[key] = order_id
+                else:
+                    self.portfolio.unlock(order_id)
+                    self._live_prices.pop(order_id, None)
+                    self._live_left.pop(order_id, None)
+
+    def _resting(self, order_id: str) -> Resting | None:
+        return self.paper.orders.get(order_id)
+
+    async def _cancel_order(self, order_id: str) -> None:
+        if self.mode == "paper":
+            self.paper.cancel(order_id)
+        else:
+            await self.live.cancel(order_id)
+            self.portfolio.unlock(order_id)
+            self._live_prices.pop(order_id, None)
+            self._live_left.pop(order_id, None)
+
+    def _cancel_window(self, window: Window) -> None:
+        for order_id in list(window.orders.values()):
+            if self.mode == "paper":
+                self.paper.cancel(order_id)
+            else:
+                asyncio.get_running_loop().create_task(self.live.cancel(order_id))
+                self.portfolio.unlock(order_id)
+        window.orders.clear()
+
+    def _drop_finished_orders(self, window: Window) -> None:
+        if self.mode != "paper":
             return
-        spot = getattr(tr, "cl_spot", None)
-        if w.price_to_beat is None and spot and -2 <= (time.time() - w.start_ts) <= 25:
-            w.price_to_beat = float(spot)
-        if w.price_to_beat is None or spot is None:
-            return
+        for key, order_id in list(window.orders.items()):
+            if self.mode != "paper":
+                continue
+            if order_id not in self.paper.orders:
+                window.orders.pop(key, None)
+
+    def _apply_fill(self, window: Window, fill: Fill) -> None:
         try:
-            fv = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts))
-        except Exception:
-            return
-
-        tau = w.remain_sec
-        dur = max(1.0, w.end_ts - w.start_ts)
-        late = (time.time() - w.start_ts) / dur >= 0.62
-        fair_up = float(fv.prob_up)
-        cooldown = float(getattr(self.params, "burst_cooldown_sec", 18.0) or 18.0)
-        if w.timeframe == "15m":
-            cooldown += 6.0
-        if time.monotonic() - w.last_trade_mono < cooldown:
-            return
-        if tau < 4:
-            return
-
-        cap = self._window_cap(w)
-        if w.gross_buy >= cap * 0.98:
-            return
-        base_clip = max(5.0, float(self.cfg.order_clip_usd))
-        if w.asset != "BTC":
-            base_clip *= 0.30
-        if self.cash < max(3.0, base_clip * 0.35):
-            return
-
-        up_info = await self._clob_ask_info(w.up_token)
-        dn_info = await self._clob_ask_info(w.down_token)
-        if not up_info and not dn_info:
-            return
-        ask_up, depth_up = up_info if up_info else (None, 0.0)
-        ask_dn, depth_dn = dn_info if dn_info else (None, 0.0)
-
-        if ask_up is not None and ask_dn is not None and int(time.time()) % 30 < 2:
-            log.info(
-                "CLOB %s %s ask_up=%.3f ask_dn=%.3f fair_up=%.3f gross=%.1f/%.0f",
-                w.asset, w.timeframe, ask_up, ask_dn, fair_up, w.gross_buy, cap,
+            self.portfolio.buy_fill(
+                slug=window.slug,
+                condition_id=window.condition_id,
+                asset=window.asset,
+                timeframe=window.timeframe,
+                outcome=fill.outcome,
+                shares=fill.shares,
+                price=fill.price,
+                fee=fill.fee,
+                order_id=fill.order_id,
             )
-
-        spot_up = float(spot) >= float(w.price_to_beat)
-        min_fair = float(getattr(self.params, "min_fair", 0.52) or 0.52)
-        choice = _choose_entry(ask_up, ask_dn, fair_up, late, min_fair=min_fair)
-        if choice is not None:
-            outcome, reason = choice
-            ask = float(ask_up if outcome == "Up" else ask_dn)
-            depth = float(depth_up if outcome == "Up" else depth_dn)
-            fair_side = fair_up if outcome == "Up" else (1.0 - fair_up)
-            agrees = spot_up if outcome == "Up" else (not spot_up)
-            if fair_side >= 0.80 or agrees or fair_side >= 0.60:
-                await self._lift(w, outcome, ask, depth, base_clip, cap, reason)
-
-        await self._hedge(w, ask_up, ask_dn, depth_up, depth_dn, base_clip, cap)
-
-    async def _lift(self, w, outcome, ask, depth, base_clip, cap, reason) -> None:
-        room = cap - w.gross_buy
-        if room < 1.0 or ask <= 0.02 or ask >= 0.995 or depth < 5:
+        except ValueError as exc:
+            self._note("ERROR", f"Филл не записан ({window.slug}): {exc}")
             return
-        if ask >= 0.90:
-            mult = 2.15
-        elif ask >= 0.80:
-            mult = 1.55
-        elif ask >= 0.65:
-            mult = 1.05
-        else:
-            mult = 0.65
-        usd = min(base_clip * mult, room * 0.55)
-        side_cost = w.up_cost if outcome == "Up" else w.down_cost
-        usd = min(usd, max(0.0, cap * 0.78 - side_cost))
-        usd = min(usd, max(0.0, float(self.cfg.max_total_exposure_usd) - self._inventory_usd()))
-        if usd < 1.0:
-            return
-        sz = round(min(usd / ask, depth * 0.35), 2)
-        if sz < 5.0:
-            return
-        fee = calc_taker_fee_usdc(sz, ask, w.asset, w.timeframe)
-        await self._open(w, outcome, ask, sz, reason, fee=fee)
-
-    async def _hedge(self, w, ask_up, ask_dn, depth_up, depth_dn, base_clip, cap) -> None:
-        ratio = float(getattr(self.params, "hedge_ratio", 0.22) or 0.0)
-        max_ask = float(getattr(self.params, "hedge_max_ask", 0.30) or 0.30)
-        if ratio <= 0:
-            return
-        if w.up_cost >= w.down_cost + 0.8 and ask_dn is not None and float(ask_dn) <= max_ask:
-            outcome, ask, depth, fav_cost, have = "Down", float(ask_dn), float(depth_dn), w.up_cost, w.down_cost
-        elif w.down_cost >= w.up_cost + 0.8 and ask_up is not None and float(ask_up) <= max_ask:
-            outcome, ask, depth, fav_cost, have = "Up", float(ask_up), float(depth_up), w.down_cost, w.up_cost
-        else:
-            return
-        need = ratio * fav_cost - have
-        if need < 0.40 or ask <= 0.01 or depth < 5:
-            return
-        room = cap - w.gross_buy
-        inv_room = float(self.cfg.max_total_exposure_usd) - self._inventory_usd()
-        usd = min(need, base_clip * 0.40, room, max(0.0, inv_room))
-        if usd < 0.40:
-            return
-        sz = round(min(usd / ask, depth * 0.50, 80.0), 2)
-        if sz < 5.0:
-            return
-        fee = calc_taker_fee_usdc(sz, ask, w.asset, w.timeframe)
-        await self._open(w, outcome, ask, sz, "hedge", fee=fee)
-
-    async def _open(self, w, outcome, price, size, reason, fee: float = 0.0) -> None:
-        price = round(max(0.01, min(0.99, float(price))), 2)
-        size = round(max(5.0, float(size)), 2)
-        fee = float(fee or 0.0)
-        cost = price * size + fee
-        if cost > self.cash:
-            size = max(5.0, round((self.cash * 0.95 - fee) / max(price, 0.01), 2))
-            cost = price * size + fee
-            if size < 5:
-                return
-        self.cash -= cost
-        self.fees_paid += fee
-        if outcome == "Up":
-            w.up_shares += size
-            w.up_cost += price * size
-        else:
-            w.down_shares += size
-            w.down_cost += price * size
-        w.gross_buy += price * size
-        w.last_trade_mono = time.monotonic()
-        fill = {
-            "ts": time.time(), "mode": self.cfg.trading_mode, "slug": w.slug, "asset": w.asset,
-            "outcome": outcome, "role": "TAKER_CLOB", "reason": reason, "shares": size, "price": price,
-            "fee": fee, "notional": cost,
-        }
-        self._fill_history.insert(0, fill)
-        self._fill_history = self._fill_history[:80]
-        try:
-            self.ledger.record_fill(
-                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, outcome=outcome, role="TAKER_CLOB",
-                reason=reason, shares=size, price=price, fee=fee, fair_prob=price,
-                tx_or_order_id=f"paper-clob-{int(time.time())}",
-            )
-        except Exception as e:
-            log.warning("record_fill: %s", e)
-        side = "ВВЕРХ (Up)" if outcome == "Up" else "ВНИЗ (Down)"
-        why = {
-            "favorite": "фаворит книги, как mo-money",
-            "mid": "перевес модели у 50¢",
-            "hedge": "дешёвый хедж второй ноги (~22%)",
-            "maker_entry": "CLOB ask дешевле fair",
-            "lockin": "lock-in по CLOB",
-            "syn_tp": "добор пары по CLOB",
-            "pair_arb": "пара CLOB+fee < $1",
-        }.get(reason, reason)
-        fee_s = f" · fee ${fee:.3f}" if fee > 0 else ""
-        self._log_event(
+        if self.mode == "paper" and fill.order_id not in self.paper.orders:
+            # Full paper fill: release a rounding remainder of the lock.
+            # Live orders are not in the paper book; their lock is reduced by
+            # buy_fill and released only when the order is fully matched.
+            self.portfolio.unlock(fill.order_id)
+        notional = usdc(fill.shares * fill.price)
+        self.ledger.record_fill(
+            mode=self.mode, slug=window.slug, condition_id=window.condition_id,
+            asset=window.asset, timeframe=window.timeframe, outcome=fill.outcome,
+            role=fill.role, shares=fill.shares, price=fill.price, notional=notional,
+            fee=fill.fee, order_id=fill.order_id,
+        )
+        side = "Вверх" if fill.outcome == "Up" else "Вниз"
+        self._note(
             "INFO",
-            f"🟢 Купил {side}\n{w.asset} · {size:.1f} шт по {price*100:.0f}¢ (${cost:.2f}){fee_s}\n{why}\n<code>{w.slug}</code>",
+            f"Заявка исполнена · {side} {window.asset} {window.timeframe} · "
+            f"{fill.shares} шт по {fill.price} · ${notional} · комиссия ${fill.fee}",
             notify=True,
         )
+        self._persist()
 
-    async def _try_merge(self, w: WindowState) -> None:
-        """Burn matched Up+Down back into $1.
-
-        PnL equals holding both legs to resolution, but cash comes back now.
-        The wallet merged $42k in the same 9h and never sold.
-        """
-        pairs = w.mergeable_pairs
-        if pairs < 1.0 or w.merge_in_flight:
-            return
-        if pairs < 5.0 and abs(w.net_shares) >= 0.5:
-            return
-        await self._execute_merge(w)
-
-    async def _execute_merge(self, w: WindowState) -> float:
-        pairs = round(w.mergeable_pairs, 4)
-        if pairs < 1:
-            return 0.0
-        w.merge_in_flight = True
-        try:
-            up_part = (pairs / w.up_shares) * w.up_cost if w.up_shares else 0.0
-            dn_part = (pairs / w.down_shares) * w.down_cost if w.down_shares else 0.0
-            cost = up_part + dn_part
-            locked = pairs - cost
-            w.up_shares = max(0.0, w.up_shares - pairs)
-            w.down_shares = max(0.0, w.down_shares - pairs)
-            w.up_cost = max(0.0, w.up_cost - up_part)
-            w.down_cost = max(0.0, w.down_cost - dn_part)
-            self.cash += pairs
-            self.realized_pnl += locked
-            self.day_pnl += locked
-            self._merge_history.insert(0, {"ts": time.time(), "slug": w.slug, "pairs": pairs, "locked_pnl": locked})
-            self._merge_history = self._merge_history[:40]
-            try:
-                self.ledger.record_merge(
-                    mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                    pairs=pairs, cost_basis=cost, locked_pnl=locked, tx_hash=f"m-{int(time.time())}",
-                )
-            except Exception as e:
-                log.warning("record_merge: %s", e)
-            self._log_event(
-                "INFO",
-                f"♻️ MERGE: закрыл {pairs:.1f} пар\nЗафиксировано: ${locked:+.2f}\n<code>{w.slug}</code>",
-                notify=True,
+    async def _pull_live_fills(self, window: Window) -> None:
+        for key, order_id in list(window.orders.items()):
+            outcome = key.split("@", 1)[0]
+            delta = await self.live.newly_matched(order_id)
+            if delta <= 0:
+                continue
+            price = self._live_prices.get(order_id, _ZERO)
+            if price <= 0:
+                self._note("ERROR", f"Нет цены у заявки {order_id}, филл {delta} не записан")
+                continue
+            self._apply_fill(
+                window,
+                Fill(order_id=order_id, outcome=outcome, shares=delta, price=price, fee=_ZERO, role="MAKER"),
             )
-            return pairs
-        finally:
-            w.merge_in_flight = False
+            left = self._live_left.get(order_id, _ZERO) - delta
+            self._live_left[order_id] = left
+            if left <= 0:
+                window.orders.pop(key, None)
+                self.portfolio.unlock(order_id)
+                self._live_prices.pop(order_id, None)
+                self._live_left.pop(order_id, None)
 
-    async def _resolve_loop(self) -> None:
-        while self.running:
-            try:
-                for w in list(self.windows.values()):
-                    if w.resolved:
-                        continue
-                    if w.remain_sec > -3:
-                        continue
-                    await self._resolve(w)
-            except Exception as e:
-                log.warning("resolve: %s", e)
-            await asyncio.sleep(3)
-
-    async def _resolve(self, w: WindowState) -> None:
-        winner = None
+    async def _recent_trades(self, condition_id: str) -> list[dict]:
+        if self._session is None or not condition_id:
+            return []
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
-                async with s.get(url) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        items = data.get("data") if isinstance(data, dict) else data
-                        if items:
-                            item = items[0] if isinstance(items, list) else items
-                            if item.get("status") == "resolved":
-                                payouts = item.get("payouts") or []
-                                winner = "Up" if payouts and float(payouts[0]) > 0 else "Down"
-        except Exception:
-            pass
-        spot = getattr(self.trackers[w.asset], "cl_spot", None)
-        if winner is None and w.final_price is not None and w.price_to_beat is not None:
-            winner = "Up" if w.final_price >= w.price_to_beat else "Down"
-        if winner is None and w.price_to_beat is not None and spot is not None:
-            winner = "Up" if spot >= w.price_to_beat else "Down"
-        if winner is None and w.remain_sec <= -20:
-            if w.price_to_beat and spot:
-                winner = "Up" if spot >= w.price_to_beat else "Down"
-            elif w.up_shares >= w.down_shares:
-                winner = "Down"
-            else:
-                winner = "Up"
+            async with self._session.get(
+                "https://data-api.polymarket.com/v2/trades",
+                params={"condition": condition_id, "limit": "80"},
+            ) as response:
+                if response.status != 200:
+                    return []
+                payload = await response.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            self._note("ERROR", f"Лента сделок: {exc}")
+            return []
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        return list(rows or [])
+
+    async def _paper_prints(self, window: Window) -> list[Fill]:
+        """Seed the tape once, then fill only on new sell prints.
+
+        The first response is history. Filling it would pretend we were
+        already at the front of the queue.
+        """
+        rows = await self._recent_trades(window.condition_id)
+        fresh: list[tuple[str, dict]] = []
+        for row in rows:
+            key = "|".join(
+                str(row.get(name))
+                for name in ("transaction_hash", "token_id", "price", "size", "timestamp", "side")
+            )
+            if key in window.seen_prints:
+                continue
+            fresh.append((key, row))
+        if not window.prints_seeded:
+            for key, _row in fresh:
+                window.seen_prints.add(key)
+            window.prints_seeded = True
+            return []
+        fills: list[Fill] = []
+        for key, row in fresh:
+            window.seen_prints.add(key)
+            try:
+                price = D(row.get("price"))
+                size = D(row.get("size"))
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+            fills.extend(
+                self.paper.on_trade(str(row.get("token_id") or ""), price, size, str(row.get("side") or ""))
+            )
+        return fills
+
+    async def _merge(self, window: Window) -> Decimal:
+        book = self.portfolio.markets.get(window.slug)
+        if book is None or book.closed:
+            return _ZERO
+        up = book.outcomes.get("Up")
+        down = book.outcomes.get("Down")
+        if up is None or down is None:
+            return _ZERO
+        pairs = min(up.shares, down.shares)
+        if pairs < D(str(self.cfg.min_merge_shares)):
+            return _ZERO
+        # Matched shares pay $1 either way. Merging a pair that cost $1 or
+        # more only crystallises a loss; leave it for resolution instead.
+        if up.shares > 0 and down.shares > 0 and up.avg_price() + down.avg_price() >= Decimal("1"):
+            return _ZERO
+        gas = self._gas()
+        tx = ""
+        if self.mode == "live" and self.live.ready:
+            try:
+                tx = await self.live.merge(window.condition_id)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"MERGE не прошёл {window.slug}: {exc}")
+                return _ZERO
+        try:
+            pnl = self.portfolio.merge(window.slug, pairs, gas=gas)
+        except ValueError as exc:
+            self._note("ERROR", f"MERGE учёт {window.slug}: {exc}")
+            return _ZERO
+        self.ledger.record_merge(mode=self.mode, slug=window.slug, pairs=pairs, pnl=pnl, tx=tx)
+        self._note("INFO", f"MERGE {pairs} пар · результат ${pnl} · {window.asset} {window.timeframe}", notify=True)
+        self._report_if_closed(window)
+        self._persist()
+        return pnl
+
+    async def _resolve(self, window: Window) -> None:
+        if window.resolved or self._session is None:
+            return
+        winner = await self._winner(window.condition_id, list(window.tokens))
         if winner is None:
             return
-        if w.up_shares < 0.01 and w.down_shares < 0.01:
-            w.resolved = True
+        self._cancel_window(window)
+        await self._merge(window)
+        book = self.portfolio.markets.get(window.slug)
+        if book is None or book.open_shares() <= 0:
+            window.resolved = True
+            self._report_if_closed(window)
             return
-        payout = float(w.up_shares if winner == "Up" else w.down_shares)
-        gross_cost = float(w.up_cost + w.down_cost)
-        gross = payout - gross_cost
-        self.cash += payout
-        self.realized_pnl += gross
-        self.day_pnl += gross
-        self.consecutive_losses = self.consecutive_losses + 1 if gross < 0 else 0
+        gas = self._gas()
+        if self.mode == "live" and self.live.ready:
+            try:
+                await self.live.redeem(window.condition_id)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"REDEEM не прошёл {window.slug}: {exc}")
+                return
         try:
-            self.ledger.record_resolution(
-                mode=self.cfg.trading_mode, slug=w.slug, condition_id=w.condition_id,
-                asset=w.asset, timeframe=w.timeframe, winner=winner,
-                price_to_beat=w.price_to_beat, final_price=w.final_price or spot,
-                up_shares_total=float(w.up_shares), down_shares_total=float(w.down_shares),
-                merged_pairs=0.0, gross_cost=gross_cost, total_fees=0.0, total_payout=payout,
-            )
-        except Exception as e:
-            log.warning("record_resolution: %s", e)
-        self._resolve_history.insert(0, {"ts": time.time(), "slug": w.slug, "winner": winner, "gross": gross, "pnl": gross})
-        self._resolve_history = self._resolve_history[:40]
-        w.up_shares = w.down_shares = w.up_cost = w.down_cost = 0.0
-        w.resolved = True
-        side = "ВВЕРХ" if winner == "Up" else "ВНИЗ"
-        if gross >= 0:
-            msg = f"✅ Окно закрылось · победил {side}\nПрибыль: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
+            pnl = self.portfolio.redeem(window.slug, winner, gas=gas)
+        except ValueError as exc:
+            self._note("ERROR", f"REDEEM учёт {window.slug}: {exc}")
+            return
+        window.resolved = True
+        total = book.realized
+        if total < 0:
+            self.consecutive_losses += 1
         else:
-            msg = f"❌ Окно закрылось · победил {side}\nУбыток: <b>${gross:+.2f}</b>\n<code>{w.slug}</code>"
-        self._log_event("INFO", msg, notify=True)
+            self.consecutive_losses = 0
+        self.ledger.record_resolution(
+            mode=self.mode, slug=window.slug, condition_id=window.condition_id,
+            asset=window.asset, timeframe=window.timeframe, winner=winner,
+            pnl=total, payout=str(pnl),
+        )
+        window.reported = True
+        word = "Вверх" if winner == "Up" else "Вниз"
+        self._note("INFO", f"Окно закрыто · победил {word} · итог окна ${total}", notify=True)
+        self._persist()
 
-    def snapshot(self) -> Dict[str, Any]:
+    def _report_if_closed(self, window: Window) -> None:
+        book = self.portfolio.markets.get(window.slug)
+        if book is None or not book.closed or window.reported:
+            return
+        if book.resolved:
+            return
+        window.reported = True
+        if book.realized < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+        self.ledger.record_resolution(
+            mode=self.mode, slug=window.slug, condition_id=window.condition_id,
+            asset=window.asset, timeframe=window.timeframe, winner="MERGE",
+            pnl=book.realized, payout="0",
+        )
+
+    async def _winner(self, condition_id: str, outcomes: list[str]) -> str | None:
+        if self._session is None or not condition_id:
+            return None
         try:
-            stats = self.ledger.get_stats(self.cfg.trading_mode)
-        except Exception:
+            async with self._session.get(
+                "https://data-api.polymarket.com/v2/resolutions",
+                params={"condition": condition_id},
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            self._note("ERROR", f"Резолюция: {exc}")
+            return None
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        if not rows:
+            return None
+        item = rows[0] if isinstance(rows, list) else rows
+        if item.get("status") != "resolved":
+            return None
+        payouts = item.get("payouts") or []
+        return winner_from_payouts(payouts, outcomes)
+
+    def _gas(self) -> Decimal:
+        if self.mode != "live":
+            return _ZERO
+        if self.cfg.has_gasless_relayer:
+            return _ZERO
+        return D(str(self.cfg.onchain_gas_usd))
+
+    async def _housekeep_loop(self) -> None:
+        while self.running:
+            try:
+                now = time.time()
+                if now - self._last_equity_ts > 30:
+                    equity = self.portfolio.equity(self.marks)
+                    self.ledger.record_equity(
+                        mode=self.mode, equity=str(equity), cash=str(self.portfolio.cash),
+                        realized=str(self.portfolio.realized),
+                    )
+                    self._last_equity_ts = now
+                    self._persist()
+                stale = []
+                for slug, window in self.windows.items():
+                    book = self.portfolio.markets.get(slug)
+                    still_open = book is not None and not book.closed
+                    if still_open:
+                        if window.end_ts < now - 6 * 3600 and slug not in self._stuck_noted:
+                            self._stuck_noted.add(slug)
+                            self._note("ERROR", f"Окно {slug} без итога больше 6 часов, позиция сохранена")
+                        continue
+                    if window.end_ts < now - 600:
+                        stale.append(slug)
+                for slug in stale:
+                    self.windows.pop(slug, None)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Фон: {exc}")
+            await asyncio.sleep(15)
+
+    def snapshot(self) -> dict[str, Any]:
+        equity = self.portfolio.equity(self.marks)
+        self.portfolio.roll_day(equity)
+        stats = {}
+        try:
+            stats = self.ledger.stats(self.mode)
+        except Exception:  # noqa: BLE001
             stats = {}
-        inv = 0.0
-        for w in self.windows.values():
-            if not w.resolved:
-                inv += max(0.0, w.up_cost) + max(0.0, w.down_cost)
-        equity = self.cash + inv
-        now = time.time()
-        windows = []
-        for w in self.windows.values():
-            if w.resolved or w.end_ts < now - 3:
+        positions = []
+        for slug, book in self.portfolio.markets.items():
+            if book.closed:
                 continue
-            fair = None
-            if w.price_to_beat is not None:
-                tr = self.trackers[w.asset]
-                if getattr(tr, "cl_spot", None) is not None:
-                    try:
-                        fair = tr.compute_fair_value(float(w.price_to_beat), float(w.end_ts)).prob_up
-                    except Exception:
-                        pass
-            windows.append({
-                "slug": w.slug, "asset": w.asset, "remain_sec": round(w.remain_sec, 1),
-                "price_to_beat": w.price_to_beat,
-                "fair_up": round(fair, 4) if fair is not None else None,
-                "net_shares": round(w.net_shares, 2),
-                "up_shares": round(w.up_shares, 2),
-                "down_shares": round(w.down_shares, 2),
-                "mergeable": round(w.mergeable_pairs, 2),
-            })
-        windows.sort(key=lambda x: x["remain_sec"])
-        return {
-            "mode": self.cfg.trading_mode,
-            "running": self.running and not self.paused,
-            "paused": self.paused,
-            "preset": self.cfg.strategy_preset,
-            "equity": round(equity, 2),
-            "cash": round(self.cash, 2),
-            "realized_pnl": round(self.realized_pnl, 2),
-            "day_pnl": round(self.day_pnl, 2),
-            "fees_paid": round(self.fees_paid, 4),
-            "total_exposure": round(inv, 2),
-            "stats": stats,
-            "windows": windows,
-            "events": self.events[-40:],
-            "fee_regime": fee_regime_label(),
-            "assets": self.cfg.enabled_assets,
-            "streams_ok": self._price_ok,
-            "fill_history": self._fill_history[:20],
-            "merge_history": self._merge_history[:10],
-            "resolve_history": self._resolve_history[:10],
-            "wins": sum(1 for x in self._resolve_history if x.get("gross", 0) > 0),
-            "losses": sum(1 for x in self._resolve_history if x.get("gross", 0) < 0),
-            "merge_profit": round(sum(x.get("locked_pnl", 0) for x in self._merge_history), 2),
+            for name, lot in book.outcomes.items():
+                if lot.shares <= 0:
+                    continue
+                mark = self.marks.get((slug, name), lot.avg_price())
+                value = usdc(lot.shares * mark)
+                positions.append({
+                    "slug": slug,
+                    "asset": book.asset,
+                    "timeframe": book.timeframe,
+                    "outcome": name,
+                    "shares": str(lot.shares),
+                    "avg_price": str(lot.avg_price()),
+                    "cost": str(lot.cost),
+                    "fees": str(lot.fees),
+                    "mark": str(mark),
+                    "value": str(value),
+                    "unrealized": str(usdc(value - lot.cost - lot.fees)),
+                })
+        now = time.time()
+        floor = float(self.cfg.paper_stats_since_ts or 0)
+        edge = {
+            "d7": self.ledger.turnover(self.mode, max(floor, now - 7 * 86400)),
+            "d14": self.ledger.turnover(self.mode, max(floor, now - 14 * 86400)),
+            "d30": self.ledger.turnover(self.mode, max(floor, now - 30 * 86400)),
         }
+        try:
+            series = self.ledger.equity_series(self.mode)
+        except Exception:  # noqa: BLE001
+            series = []
+        pnl_7d = str(usdc(equity - self.portfolio.initial_cash))
+        if series:
+            cutoff = time.time() - 7 * 86400
+            anchor = series[0]
+            for point in series:
+                if float(point["ts"]) >= cutoff:
+                    anchor = point
+                    break
+            pnl_7d = str(usdc(equity - D(anchor["equity"])))
+        open_orders = []
+        if self.mode == "paper":
+            for order in self.paper.open_orders():
+                open_orders.append({
+                    "outcome": order.outcome, "price": str(order.price),
+                    "remaining": str(order.remaining), "queue_ahead": str(order.queue_ahead),
+                })
+        return {
+            "mode": self.mode,
+            "running": self.running and not self.paused and not self.halt_reason,
+            "paused": self.paused,
+            "halt_reason": self.halt_reason,
+            "preset": "mo_money",
+            "strategy_title": "mo-money: лестница мейкер-бидов",
+            "equity": str(equity),
+            "cash": str(self.portfolio.cash),
+            "reserved": str(self.portfolio.reserved),
+            "initial": str(self.portfolio.initial_cash),
+            "realized": str(self.portfolio.realized),
+            "unrealized": str(self.portfolio.unrealized(self.marks)),
+            "day_pnl": str(self.portfolio.day_pnl(equity)),
+            "pnl_7d": pnl_7d,
+            "pnl_all": str(usdc(equity - self.portfolio.initial_cash)),
+            "fees_paid": str(self.portfolio.fees_paid),
+            "gas_paid": str(self.portfolio.gas_paid),
+            "maker_rebates": str(self.portfolio.maker_rebates),
+            "taker_rebates": str(self.portfolio.taker_rebates),
+            "liquidity_rewards": str(self.portfolio.liquidity_rewards),
+            "edge": edge,
+            "wallet_edge": [
+                {"label": "июль–август 2026", "roi": "4.1%"},
+                {"label": "сентябрь 2026", "roi": "3.3%"},
+                {"label": "октябрь 2026", "roi": "2.6%"},
+                {"label": "ноябрь 2026", "roi": "2.4%"},
+                {"label": "последние 14 дней", "roi": "1.9%"},
+            ],
+            "exposure": str(self.portfolio.exposure_cost()),
+            "consecutive_losses": self.consecutive_losses,
+            "stats": stats,
+            "breakdown": self.ledger.breakdown(self.mode) if self.ledger else [],
+            "positions": positions,
+            "orders": open_orders,
+            "windows": [
+                {
+                    "slug": w.slug, "asset": w.asset, "timeframe": w.timeframe,
+                    "seconds_to_end": round(w.seconds_to_end, 1),
+                    "quoting": in_entry_window(w.seconds_from_start, w.seconds_to_end) and not self.paused and not self.halt_reason,
+                }
+                for w in sorted(self.windows.values(), key=lambda w: w.end_ts)
+                if not w.resolved
+            ],
+            "fills": self.ledger.recent_fills(self.mode),
+            "merges": self.ledger.recent_merges(self.mode),
+            "resolutions": self.ledger.recent_resolutions(self.mode),
+            "equity_series": series,
+            "events": self.events[-30:],
+            "errors": self.errors[-20:],
+            "fee_regime": fee_regime_label(),
+            "limits": {
+                "order_clip_usd": self.cfg.order_clip_usd,
+                "max_window_risk_usd": self.cfg.max_window_risk_usd,
+                "max_total_exposure_usd": self.cfg.max_total_exposure_usd,
+                "max_daily_loss_usd": self.cfg.max_daily_loss_usd,
+                "max_consecutive_losses": self.cfg.max_consecutive_losses,
+            },
+            "assets": self.cfg.enabled_assets,
+            "timeframes": self.cfg.enabled_timeframes,
+        }
+
+
+# Set in __init__ via attribute. Declared here so live fill pricing has a home
+# even before the first order. Assigned on the instance below.
+def winner_from_payouts(payouts: list, outcomes: list[str]) -> str | None:
+    """Oracle payouts are base units (1_000_000 = $1 per share), not 0/1 flags.
+
+    The winning outcome is the index with the strictly highest positive payout.
+    """
+    if not payouts or not outcomes:
+        return None
+    amounts = []
+    for raw in payouts:
+        try:
+            amounts.append(int(raw))
+        except (TypeError, ValueError):
+            amounts.append(0)
+    if not amounts or max(amounts) <= 0:
+        return None
+    index = max(range(len(amounts)), key=lambda i: amounts[i])
+    if index >= len(outcomes):
+        return None
+    return outcomes[index]

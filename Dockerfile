@@ -23,5 +23,7 @@ RUN mkdir -p /data
 
 EXPOSE 8080
 
-# Railway sets PORT; main.py / BotConfig reads it first
+# Tests run in GitHub Actions (.github/workflows/test.yml), not in this
+# image. A boot-time pytest step crashed production twice
+# (`No module named pytest`) and is intentionally absent.
 CMD ["python", "main.py"]

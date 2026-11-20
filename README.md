@@ -1,109 +1,71 @@
-# PolyBot TWAP Hybrid
+# PolyBot
 
-Production-ready Polymarket crypto Up/Down trading bot.
+Бумажный, по желанию боевой бот для крипто-окон Polymarket Up/Down.
+Стратегия снята с кошелька [mo-money](https://polymarket.com/profile/0x32ed2e546b187ca15e2841edc82b22c713cf8ec3).
+Разбор с цифрами: [docs/STRATEGY_ANALYSIS.md](docs/STRATEGY_ANALYSIS.md).
 
-Default preset **`mo_money`** copies the on-chain behaviour of
-[@mo-money](https://polymarket.com/profile/0x32ed2e546b187ca15e2841edc82b22c713cf8ec3)
-(`0x32ed2e546b187ca15e2841edc82b22c713cf8ec3`), scaled to your bankroll.
+Бот ставит лестницу пост-онли заявок на покупку от 1¢ до 98¢, обе стороны вместе не дороже 99¢,
+пары дешевле $1 меняет на $1, остаток забирает после официального итога. Продаж нет.
+По умолчанию только BTC, окна 5 и 15 минут.
 
-## What the wallet actually does (measured, not guessed)
+Старт всегда в бумажном режиме. Боевой режим не включается без ключей и проверки геоблока.
 
-Sample: 9.2 hours, 2 164 buys, **$86 304**, **0 sells**, 197 markets, +$601k lifetime / $32.7M volume.
+## Переменные
 
-| Fact | Number |
-|---|---|
-| Asset | **98% BTC** |
-| Windows | 5m = $60.6k, 15m = $20.5k, everything else noise |
-| Where the money is | median clip **$6 / $12 / $27** at 35–65¢ / 65–85¢ / 85–99¢ |
-| Both legs | 63% of markets, hedge ≈ **22%** of the big side |
-| Cadence | ~4 bursts per window, median gap 19s, until the bell |
-| Exit | **MERGE** matched pairs back to $1, then **REDEEM**. Never a SELL |
-
-The bot therefore:
-
-1. Trades **only BTC 5m and 15m** on `STRATEGY_PRESET=mo_money` (ETH/SOL ignored in this preset).
-2. Lifts the **favorite** (the expensive side of the book) when the TWAP model agrees, and sizes up as the price goes to 90–97¢.
-3. Buys the **cheap wing** up to ~22% of the favorite's cost (the hedge).
-4. **MERGEs** every matched pair immediately (same PnL as holding both to resolution, cash comes back now).
-5. **REDEEMs** the leftover winner. No sell orders.
-
-Dollar size is **not** copied. That wallet turns about $9k/hour; on a ~$2 750 bankroll the same notional would blow the account. Shape is copied, size follows `ORDER_CLIP_USD` / `MAX_WINDOW_RISK_USD`.
-
-Always starts in **paper** mode (live CLOB asks + spot, virtual bankroll). Live only after you have watched paper windows.
-
-## Quick start (Railway + iPhone)
-
-1. Fork / clone this repo.
-2. Railway → New Project → Deploy from GitHub → select repo.
-3. **Region: `eu-west1` (Amsterdam)** — lowest latency to Polymarket matching engine.
-4. Add **Volume** mount path `/data` (SQLite persistence).
-5. Set variables (minimum). If these were set earlier, **overwrite** them — old values (`5m` only, ETH/SOL, clip $18 / window $60) do not match the wallet:
+Имена прежние. Новые не обязательны.
 
 ```
-TRADING_MODE=paper
-DASHBOARD_PIN=123456          # 6 digits
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-BANKROLL_USD=2750
-STRATEGY_PRESET=mo_money
+TRADING_MODE=paper          # paper | live
+DRY_RUN=false               # true принудительно оставляет бумажный режим
+BANKROLL_USD=2750           # стартовый бумажный банк
+STRATEGY_PRESET=mo_money    # lockin и hybrid больше не отдельные стратегии
 ENABLED_ASSETS=BTC
 ENABLED_TIMEFRAMES=5m,15m
 ORDER_CLIP_USD=16
 MAX_WINDOW_RISK_USD=140
 MAX_TOTAL_EXPOSURE_USD=420
 MAX_DAILY_LOSS_USD=160
+MAX_CONSECUTIVE_LOSSES=10
+MIN_MERGE_SHARES=1
+ONCHAIN_GAS_USD=0           # вычитается на live merge/redeem, если нет релеера
 DB_PATH=/data/polybot.db
+DASHBOARD_PIN=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
-6. Open the public Railway URL in Safari → enter PIN → Share → Add to Home Screen.
-7. Telegram: `/status`, `/pnl`, `/pause`, `/resume`, `/kill`, `/preset`.
+Боевые ключи те же: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`,
+ключи релеера и билдера. Без релеера газ задаётся `ONCHAIN_GAS_USD`, иначе в учёте он 0.
 
-Full iPhone/iPad guide: [GUIDE_IPHONE_RU.md](GUIDE_IPHONE_RU.md)
+`STRATEGY_PRESET=lockin` или `hybrid` больше не переключает логику: оба значения
+пишут предупреждение и работают как mo-money. Отдельных движков под ними не было.
 
-## Architecture
+Бумажный капитал и позиции пишутся в SQLite и поднимаются после рестарта.
+Чистый старт — удалить файл базы.
 
-```
-main.py                 FastAPI + Uvicorn + Engine + Telegram
-bot/
-  config.py             BotConfig + 3 strategy presets
-  fees.py               Exact Polymarket fee formula + 2026-11-20 switchover
-  twap_model.py         Chainlink 60s TWAP fair-value model + Binance lead-lag
-  ledger.py             SQLite WAL (fills / merges / resolutions / equity)
-  execution.py          PaperExecutor (queue-aware) + LiveExecutor
-  engine.py             discovery + mo-money tape strategy + risk
-  telegram_ctl.py       Pure aiohttp Telegram controller
-  web.py                Mobile PWA dashboard (all HTML/JS inlined)
-```
+## Запуск
 
-## Risk defaults (bankroll $2 750)
+Railway: Dockerfile, healthcheck `/api/health`, том на `/data`.
+Регион `eu-west1`. Процесс слушает `PORT`.
 
-| Limit                    | Value  |
-|--------------------------|--------|
-| Order clip               | $16 base, up to ~2.2× on 90¢+ favorites |
-| Max risk per 5m window   | $140 (15m × 1.35) |
-| Max total exposure       | $420   |
-| Daily loss stop          | $160   |
-| Pause after N losses     | 10     |
-
-## Local / VPS
+Локально:
 
 ```bash
-cp .env.example .env
-# edit .env
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+python -m unittest discover -s tests
 python main.py
 ```
 
-One-shot Ubuntu install: `sudo bash deploy/install_vps.sh`
+Панель на телефоне: Safari → URL сервиса → PIN → «На экран Домой».
+Инструкция: [GUIDE_IPHONE_RU.md](GUIDE_IPHONE_RU.md).
 
-## Safety
+## Учёт
 
-- Never commit `.env` or private keys.
-- Live trading: use a dedicated wallet only.
-- Check `https://polymarket.com/api/geoblock` from the server IP before enabling live.
-- Rollout path: paper 200–300 windows → live $220 → $600 → $1 300 → full bankroll. Withdraw 50% of profits to cold storage.
+Капитал = свободный USDC + залог в заявках + оценка позиций по лучшему биду.
+Реализованный PnL включает комиссию и газ один раз. Нереализованный — остаток
+до капитала. Мейкерская комиссия 0. Тейкерская, если понадобится:
 
-## License
-
-Private / personal use. Not financial advice. Trade at your own risk.
+`shares × feeRate × price × (1 − price)`, округление half-up до 5 знаков.
+До 20.11.2026 23:59 UTC ставка крипты 0.07, затем BTC 5m/15m — 0.05, остальная крипта — 0.01.
+Если Gamma отдала ставку рынка, берётся она.
