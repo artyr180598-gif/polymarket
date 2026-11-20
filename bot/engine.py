@@ -887,8 +887,13 @@ class TradingEngine:
                                     continue
                                 payouts = item.get("payouts") or []
                                 if len(payouts) >= 2:
-                                    winner = "Up" if float(payouts[0]) > float(payouts[1]) else "Down"
-                                    break
+                                    up_payout, down_payout = float(payouts[0]), float(payouts[1])
+                                    if up_payout > down_payout:
+                                        winner = "Up"
+                                        break
+                                    if down_payout > up_payout:
+                                        winner = "Down"
+                                        break
         except Exception as exc:
             log.debug("resolution API not ready for %s: %s", w.slug, exc)
 
@@ -979,6 +984,8 @@ class TradingEngine:
             "paused": self.paused,
             "preset": self.cfg.strategy_preset,
             "equity": round(equity, 2),
+            "equity_basis": "cash + open inventory at cost; not mark-to-market",
+            "mark_to_market_available": False,
             "cash": round(self.cash, 2),
             "realized_pnl": round(self.realized_pnl, 2),
             "day_pnl": round(self.day_pnl, 2),
