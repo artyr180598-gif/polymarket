@@ -572,7 +572,6 @@ class TradingEngine:
         ]
         while self.running:
             last_seq: Dict[str, int] = {}
-            snapshot_seen = set()
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
                     async with session.ws_connect("wss://ws-live-v2.polymarket.com/ws", heartbeat=90) as ws:
@@ -625,8 +624,6 @@ class TradingEngine:
                                             if previous is not None and seq != previous + 1:
                                                 raise ConnectionError(f"PolyBolt {channel} sequence gap: {previous} -> {seq}")
                                             last_seq[channel] = seq
-                                        if frame.get("snapshot") is True:
-                                            snapshot_seen.add(channel)
                                     try:
                                         self._handle_polybolt_frame(frame)
                                     except Exception as exc:
