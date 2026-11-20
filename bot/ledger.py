@@ -22,14 +22,29 @@ class Ledger:
                     "Preserve the volume and restore the existing ledger."
                 )
         parent = os.path.dirname(os.path.abspath(db_path))
+        marker = f"{db_path}.initialized"
+        db_exists = os.path.isfile(db_path)
+        if not db_exists and os.path.exists(marker):
+            raise RuntimeError(f"Persistent PAPER ledger is missing at {db_path!r}; refusing to recreate an empty history")
         try:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self._init_schema()
+            if not os.path.exists(marker):
+                with open(marker, "x", encoding="utf-8") as handle:
+                    handle.write("initialized\\n")
         except Exception as exc:
+            conn = getattr(self, "conn", None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if isinstance(exc, RuntimeError):
+                raise
             raise RuntimeError(f"Unable to open persistent PAPER ledger at {db_path!r}") from exc
-        self.conn.row_factory = sqlite3.Row
-        self._init_schema()
         try:
             with open(marker_path, "a", encoding="utf-8"):
                 pass
