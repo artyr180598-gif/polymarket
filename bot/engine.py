@@ -116,10 +116,8 @@ class TradingEngine:
         # Tape of 0x32ed… (@mo-money), 9h / 2164 buys / $86k: 98% BTC,
         # 5m+15m, zero SELLs. This preset is locked to that universe.
         if cfg.strategy_preset == "mo_money":
-            if "BTC" not in [a.upper() for a in cfg.enabled_assets]:
-                cfg.enabled_assets.insert(0, "BTC")
-            if "15m" not in cfg.enabled_timeframes:
-                cfg.enabled_timeframes.append("15m")
+            cfg.enabled_assets = ["BTC"]
+            cfg.enabled_timeframes = ["5m", "15m"]
         self.ledger = Ledger(cfg.db_path)
         self.trackers = {a: AssetPriceTracker(a) for a in cfg.enabled_assets}
         self.windows: Dict[str, WindowState] = {}
@@ -206,6 +204,7 @@ class TradingEngine:
                 fee = float(event.get("fee") or 0.0)
                 principal = float(event.get("notional") or (shares * price))
                 cash -= principal + fee
+                w.gross_buy += principal
                 fees_paid += fee
                 if ts >= day_start_ts:
                     day_fees += fee
@@ -280,6 +279,7 @@ class TradingEngine:
                     w.price_to_beat = meta.get("price_to_beat")
             except Exception as exc:
                 log.warning("PAPER recovery market metadata %s: %s", slug, exc)
+            w.last_trade_mono = time.monotonic()
             self.windows[slug] = w
 
         self._log_event(
