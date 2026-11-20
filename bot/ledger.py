@@ -316,6 +316,14 @@ class Ledger:
         )
         self.conn.commit()
 
+    def update_resolution_fees(self, resolution_id: int, fees: float) -> None:
+        """Backfill fee allocation on legacy resolutions created before fee accounting."""
+        self.conn.execute(
+            "UPDATE resolutions SET total_fees = ?, net_pnl = gross_pnl - ? WHERE id = ? AND (total_fees IS NULL OR total_fees = 0)",
+            (round(max(0.0, fees), 5), round(max(0.0, fees), 5), int(resolution_id)),
+        )
+        self.conn.commit()
+
     def recovery_events(self, mode: str) -> List[Dict[str, Any]]:
         """Return immutable paper-ledger events in replay order for crash recovery."""
         events: List[Dict[str, Any]] = []
