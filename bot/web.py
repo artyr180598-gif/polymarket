@@ -43,11 +43,15 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
         mode = engine.cfg.trading_mode
         if engine.executor is not None:
             mode = getattr(engine.executor, "mode", mode) or mode
+        snapshot = engine.snapshot() if hasattr(engine, "snapshot") else {}
         return {
             "ok": True,
             "mode": mode,
             "running": getattr(engine, "running", False),
             "paused": getattr(engine, "paused", True),
+            "entry_ready": bool(snapshot.get("entry_ready", False)),
+            "entry_halt_reason": snapshot.get("entry_halt_reason", "status_unavailable"),
+            "price_feed_mode": snapshot.get("price_feed_mode", "unavailable"),
             "pin_required": bool(engine.cfg.dashboard_pin),
         }
 
