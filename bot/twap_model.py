@@ -83,14 +83,38 @@ class AssetPriceTracker:
         self.cl_spot = price
         self.cl_spot_ts = ts
         self.cl_recv_mono = now_m
-        if not self.cl_spot_hist or ts >= self.cl_spot_hist[-1][0]:
+        if not self.cl_spot_hist or ts > self.cl_spot_hist[-1][0]:
             self.cl_spot_hist.append((ts, price))
+            self._refresh_twap60(ts)
         if self.bn_spot is not None and abs(self.bn_spot_ts - ts) <= 3.0:
             diff = self.bn_spot - price
             if self.basis_ema is None:
                 self.basis_ema = diff
             else:
                 self.basis_ema = (1.0 - self.basis_alpha) * self.basis_ema + self.basis_alpha * diff
+
+    def _refresh_twap60(self, now_ts: float) -> None:
+        """Build a true 60-second time-weighted average from Chainlink samples."""
+        history = list(self.cl_spot_hist)
+        cutoff = now_ts - 60.0
+        if len(history) < 2 or history[0][0] > cutoff:
+            return
+        prior = [(ts, px) for ts, px in history if ts <= cutoff]
+        if not prior:
+            return
+        cursor = cutoff
+        price = prior[-1][1]
+        integral = 0.0
+        for ts, px in history:
+            if ts <= cutoff:
+                continue
+            if ts > now_ts:
+                break
+            integral += price * (ts - cursor)
+            cursor = ts
+            price = px
+        integral += price * (now_ts - cursor)
+        self.on_chainlink_twap60(integral / 60.0, int(now_ts * 1000))
 
     def on_chainlink_twap60(self, twap_val: float, feed_ts_ms: int) -> None:
         ts = feed_ts_ms / 1000.0
