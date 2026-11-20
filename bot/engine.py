@@ -140,6 +140,7 @@ class TradingEngine:
         self._resolve_history: List[Dict[str, Any]] = []
         self._rtds_ok = False
         self._day_key = time.strftime("%Y-%m-%d", time.gmtime())
+        self._resolve_sem = asyncio.Semaphore(5)
 
     def set_notifier(self, fn: NotifyFn) -> None:
         self._notify_cb = fn
@@ -278,14 +279,20 @@ class TradingEngine:
         for slug, w in windows.items():
             if w.resolved or (w.up_shares < 0.01 and w.down_shares < 0.01):
                 continue
-            try:
-                meta = await self._gamma(slug)
-                if meta:
-                    w.up_token = meta.get("up_token") or ""
-                    w.down_token = meta.get("down_token") or ""
-                    w.price_to_beat = meta.get("price_to_beat")
-            except Exception as exc:
-                log.warning("PAPER recovery market metadata %s: %s", slug, exc)
+            # Old unresolved windows need only their saved condition id for the
+            # resolution API. Avoid serial Gamma lookups for historical inventory.
+            if w.end_ts >= now - 180 or not w.condition_id:
+                try:
+                    meta = await self._gamma(slug)
+                    if meta:
+                        w.up_token = meta.get("up_token") or ""
+                        w.down_token = meta.get("down_token") or ""
+                        if w.price_to_beat is None:
+                            w.price_to_beat = meta.get("price_to_beat")
+                        if not w.condition_id:
+                            w.condition_id = meta.get("condition_id") or ""
+                except Exception as exc:
+                    log.warning("PAPER recovery market metadata %s: %s", slug, exc)
             w.last_trade_mono = time.monotonic()
             self.windows[slug] = w
 
@@ -858,45 +865,48 @@ class TradingEngine:
     async def _resolve_loop(self) -> None:
         while self.running:
             try:
+                pending = []
                 for w in list(self.windows.values()):
-                    if w.resolved:
-                        continue
-                    if w.seconds_after_end < 3:
+                    if w.resolved or w.seconds_after_end < 3:
                         continue
                     if time.monotonic() - w.last_resolve_attempt_mono < 15.0:
                         continue
                     w.last_resolve_attempt_mono = time.monotonic()
-                    await self._resolve(w)
-            except Exception as e:
-                log.warning("resolve: %s", e)
+                    pending.append(w)
+                if pending:
+                    await asyncio.gather(*(self._resolve(w) for w in pending), return_exceptions=True)
+            except Exception as exc:
+                log.warning("resolve loop: %s", exc)
             await asyncio.sleep(3)
 
     async def _resolve(self, w: WindowState) -> None:
         winner = None
-        try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        items = data.get("data") if isinstance(data, dict) else data
-                        if items:
-                            candidates = items if isinstance(items, list) else [items]
-                            for item in candidates:
-                                if item.get("status") != "resolved":
-                                    continue
-                                payouts = item.get("payouts") or []
-                                if len(payouts) >= 2:
-                                    up_payout, down_payout = float(payouts[0]), float(payouts[1])
-                                    if up_payout > down_payout:
-                                        winner = "Up"
-                                        break
-                                    if down_payout > up_payout:
-                                        winner = "Down"
-                                        break
-        except Exception as exc:
-            log.debug("resolution API not ready for %s: %s", w.slug, exc)
+        if w.condition_id:
+            try:
+                async with self._resolve_sem:
+                    timeout = aiohttp.ClientTimeout(total=10)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        url = f"https://data-api.polymarket.com/v2/resolutions?condition={w.condition_id}"
+                        async with session.get(url) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                items = data.get("data") if isinstance(data, dict) else data
+                                if items:
+                                    candidates = items if isinstance(items, list) else [items]
+                                    for item in candidates:
+                                        if item.get("status") != "resolved":
+                                            continue
+                                        payouts = item.get("payouts") or []
+                                        if len(payouts) >= 2:
+                                            up_payout, down_payout = float(payouts[0]), float(payouts[1])
+                                            if up_payout > down_payout:
+                                                winner = "Up"
+                                                break
+                                            if down_payout > up_payout:
+                                                winner = "Down"
+                                                break
+            except Exception as exc:
+                log.debug("resolution API not ready for %s: %s", w.slug, exc)
 
         # Fallback is permitted only with a Chainlink sample captured after the
         # window ended. Never infer a winner from current spot or inventory size.
