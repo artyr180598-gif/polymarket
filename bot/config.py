@@ -141,6 +141,10 @@ class BotConfig:
     builder_api_key: str = ""
     builder_secret: str = ""
     builder_passphrase: str = ""
+    polymarket_api_key: str = ""
+    polymarket_api_secret: str = ""
+    polymarket_api_passphrase: str = ""
+    chainlink_api_key: str = ""
 
     dashboard_host: str = "0.0.0.0"
     dashboard_port: int = 8080
@@ -156,6 +160,13 @@ class BotConfig:
     @property
     def has_live_credentials(self) -> bool:
         return bool(self.private_key and self.wallet_address)
+
+    @property
+    def has_polybolt_credentials(self) -> bool:
+        return bool(
+            self.polymarket_api_key and self.polymarket_api_secret
+            and self.polymarket_api_passphrase and self.chainlink_api_key
+        )
 
     @property
     def has_gasless_relayer(self) -> bool:
@@ -207,6 +218,10 @@ class BotConfig:
             builder_api_key=os.getenv("POLYMARKET_BUILDER_API_KEY", "").strip(),
             builder_secret=os.getenv("POLYMARKET_BUILDER_SECRET", "").strip(),
             builder_passphrase=os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip(),
+            polymarket_api_key=os.getenv("POLYMARKET_API_KEY", "").strip(),
+            polymarket_api_secret=os.getenv("POLYMARKET_API_SECRET", "").strip(),
+            polymarket_api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE", "").strip(),
+            chainlink_api_key=os.getenv("CHAINLINK_API_KEY", "").strip(),
             dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip(),
             # Railway injects PORT; prefer it over DASHBOARD_PORT (local/VPS default 8080)
             dashboard_port=int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "8080")),
