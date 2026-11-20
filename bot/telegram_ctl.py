@@ -53,6 +53,7 @@ class TelegramController:
         self._send_lock = asyncio.Lock()
         self._last_send_mono = 0.0
         self._startup_ts = time.time()
+        self._poll_backoff = 1.0
 
     @property
     def _base(self) -> str:
@@ -363,9 +364,28 @@ class TelegramController:
                     "allowed_updates": json.dumps(["message", "callback_query"]),
                 }
                 async with self._session.get(f"{self._base}/getUpdates", params=params) as r:
-                    if r.status != 200:
-                        await asyncio.sleep(3)
+                    if r.status == 429:
+                        retry_after = r.headers.get("Retry-After")
+                        try:
+                            body = await r.json()
+                            retry_after = (body.get("parameters") or {}).get("retry_after") or retry_after
+                        except Exception:
+                            pass
+                        try:
+                            wait = float(retry_after) if retry_after is not None else 5.0
+                        except (TypeError, ValueError):
+                            wait = 5.0
+                        await asyncio.sleep(min(60.0, max(1.0, wait)))
                         continue
+                    if r.status >= 500:
+                        await asyncio.sleep(self._poll_backoff)
+                        self._poll_backoff = min(30.0, self._poll_backoff * 2.0)
+                        continue
+                    if r.status != 200:
+                        logger.warning("getUpdates returned HTTP %s", r.status)
+                        await asyncio.sleep(10)
+                        continue
+                    self._poll_backoff = 1.0
                     data = await r.json()
                     for upd in data.get("result", []):
                         self._offset = max(self._offset, upd["update_id"] + 1)
