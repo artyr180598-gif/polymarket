@@ -52,6 +52,7 @@ class TelegramController:
         self._session: Optional[aiohttp.ClientSession] = None
         self._send_lock = asyncio.Lock()
         self._last_send_mono = 0.0
+        self._min_send_interval = 1.05
         self._rate_limit_until = 0.0
         self._startup_ts = time.time()
         self._poll_backoff = 1.0
@@ -118,7 +119,7 @@ class TelegramController:
             return
         async with self._send_lock:
             wait = max(
-                1.05 - (time.monotonic() - self._last_send_mono),
+                self._min_send_interval - (time.monotonic() - self._last_send_mono),
                 self._rate_limit_until - time.monotonic(),
                 0.0,
             )
@@ -151,6 +152,7 @@ class TelegramController:
                     seconds = 5.0
                 seconds = min(60.0, max(1.0, seconds))
                 self._rate_limit_until = time.monotonic() + seconds
+                self._min_send_interval = max(self._min_send_interval, seconds)
                 return seconds
 
             try:
