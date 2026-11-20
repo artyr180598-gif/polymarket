@@ -616,7 +616,7 @@ class TradingEngine:
             timeout = aiohttp.ClientTimeout(total=6)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 best_px = None
-                depth = 12.0
+                depth = 0.0
                 async with s.get(
                     f"https://clob.polymarket.com/price?token_id={token_id}&side=BUY"
                 ) as r:
@@ -642,8 +642,9 @@ class TradingEngine:
                             if best_px is None:
                                 best_px = min_px
                             depth = sum(sz for px, sz in levels if abs(px - best_px) < 0.015)
-                            depth = max(depth, 5.0)
-                if best_px is None or best_px <= 0:
+                # A price without a readable book is not executable depth. Never
+                # synthesize a default depth or inflate a thin book to the minimum.
+                if best_px is None or best_px <= 0 or depth < 5.0:
                     return None
                 return (best_px, float(depth))
         except Exception:
