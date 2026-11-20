@@ -7,8 +7,10 @@ The loop is deliberately boring:
 3. Apply fills (paper queue, or live size_matched) to the portfolio.
 4. Merge a matched pair as soon as it exists. PnL equals holding both to
    resolution; cash comes back immediately.
-5. After the official resolution, redeem. The winner is never guessed from a
-   spot price. A missing oracle means we wait.
+5. After Polymarket officially resolves the market, redeem. Official means
+   Gamma closed with umaResolutionStatus resolved, or the CLOB market closed
+   with one winning token. A data-api "resolved" row and a Chainlink price
+   are not enough. A missing official result means we wait.
 """
 
 from __future__ import annotations
@@ -98,6 +100,7 @@ class TradingEngine:
         self._live_left: dict[str, Decimal] = {}
         self._live_original: dict[str, Decimal] = {}
         self._stuck_noted: set[str] = set()
+        self._resolution_conflict: set[str] = set()
         self._preset_note = ""
         if cfg.strategy_preset not in ("mo_money",):
             self._preset_note = (
@@ -702,7 +705,7 @@ class TradingEngine:
     async def _resolve(self, window: Window) -> None:
         if window.resolved or self._session is None:
             return
-        winner = await self._winner(window.condition_id, list(window.tokens))
+        winner = await self._official_winner(window)
         if winner is None:
             return
         self._cancel_window(window)
@@ -719,8 +722,12 @@ class TradingEngine:
             except Exception as exc:  # noqa: BLE001
                 self._note("ERROR", f"REDEEM не прошёл {window.slug}: {exc}")
                 return
+        winning = book.outcomes.get(winner)
+        # $1 per remaining winning share. Losers pay nothing. This is the cash
+        # that comes back, not the profit: profit is that cash minus the cost.
+        payout = usdc(winning.shares) if winning is not None else _ZERO
         try:
-            pnl = self.portfolio.redeem(window.slug, winner, gas=gas)
+            self.portfolio.redeem(window.slug, winner, gas=gas)
         except ValueError as exc:
             self._note("ERROR", f"REDEEM учёт {window.slug}: {exc}")
             return
@@ -733,11 +740,15 @@ class TradingEngine:
         self.ledger.record_resolution(
             mode=self.mode, slug=window.slug, condition_id=window.condition_id,
             asset=window.asset, timeframe=window.timeframe, winner=winner,
-            pnl=total, payout=str(pnl),
+            pnl=total, payout=str(payout),
         )
         window.reported = True
         word = "Вверх" if winner == "Up" else "Вниз"
-        self._note("INFO", f"Окно закрыто · победил {word} · итог окна ${total}", notify=True)
+        self._note(
+            "INFO",
+            f"Окно закрыто · победил {word} · выплата ${payout} · итог ${total}",
+            notify=True,
+        )
         self._persist()
 
     def _report_if_closed(self, window: Window) -> None:
@@ -757,28 +768,39 @@ class TradingEngine:
             pnl=book.realized, payout="0",
         )
 
-    async def _winner(self, condition_id: str, outcomes: list[str]) -> str | None:
-        if self._session is None or not condition_id:
+    async def _official_winner(self, window: Window) -> str | None:
+        """Winner only after Gamma or the CLOB has officially closed the market.
+
+        data-api /v2/resolutions can say status=resolved while Gamma is still
+        open and the book is still priced in the middle. That row is ignored.
+        """
+        known = set(window.tokens)
+        clob = winner_from_clob_market(
+            await self._get_json(f"https://clob.polymarket.com/markets/{window.condition_id}"),
+            known,
+        )
+        gamma = winner_from_gamma_market(_gamma_market(await self._get_json(
+            "https://gamma-api.polymarket.com/events",
+            params={"slug": window.slug},
+        )), known)
+        if clob and gamma and clob != gamma:
+            if window.slug not in self._resolution_conflict:
+                self._resolution_conflict.add(window.slug)
+                self._note("ERROR", f"Резолюция {window.slug}: CLOB {clob}, Gamma {gamma}. Ждём совпадения.")
+            return None
+        return clob or gamma
+
+    async def _get_json(self, url: str, params: dict | None = None) -> Any:
+        if self._session is None:
             return None
         try:
-            async with self._session.get(
-                "https://data-api.polymarket.com/v2/resolutions",
-                params={"condition": condition_id},
-            ) as response:
+            async with self._session.get(url, params=params) as response:
                 if response.status != 200:
                     return None
-                payload = await response.json(content_type=None)
+                return await response.json(content_type=None)
         except Exception as exc:  # noqa: BLE001
             self._note("ERROR", f"Резолюция: {exc}")
             return None
-        rows = payload.get("data") if isinstance(payload, dict) else payload
-        if not rows:
-            return None
-        item = rows[0] if isinstance(rows, list) else rows
-        if item.get("status") != "resolved":
-            return None
-        payouts = item.get("payouts") or []
-        return winner_from_payouts(payouts, outcomes)
 
     def _gas(self) -> Decimal:
         if self.mode != "live":
@@ -956,6 +978,101 @@ class TradingEngine:
 
 # Set in __init__ via attribute. Declared here so live fill pricing has a home
 # even before the first order. Assigned on the instance below.
+def _json_list(value: Any) -> list:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    return value if isinstance(value, list) else []
+
+
+def _gamma_market(payload: Any) -> dict:
+    if isinstance(payload, list):
+        payload = payload[0] if payload else None
+    if not isinstance(payload, dict):
+        return {}
+    markets = payload.get("markets") or []
+    market = markets[0] if markets else payload
+    return market if isinstance(market, dict) else {}
+
+
+def _closed_flag(value: Any) -> bool:
+    if value is True:
+        return True
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
+def winner_from_clob_market(payload: Any, known: set[str]) -> str | None:
+    """CLOB is official only when the market is closed and one token won.
+
+    A winner flag on an still-open market is ignored. If flags are absent,
+    payout numerators aligned with the token list are accepted the same way.
+    """
+    if not isinstance(payload, dict) or not _closed_flag(payload.get("closed")):
+        return None
+    tokens = [token for token in (payload.get("tokens") or []) if isinstance(token, dict)]
+    flagged = []
+    for token in tokens:
+        if token.get("winner") is True:
+            name = str(token.get("outcome") or "")
+            if name in known:
+                flagged.append(name)
+    if len(flagged) == 1:
+        return flagged[0]
+    if flagged:
+        return None
+    nums = payload.get("payout_numerators")
+    if nums is None:
+        nums = payload.get("payoutNumerators")
+    if not isinstance(nums, list) or len(nums) != len(tokens) or not tokens:
+        return None
+    amounts = []
+    for raw in nums:
+        try:
+            amounts.append(int(raw))
+        except (TypeError, ValueError):
+            amounts.append(0)
+    if not amounts or max(amounts) <= 0 or amounts.count(max(amounts)) != 1:
+        return None
+    name = str(tokens[amounts.index(max(amounts))].get("outcome") or "")
+    if name not in known:
+        return None
+    return name
+
+
+def winner_from_gamma_market(market: Any, known: set[str]) -> str | None:
+    """Gamma is official only when the market is closed and UMA says resolved.
+
+    Outcome prices must be exactly 1 and 0. A live price such as 0.995 is not
+    a settlement, and neither is a data-api resolutions row.
+    """
+    if not isinstance(market, dict) or not _closed_flag(market.get("closed")):
+        return None
+    status = str(market.get("umaResolutionStatus") or "").strip().lower()
+    if status != "resolved":
+        return None
+    outcomes = _json_list(market.get("outcomes"))
+    prices = _json_list(market.get("outcomePrices"))
+    if not outcomes or len(outcomes) != len(prices):
+        return None
+    winner = None
+    for name, raw in zip(outcomes, prices):
+        try:
+            price = Decimal(str(raw))
+        except (ArithmeticError, ValueError):
+            return None
+        if price == 1:
+            if winner is not None:
+                return None
+            winner = str(name)
+        elif price != 0:
+            return None
+    if winner not in known:
+        return None
+    return winner
+
+
 def winner_from_payouts(payouts: list, outcomes: list[str]) -> str | None:
     """Oracle payouts are base units (1_000_000 = $1 per share), not 0/1 flags.
 
