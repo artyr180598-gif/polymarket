@@ -176,12 +176,13 @@ class TelegramController:
         lines = [
             f"{state_emoji} <b>PolyBot — {state_txt}</b>",
             "━━━━━━━━━━━━━━━━",
-            f"Стратегия: <b>mo-money</b> · CLOB+fee",
+            f"Стратегия: <b>mo-money</b> · RTDS + CLOB REST",
             f"Режим: <b>{mode}</b>",
             f"",
             f"💵 Equity: <b>${equity:,.2f}</b>",
             f"💸 Cash: ${cash:,.2f}",
             f"📈 Сегодня: <b>{day_s}</b>",
+            f"RTDS Chainlink/TWAP: {'OK' if st.get('chainlink_twap_ready') else 'ожидание'}",
             f"수수료 Fees: −${fees:.2f}".replace("수수료 ", ""),
         ]
         windows = [w for w in (st.get("windows") or []) if not w.get("resolved")]
@@ -291,13 +292,12 @@ class TelegramController:
 
     def _fmt_help(self) -> str:
         return (
-            "ℹ️ <b>Как зарабатывает бот</b>\n━━━━━━━━━━━━━━━━\n"
-            "1) Покупает Up и Down в CLOB\n"
-            "2) Если вместе дешевле $1 (после fee)\n"
-            "3) MERGE → получает $1 за пару\n"
-            "Разница = прибыль\n\n"
-            "✅/❌ окна — только если не сделали MERGE\n"
-            "и дождались конца 5 минут."
+            "ℹ️ <b>Как работает стратегия</b>\n━━━━━━━━━━━━━━━━\n"
+            "1) Покупает фаворита по лучшему ask, когда Chainlink-модель подтверждает сторону\n"
+            "2) При подходящей цене добавляет дешёвую противоположную ногу примерно до 22% стоимости фаворита\n"
+            "3) MERGE закрывает только совпавшие пары; остаток держит до подтверждённого резолва\n"
+            "4) SELL не используется. Комиссии taker учитываются отдельно.\n\n"
+            "PAPER-исполнение виртуальное; это не гарантия реального исполнения или прибыли."
         )
 
     def _fmt_presets(self) -> str:
