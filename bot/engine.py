@@ -726,9 +726,12 @@ class TradingEngine:
                                 msg = await ws.receive(timeout=30.0)
                             except asyncio.TimeoutError:
                                 await ws.send_json({"op": "ping"})
+                                tracker = self.trackers.get("BTC")
                                 if (
-                                    tracker := self.trackers.get("BTC")
-                                ) is None or time.monotonic() - tracker.cl_recv_mono > 30.0 or time.monotonic() - tracker.cl_twap_recv_mono > 30.0:
+                                    tracker is None
+                                    or time.monotonic() - tracker.cl_recv_mono > 30.0
+                                    or time.monotonic() - tracker.cl_twap_recv_mono > 30.0
+                                ):
                                     raise ConnectionError("PolyBolt Chainlink feed stale for more than 30 seconds")
                                 continue
                             if msg.type == aiohttp.WSMsgType.TEXT:
