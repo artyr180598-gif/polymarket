@@ -117,7 +117,7 @@ class StrategySafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = BotConfig(
                 trading_mode="paper", strategy_preset="hybrid",
-                enabled_assets=["BTC", "ETH"], enabled_timeframes=["1h"],
+                enabled_assets=["BTC", "ETH"], enabled_timeframes=["1h"], auto_start=False,
                 db_path=str(Path(tmp) / "preset.db"),
             )
             engine = TradingEngine(cfg)
@@ -126,6 +126,8 @@ class StrategySafetyTests(unittest.TestCase):
             self.assertEqual(engine.cfg.strategy_preset, "mo_money")
             self.assertEqual(engine.cfg.enabled_assets, ["BTC"])
             self.assertEqual(engine.cfg.enabled_timeframes, ["5m", "15m"])
+            self.assertTrue(engine.cfg.auto_start)
+            self.assertFalse(engine.paused)
             engine.ledger.conn.close()
 
 
