@@ -260,7 +260,7 @@ class TelegramController:
         stats = st.get("stats") or {}
         fills = list(st.get("fill_history") or [])
         merges = list(st.get("merge_history") or [])
-        merge_pnl = float(st.get("merge_profit", 0) or stats.get("merged_locked_pnl", 0) or 0)
+        merge_pnl = float(st.get("merge_profit", stats.get("merged_net_pnl", 0)) or 0)
         n_fills = int(stats.get("total_fills", 0) or len(fills))
         lines = [
             "📋 <b>Журнал сделок</b>",
@@ -288,7 +288,7 @@ class TelegramController:
             lines.append("")
             lines.append("<b>MERGE:</b>")
             for m in merges[:6]:
-                lines.append(f"♻️ {m.get('pairs', 0):.0f} пар → ${m.get('locked_pnl', 0):+.2f}")
+                lines.append(f"♻️ {m.get('pairs', 0):.0f} пар → net ${m.get('net_pnl', float(m.get('locked_pnl', 0) or 0) - float(m.get('fees', 0) or 0)):+.2f}")
         return "\n".join(lines)
 
     def _fmt_help(self) -> str:
