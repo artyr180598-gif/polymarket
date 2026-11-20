@@ -74,7 +74,10 @@ class Ledger:
                 notional REAL NOT NULL,
                 fee REAL NOT NULL,
                 fair_prob REAL NOT NULL,
-                tx_or_order_id TEXT DEFAULT ''
+                tx_or_order_id TEXT DEFAULT '',
+                price_to_beat REAL,
+                window_start_ts REAL,
+                window_end_ts REAL
             );
 
             CREATE TABLE IF NOT EXISTS merges (
@@ -123,9 +126,13 @@ class Ledger:
             );
             """
         )
-        columns = {row[1] for row in cur.execute("PRAGMA table_info(merges)").fetchall()}
-        if "fees" not in columns:
+        merge_columns = {row[1] for row in cur.execute("PRAGMA table_info(merges)").fetchall()}
+        if "fees" not in merge_columns:
             cur.execute("ALTER TABLE merges ADD COLUMN fees REAL NOT NULL DEFAULT 0.0")
+        fill_columns = {row[1] for row in cur.execute("PRAGMA table_info(fills)").fetchall()}
+        for name in ("price_to_beat", "window_start_ts", "window_end_ts"):
+            if name not in fill_columns:
+                cur.execute(f"ALTER TABLE fills ADD COLUMN {name} REAL")
         self.conn.commit()
 
     def record_fill(
@@ -144,19 +151,24 @@ class Ledger:
         fee: float,
         fair_prob: float,
         tx_or_order_id: str = "",
+        price_to_beat: float | None = None,
+        window_start_ts: float | None = None,
+        window_end_ts: float | None = None,
         ts: float | None = None,
     ) -> None:
         t = ts if ts is not None else time.time()
         self.conn.execute(
             """
             INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
-                               shares, price, notional, fee, fair_prob, tx_or_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               shares, price, notional, fee, fair_prob, tx_or_order_id,
+                               price_to_beat, window_start_ts, window_end_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 t, mode, slug, condition_id, asset, timeframe, outcome, role, reason,
                 round(shares, 4), round(price, 4), round(shares * price, 4),
                 round(fee, 5), round(fair_prob, 4), tx_or_order_id,
+                price_to_beat, window_start_ts, window_end_ts,
             ),
         )
         self.conn.commit()
