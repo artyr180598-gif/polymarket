@@ -265,11 +265,12 @@ class TelegramController:
         merges = list(st.get("merge_history") or [])
         merge_pnl = float(st.get("merge_profit", stats.get("merged_net_pnl", 0)) or 0)
         n_fills = int(stats.get("total_fills", 0) or len(fills))
+        n_merges = int(stats.get("merge_count", 0) or len(merges))
         lines = [
             "📋 <b>Журнал сделок</b>",
             "━━━━━━━━━━━━━━━━",
             f"Ставок: <b>{n_fills}</b>",
-            f"MERGE: {len(merges) or stats.get('merge_count', 0)} → ${merge_pnl:+.2f}",
+            f"MERGE: {n_merges} → ${merge_pnl:+.2f}",
             "",
             "<b>Последние:</b>",
         ]
