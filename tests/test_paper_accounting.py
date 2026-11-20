@@ -187,6 +187,12 @@ class RailwayVolumeSafetyTests(unittest.TestCase):
 
 
 class LedgerSafetyTests(unittest.TestCase):
+    def test_refuses_relative_data_path_that_bypasses_railway_volume(self):
+        with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_NAME": "production"}):
+            with patch("bot.ledger.os.getcwd", return_value="/app"):
+                with self.assertRaisesRegex(RuntimeError, "DB_PATH=/data/polybot.db"):
+                    Ledger("data/polybot.db")
+
     def test_refuses_ephemeral_railway_data_path_without_mounted_volume(self):
         with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_NAME": "production"}):
             with patch("bot.ledger.os.path.ismount", return_value=False):
