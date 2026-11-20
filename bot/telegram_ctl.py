@@ -53,6 +53,7 @@ class TelegramController:
         self._session: Optional[aiohttp.ClientSession] = None
         self._send_lock = asyncio.Lock()
         self._last_send_mono = 0.0
+        self._startup_ts = time.time()
 
     @property
     def _base(self) -> str:
@@ -352,6 +353,13 @@ class TelegramController:
                     data = await r.json()
                     for upd in data.get("result", []):
                         self._offset = max(self._offset, upd["update_id"] + 1)
+                        update_message = upd.get("message") or (upd.get("callback_query") or {}).get("message") or {}
+                        try:
+                            update_ts = int(update_message.get("date") or 0)
+                        except (TypeError, ValueError):
+                            update_ts = 0
+                        if update_ts < int(self._startup_ts):
+                            continue
                         if "message" in upd:
                             msg = upd["message"]
                             if str((msg.get("chat") or {}).get("id", "")).strip() != self.chat_id:
