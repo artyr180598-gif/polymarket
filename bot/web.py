@@ -30,7 +30,10 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
     def verify_pin(x_bot_pin: Optional[str] = Header(default=None)) -> None:
         required = engine.cfg.dashboard_pin
         if not required:
-            return
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard API disabled: DASHBOARD_PIN is not configured",
+            )
         provided = (x_bot_pin or "").strip()
         if not hmac.compare_digest(provided, required):
             raise HTTPException(status_code=401, detail="Неверный PIN-код панели")
