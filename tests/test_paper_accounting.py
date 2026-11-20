@@ -85,6 +85,50 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(restored.up_shares, 5.0, places=4)
             self.assertAlmostEqual(restored.down_shares, 5.0, places=4)
             self.assertAlmostEqual(restored.up_cost + restored.down_cost, 4.5, places=4)
+            self.assertAlmostEqual(restored.gross_buy, 9.0, places=4)
+            engine.ledger.conn.close()
+
+    async def test_resolution_does_not_guess_from_inventory_when_oracle_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "no-guess.db"))
+            engine = TradingEngine(cfg)
+            slug = f"btc-updown-5m-{int(time.time()) - 400}"
+            window = WindowState(
+                slug=slug, asset="BTC", timeframe="5m", condition_id="condition",
+                up_token="up", down_token="down",
+                start_ts=time.time() - 700, end_ts=time.time() - 400,
+                up_shares=20.0, down_shares=5.0, up_cost=10.0, down_cost=2.5,
+            )
+            engine.windows[slug] = window
+            with unittest.mock.patch("bot.engine.aiohttp.ClientSession", side_effect=RuntimeError("offline")):
+                await engine._resolve(window)
+            self.assertFalse(window.resolved)
+            self.assertAlmostEqual(engine.cash, cfg.bankroll_usd, places=5)
+            self.assertEqual(engine.ledger.recent_resolutions("paper"), [])
+            engine.ledger.conn.close()
+
+    async def test_live_mode_is_rejected_before_any_executor_starts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="live", db_path=str(Path(tmp) / "live-block.db"))
+            engine = TradingEngine(cfg)
+            with self.assertRaisesRegex(RuntimeError, "LIVE mode is disabled"):
+                await engine.start()
+            self.assertIsNone(engine.executor)
+            engine.ledger.conn.close()
+
+    async def test_failed_fill_persistence_does_not_change_paper_balance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "fill-failure.db"))
+            engine = TradingEngine(cfg)
+            window = WindowState(
+                slug="btc-updown-5m-1800000000", asset="BTC", timeframe="5m",
+                condition_id="condition", up_token="up", down_token="down",
+                start_ts=1800000000, end_ts=1800000300,
+            )
+            with unittest.mock.patch.object(engine.ledger, "record_fill", side_effect=RuntimeError("disk full")):
+                await engine._open(window, "Up", 0.5, 10.0, "favorite", fee=0.01)
+            self.assertAlmostEqual(engine.cash, cfg.bankroll_usd, places=5)
+            self.assertEqual(window.up_shares, 0.0)
             engine.ledger.conn.close()
 
     async def test_recovery_event_order_puts_fills_before_merge(self):
