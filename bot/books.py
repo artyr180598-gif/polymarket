@@ -43,7 +43,35 @@ def touch(bids: list, asks: list) -> tuple[Decimal | None, Decimal | None, Decim
 
 
 def size_at(bids: list, price: Decimal) -> Decimal:
+    """Size already resting on the bid at ``price``. Asks are not included."""
     return sum((sz for px, sz in parse_levels(bids) if px == D(price)), _ZERO)
+
+
+def queue_print_delta(
+    buy: Decimal,
+    sell: Decimal,
+    side: str,
+    size: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """New buy total, new sell total, and shares that newly traded.
+
+    /v2/trades lists the buyer and the seller as separate rows. A maker bid
+    fill is usually only the BUY row (the maker bought). When both rows are
+    present they are one trade, so the queue moves by the larger of the two
+    totals, not by their sum.
+    """
+    buy = D(buy)
+    sell = D(sell)
+    size = D(size)
+    if size <= 0:
+        return buy, sell, _ZERO
+    before = buy if buy >= sell else sell
+    if (side or "").upper() == "BUY":
+        buy += size
+    else:
+        sell += size
+    after = buy if buy >= sell else sell
+    return buy, sell, after - before
 
 
 def apply_trade_print(

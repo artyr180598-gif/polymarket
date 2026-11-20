@@ -26,7 +26,7 @@ from typing import Any, Callable
 import aiohttp
 
 from .accounting import D, Portfolio, usdc
-from .books import touch
+from .books import queue_print_delta, touch
 from .config import BotConfig
 from .execution import Fill, LiveBroker, PaperBroker, Resting
 from .fees import fallback_taker_fee_rate, fee_regime_label
@@ -59,6 +59,13 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
     return bases
 
 
+def _print_key(row: dict) -> str:
+    return "|".join(
+        str(row.get(name))
+        for name in ("transaction_hash", "token_id", "price", "size", "timestamp", "side")
+    )
+
+
 @dataclass
 class Window:
     slug: str
@@ -74,6 +81,8 @@ class Window:
     fee_exponent: Decimal
     orders: dict[str, str] = field(default_factory=dict)  # "Up@0.42" -> order id
     seen_prints: set[str] = field(default_factory=set)
+    # (buy size, sell size) already counted for one tx + token + price.
+    print_volume: dict[str, tuple[Decimal, Decimal]] = field(default_factory=dict)
     prints_seeded: bool = False
     resolved: bool = False
     reported: bool = False
@@ -203,7 +212,9 @@ class TradingEngine:
             why = "DRY_RUN" if self.cfg.dry_run else "paper"
             self._note(
                 "INFO",
-                f"{why}: банк ${self.portfolio.cash} · мейкер BTC-окна · без SELL",
+                f"{why}: банк ${self.portfolio.cash} · мейкер "
+                f"{','.join(self.cfg.enabled_assets)} "
+                f"{','.join(self.cfg.enabled_timeframes)} · без SELL",
                 notify=True,
             )
         self.running = True
@@ -641,66 +652,95 @@ class TradingEngine:
                 self._live_left.pop(order_id, None)
                 self._live_original.pop(order_id, None)
 
-    async def _recent_trades(self, condition_id: str) -> list[dict]:
+    async def _recent_trades(self, condition_id: str, seen: set[str]) -> list[dict] | None:
+        """Newest prints, including maker buys.
+
+        The default feed is short and drops the BUY row of a maker fill.
+        ``takerOnly=false`` keeps both sides. Pages continue until one row
+        was already seen, so a burst between polls is not lost off the end
+        of a single page of 80.
+        """
         if self._session is None or not condition_id:
             return []
+        collected: list[dict] = []
+        cursor = None
+        for _ in range(4):
+            params = {"condition": condition_id, "limit": "200", "takerOnly": "false"}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                async with self._session.get(
+                    "https://data-api.polymarket.com/v2/trades", params=params,
+                ) as response:
+                    if response.status != 200:
+                        return None if not collected else collected
+                    payload = await response.json(content_type=None)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Лента сделок: {exc}")
+                return None if not collected else collected
+            rows = payload.get("data") if isinstance(payload, dict) else payload
+            page = list(rows or [])
+            if not page:
+                break
+            collected.extend(page)
+            pagination = payload.get("pagination") if isinstance(payload, dict) else None
+            has_more = bool(pagination and pagination.get("has_more"))
+            cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
+            if any(_print_key(row) in seen for row in page) or not has_more or not cursor:
+                break
+        return collected
+
+    def _absorb_print(self, window: Window, row: dict, *, fill: bool) -> list[Fill]:
+        """Count one tape row toward the queue. Seeded rows update the
+        buy/sell totals and do not fill.
+        """
         try:
-            async with self._session.get(
-                "https://data-api.polymarket.com/v2/trades",
-                params={"condition": condition_id, "limit": "80"},
-            ) as response:
-                if response.status != 200:
-                    return None
-                payload = await response.json(content_type=None)
-        except Exception as exc:  # noqa: BLE001
-            self._note("ERROR", f"Лента сделок: {exc}")
-            return None
-        rows = payload.get("data") if isinstance(payload, dict) else payload
-        return list(rows or [])
+            price = D(row.get("price"))
+            size = D(row.get("size"))
+        except (TypeError, ValueError, ArithmeticError):
+            return []
+        token = str(row.get("token_id") or "")
+        side = str(row.get("side") or "")
+        vol_key = f"{row.get('transaction_hash')}|{token}|{price}"
+        buy, sell = window.print_volume.get(vol_key, (_ZERO, _ZERO))
+        buy, sell, delta = queue_print_delta(buy, sell, side, size)
+        window.print_volume[vol_key] = (buy, sell)
+        if not fill or delta <= 0:
+            return []
+        raw_ts = row.get("timestamp")
+        try:
+            trade_ts = float(raw_ts) if raw_ts is not None else None
+        except (TypeError, ValueError):
+            trade_ts = None
+        # The delta is already one trade. Pass it as a sell so the price
+        # check runs; the side filter must not drop a maker BUY.
+        return self.paper.on_trade(token, price, delta, "SELL", trade_ts=trade_ts)
 
     async def _paper_prints(self, window: Window) -> list[Fill]:
-        """Seed the tape once, then fill only on new sell prints.
+        """Seed the tape once, then fill on new prints at our price.
 
-        The first successful response is history. A failed fetch is not a
-        seed: the next good page would otherwise look like new trades and
-        fill orders with prints from before they were placed.
+        A maker bid fill arrives as side=BUY. The first successful response
+        is history. A failed fetch is not a seed.
         """
-        rows = await self._recent_trades(window.condition_id)
+        rows = await self._recent_trades(window.condition_id, window.seen_prints)
         if rows is None:
             return []
         fresh: list[tuple[str, dict]] = []
         for row in rows:
-            key = "|".join(
-                str(row.get(name))
-                for name in ("transaction_hash", "token_id", "price", "size", "timestamp", "side")
-            )
+            key = _print_key(row)
             if key in window.seen_prints:
                 continue
             fresh.append((key, row))
         if not window.prints_seeded:
-            for key, _row in fresh:
+            for key, row in fresh:
                 window.seen_prints.add(key)
+                self._absorb_print(window, row, fill=False)
             window.prints_seeded = True
             return []
         fills: list[Fill] = []
         for key, row in fresh:
             window.seen_prints.add(key)
-            try:
-                price = D(row.get("price"))
-                size = D(row.get("size"))
-            except (TypeError, ValueError, ArithmeticError):
-                continue
-            raw_ts = row.get("timestamp")
-            try:
-                trade_ts = float(raw_ts) if raw_ts is not None else None
-            except (TypeError, ValueError):
-                trade_ts = None
-            fills.extend(
-                self.paper.on_trade(
-                    str(row.get("token_id") or ""), price, size, str(row.get("side") or ""),
-                    trade_ts=trade_ts,
-                )
-            )
+            fills.extend(self._absorb_print(window, row, fill=True))
         return fills
 
     async def _merge(self, window: Window) -> Decimal:
@@ -941,12 +981,19 @@ class TradingEngine:
                     anchor = point
                     break
             pnl_7d = str(usdc(equity - D(anchor["equity"])))
+        slug_by_order: dict[str, str] = {}
+        for window in self.windows.values():
+            for order_id in window.orders.values():
+                slug_by_order[order_id] = window.slug
         open_orders = []
         if self.mode == "paper":
             for order in self.paper.open_orders():
                 open_orders.append({
-                    "outcome": order.outcome, "price": str(order.price),
-                    "remaining": str(order.remaining), "queue_ahead": str(order.queue_ahead),
+                    "outcome": order.outcome,
+                    "price": str(order.price),
+                    "remaining": str(order.remaining),
+                    "queue_ahead": str(order.queue_ahead),
+                    "slug": slug_by_order.get(order.order_id, ""),
                 })
         return {
             "mode": self.mode,
