@@ -58,6 +58,7 @@ class Ledger:
                 pairs REAL NOT NULL,
                 cost_basis REAL NOT NULL,
                 locked_pnl REAL NOT NULL,
+                fees REAL NOT NULL DEFAULT 0.0,
                 tx_hash TEXT DEFAULT ''
             );
 
@@ -94,6 +95,9 @@ class Ledger:
             );
             """
         )
+        columns = {row[1] for row in cur.execute("PRAGMA table_info(merges)").fetchall()}
+        if "fees" not in columns:
+            cur.execute("ALTER TABLE merges ADD COLUMN fees REAL NOT NULL DEFAULT 0.0")
         self.conn.commit()
 
     def record_fill(
@@ -138,14 +142,16 @@ class Ledger:
         pairs: float,
         cost_basis: float,
         locked_pnl: float,
+        fees: float = 0.0,
         tx_hash: str = "",
+        ts: float | None = None,
     ) -> None:
         self.conn.execute(
             """
-            INSERT INTO merges (ts, mode, slug, condition_id, pairs, cost_basis, locked_pnl, tx_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO merges (ts, mode, slug, condition_id, pairs, cost_basis, locked_pnl, fees, tx_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (time.time(), mode, slug, condition_id, round(pairs, 4), round(cost_basis, 4), round(locked_pnl, 4), tx_hash),
+            (ts if ts is not None else time.time(), mode, slug, condition_id, round(pairs, 4), round(cost_basis, 4), round(locked_pnl, 4), round(fees, 5), tx_hash),
         )
         self.conn.commit()
 
@@ -237,7 +243,9 @@ class Ledger:
         m_row = self.conn.execute(
             """
             SELECT COUNT(*) AS merge_count, COALESCE(SUM(pairs), 0) AS merged_usd,
-                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl
+                   COALESCE(SUM(locked_pnl), 0) AS merged_pnl,
+                   COALESCE(SUM(fees), 0) AS merged_fees,
+                   COALESCE(SUM(locked_pnl - fees), 0) AS merged_net_pnl
             FROM merges WHERE mode = ?
             """,
             (mode,),
@@ -264,6 +272,8 @@ class Ledger:
             "merge_count": int(m_row["merge_count"]),
             "merged_usd": round(float(m_row["merged_usd"]), 2),
             "merged_locked_pnl": round(float(m_row["merged_pnl"]), 2),
+            "merged_fees": round(float(m_row["merged_fees"]), 4),
+            "merged_net_pnl": round(float(m_row["merged_net_pnl"]), 2),
         }
 
     def recent_fills(self, mode: str, limit: int = 30) -> List[Dict[str, Any]]:
@@ -297,3 +307,18 @@ class Ledger:
             (mode, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def recovery_events(self, mode: str) -> List[Dict[str, Any]]:
+        """Return immutable paper-ledger events in replay order for crash recovery."""
+        events: List[Dict[str, Any]] = []
+        for table, kind in (("fills", "fill"), ("merges", "merge"), ("resolutions", "resolution")):
+            rows = self.conn.execute(
+                f"SELECT * FROM {table} WHERE mode = ? ORDER BY ts ASC, id ASC", (mode,)
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["event_type"] = kind
+                item["_priority"] = {"fill": 0, "merge": 1, "resolution": 2}[kind]
+                events.append(item)
+        events.sort(key=lambda item: (float(item.get("ts") or 0), item["_priority"], int(item.get("id") or 0)))
+        return events
