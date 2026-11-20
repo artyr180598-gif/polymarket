@@ -424,6 +424,111 @@ class TradingEngine:
         self._log_event("ALERT", f"СТОП merge ${merged:.2f}", notify=True)
         return {"canceled": 0, "merged_usd": round(merged, 2)}
 
+    async def _discovery_loop(self) -> None:
+        """Discover the current and next BTC 5m/15m windows without dropping open inventory."""
+        while self.running:
+            try:
+                await self._discover()
+                now = time.time()
+                removable = [
+                    slug for slug, window in self.windows.items()
+                    if window.resolved or (
+                        window.end_ts < now - 180
+                        and window.up_shares < 0.01
+                        and window.down_shares < 0.01
+                    )
+                ]
+                for slug in removable:
+                    self.windows.pop(slug, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("discovery: %s", exc)
+            await asyncio.sleep(4.0)
+
+    async def _discover(self) -> None:
+        now = time.time()
+        for asset in self.cfg.enabled_assets:
+            for timeframe in self.cfg.enabled_timeframes:
+                duration = {"5m": 300, "15m": 900}.get(timeframe)
+                if duration is None:
+                    continue
+                base = int(now // duration) * duration
+                for offset in (0, 1):
+                    start = base + offset * duration
+                    end = start + duration
+                    if end <= now + 5:
+                        continue
+                    slug = f"{asset.lower()}-updown-{timeframe}-{int(start)}"
+                    if slug in self.windows:
+                        continue
+                    meta = await self._gamma(slug)
+                    if not meta:
+                        continue
+                    self.windows[slug] = WindowState(
+                        slug=slug,
+                        asset=asset,
+                        timeframe=timeframe,
+                        condition_id=meta["condition_id"],
+                        up_token=meta["up_token"],
+                        down_token=meta["down_token"],
+                        start_ts=float(start),
+                        end_ts=float(end),
+                        price_to_beat=meta.get("price_to_beat"),
+                        fee_rate=meta.get("fee_rate"),
+                        fee_exponent=meta.get("fee_exponent"),
+                    )
+
+    async def _gamma(self, slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch market token IDs and metadata from Gamma; never invent a market."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    "https://gamma-api.polymarket.com/events",
+                    params={"slug": slug},
+                ) as response:
+                    if response.status != 200:
+                        return None
+                    payload = await response.json()
+            if not isinstance(payload, list) or not payload:
+                return None
+            event = payload[0]
+            if not isinstance(event, dict):
+                return None
+            markets = event.get("markets") or []
+            if not isinstance(markets, list) or not markets or not isinstance(markets[0], dict):
+                return None
+            market = markets[0]
+            token_ids = market.get("clobTokenIds")
+            if isinstance(token_ids, str):
+                token_ids = json.loads(token_ids)
+            if not isinstance(token_ids, list) or len(token_ids) < 2:
+                return None
+            metadata = event.get("eventMetadata") or {}
+            price_to_beat = None
+            raw_strike = metadata.get("priceToBeat") if isinstance(metadata, dict) else None
+            if raw_strike is not None:
+                try:
+                    parsed_strike = float(raw_strike)
+                    if parsed_strike > 0:
+                        price_to_beat = parsed_strike
+                except (TypeError, ValueError):
+                    pass
+            return {
+                "condition_id": str(market.get("conditionId") or ""),
+                "up_token": str(token_ids[0]),
+                "down_token": str(token_ids[1]),
+                "price_to_beat": price_to_beat,
+                "fee_rate": market.get("feeRate"),
+                "fee_exponent": market.get("feeExponent"),
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("Gamma market lookup %s failed: %s", slug, exc)
+            return None
+
     async def _rtds_loop(self) -> None:
         if not self.cfg.has_polybolt_credentials:
             self._price_feed_mode = "polybolt_unconfigured"
@@ -567,8 +672,8 @@ class TradingEngine:
     async def _polybolt_loop(self) -> None:
         delay = 1.0
         subscriptions = [
-            {"channel": "price.crypto", "filter": {"symbol": "btcusd"}},
-            {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60}},
+            {"channel": "price.crypto", "filter": {"symbol": "btcusd", "provider": "chainlink"}},
+            {"channel": "price.crypto.twap", "filter": {"symbol": "btcusd", "window_seconds": 60, "provider": "chainlink"}},
         ]
         while self.running:
             last_seq: Dict[str, int] = {}
