@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from bot.accounting import Portfolio
 from bot.books import touch
-from bot.engine import winner_from_payouts
+from bot.engine import winner_from_clob_market, winner_from_gamma_market, winner_from_payouts
 from bot.execution import PaperBroker
 from bot.fees import fallback_taker_fee_rate, taker_fee_usdc
 from bot.strategy import SideBook, in_entry_window, plan_quotes
@@ -312,11 +312,141 @@ class BookTests(unittest.TestCase):
 
 
 class ResolutionTests(unittest.TestCase):
+    KNOWN = {"Up", "Down"}
+
     def test_payout_base_units(self) -> None:
         # 1_000_000 means $1 per share on outcome 0, not a million dollars.
         self.assertEqual(winner_from_payouts([1_000_000, 0], ["Up", "Down"]), "Up")
         self.assertEqual(winner_from_payouts([0, 1_000_000], ["Up", "Down"]), "Down")
         self.assertIsNone(winner_from_payouts([0, 0], ["Up", "Down"]))
+
+    def test_data_api_resolved_row_is_not_a_settlement(self) -> None:
+        # The row that booked btc-updown-5m-1795171200 while Gamma was still open.
+        early = {
+            "status": "resolved",
+            "resolution_source": "reported",
+            "payouts": [1_000_000, 0],
+            "resolved_at": "2026-11-20T10:45:19Z",
+        }
+        self.assertIsNone(winner_from_clob_market(early, self.KNOWN))
+        self.assertIsNone(winner_from_gamma_market(early, self.KNOWN))
+
+    def test_gamma_mid_prices_wait(self) -> None:
+        market = {
+            "closed": False,
+            "umaResolutionStatus": None,
+            "outcomes": '["Up","Down"]',
+            "outcomePrices": '["0.395","0.605"]',
+        }
+        self.assertIsNone(winner_from_gamma_market(market, self.KNOWN))
+        market["outcomePrices"] = '["0.995","0.005"]'
+        self.assertIsNone(winner_from_gamma_market(market, self.KNOWN))
+
+    def test_gamma_official_close_names_the_winner(self) -> None:
+        market = {
+            "closed": True,
+            "umaResolutionStatus": "resolved",
+            "outcomes": ["Up", "Down"],
+            "outcomePrices": ["1", "0"],
+        }
+        self.assertEqual(winner_from_gamma_market(market, self.KNOWN), "Up")
+        market["closed"] = True
+        market["umaResolutionStatus"] = None
+        market["outcomePrices"] = ["1", "0"]
+        self.assertIsNone(winner_from_gamma_market(market, self.KNOWN))
+
+    def test_clob_needs_a_closed_market_and_one_winner(self) -> None:
+        tokens = [
+            {"outcome": "Up", "winner": True, "price": 1},
+            {"outcome": "Down", "winner": False, "price": 0},
+        ]
+        self.assertIsNone(winner_from_clob_market({"closed": False, "tokens": tokens}, self.KNOWN))
+        self.assertEqual(winner_from_clob_market({"closed": True, "tokens": tokens}, self.KNOWN), "Up")
+        self.assertEqual(
+            winner_from_clob_market(
+                {"closed": True, "tokens": [{"outcome": "Up"}, {"outcome": "Down"}], "payoutNumerators": [0, 1_000_000]},
+                self.KNOWN,
+            ),
+            "Down",
+        )
+        self.assertIsNone(
+            winner_from_clob_market(
+                {"closed": True, "tokens": [{"outcome": "Up"}, {"outcome": "Down"}], "payoutNumerators": [0, 0]},
+                self.KNOWN,
+            )
+        )
+
+    def test_unofficial_resolution_keeps_the_position_unrealized(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=2750)
+        engine = TradingEngine(cfg)
+        engine._session = object()
+        engine.portfolio.buy_fill(
+            slug="btc-updown-5m-1795171200", condition_id="0xabc", asset="BTC", timeframe="5m",
+            outcome="Up", shares=Decimal("12.2"), price=Decimal("0.306"), fee=Decimal("0"),
+        )
+        window = Window(
+            slug="btc-updown-5m-1795171200", asset="BTC", timeframe="5m", condition_id="0xabc",
+            tokens={"Up": "u", "Down": "d"}, start_ts=0, end_ts=1,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+
+        async def no_winner(_window):
+            return None
+
+        engine._official_winner = no_winner  # type: ignore[method-assign]
+        engine.marks[(window.slug, "Up")] = Decimal("0.40")
+        asyncio.run(engine._resolve(window))
+        lot = engine.portfolio.markets[window.slug].lot("Up")
+        self.assertEqual(lot.shares, Decimal("12.2"))
+        self.assertEqual(engine.portfolio.realized, Decimal("0"))
+        self.assertFalse(window.resolved)
+        self.assertEqual(engine.ledger.recent_resolutions("paper"), [])
+        equity = engine.portfolio.equity(engine.marks)
+        self.assertNotEqual(equity, engine.portfolio.initial_cash)
+
+    def test_resolution_payout_is_not_the_pnl(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=2750)
+        engine = TradingEngine(cfg)
+        engine._session = object()
+        engine.portfolio.buy_fill(
+            slug="btc-updown-5m-1795171200", condition_id="0xabc", asset="BTC", timeframe="5m",
+            outcome="Up", shares=Decimal("12.2"), price=Decimal("0.306"), fee=Decimal("0"),
+        )
+        cost = engine.portfolio.markets["btc-updown-5m-1795171200"].lot("Up").cost
+        window = Window(
+            slug="btc-updown-5m-1795171200", asset="BTC", timeframe="5m", condition_id="0xabc",
+            tokens={"Up": "u", "Down": "d"}, start_ts=0, end_ts=1,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+
+        async def up(_window):
+            return "Up"
+
+        engine._official_winner = up  # type: ignore[method-assign]
+        asyncio.run(engine._resolve(window))
+        row = engine.ledger.recent_resolutions("paper")[0]
+        self.assertEqual(row["winner"], "Up")
+        self.assertEqual(Decimal(row["payout"]), Decimal("12.2"))
+        self.assertEqual(Decimal(row["pnl"]), Decimal("12.2") - cost)
+        self.assertNotEqual(row["payout"], row["pnl"])
+        self.assertEqual(engine.portfolio.equity({}), engine.portfolio.initial_cash + engine.portfolio.realized)
+        self.assertTrue(any("выплата $12.200000" in line and "итог $" in line for line in engine.events))
 
 
 class PersistenceAndTelegramTests(unittest.TestCase):

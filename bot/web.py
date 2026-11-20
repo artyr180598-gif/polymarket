@@ -207,6 +207,11 @@ function render(){
       : card("Сделки", "<p>Пока пусто.</p>");
     const merges = s.merges || [];
     if (merges.length) el.innerHTML += card("MERGE", merges.slice(0,10).map(m => '<div class="row"><span>'+m.slug+'</span><b class="'+cls(m.pnl)+'">'+money(m.pnl)+'</b></div>').join(""));
+    const ress = s.resolutions || [];
+    if (ress.length) el.innerHTML += card("Итоги окон", ress.slice(0,10).map(r => {
+      const who = r.winner === "Up" ? "Вверх" : (r.winner === "Down" ? "Вниз" : r.winner);
+      return '<div class="row"><span>'+who+' · выплата $'+Number(r.payout||0).toFixed(2)+'</span><b class="'+cls(r.pnl)+'">'+money(r.pnl)+'</b></div>';
+    }).join(""));
   } else if (tab === "markets") {
     const rows = s.breakdown || [];
     el.innerHTML = rows.length ? card("Закрытые окна", rows.map(r => '<div class="row"><span>'+r.bucket+' · '+r.markets+' окон</span><b class="'+cls(r.pnl)+'">$'+Number(r.pnl).toFixed(2)+'</b></div>').join(""))
@@ -232,7 +237,7 @@ function render(){
       edgeCard(s);
   } else if (tab === "strategy") {
     const L = s.limits || {};
-    el.innerHTML = card("Что делает бот", "<ul><li>Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль.</li><li>Цены от 1¢ до 98¢. Дешёвые крылья дают лучшую отдачу на доллар. Выше 90¢ тоже небольшой плюс.</li><li>Средняя цена двух сторон вместе не выше 99¢. Дороже — вторую сторону не покупаем и убыточную пару не сливаем.</li><li>Пару дешевле $1 меняем на доллар. Остаток ждёт официальный итог. Продаж нет.</li><li>Оракул Chainlink для входа не нужен. Пока нет официальной резолюции, победителя не назначаем.</li></ul>")
+    el.innerHTML = card("Что делает бот", "<ul><li>Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль.</li><li>Цены от 1¢ до 98¢. Дешёвые крылья дают лучшую отдачу на доллар. Выше 90¢ тоже небольшой плюс.</li><li>Средняя цена двух сторон вместе не выше 99¢. Дороже — вторую сторону не покупаем и убыточную пару не сливаем.</li><li>Пару дешевле $1 меняем на доллар. Остаток ждёт официальный итог. Продаж нет.</li><li>Оракул Chainlink для входа не нужен. Победителя назначаем, когда Gamma или CLOB закрыли рынок. До этого позиция ждёт и в реализованное не входит.</li></ul>")
       + card("Лимиты", '<div class="row"><span>Заявка</span><span>$'+L.order_clip_usd+'</span></div><div class="row"><span>На одно окно</span><span>$'+L.max_window_risk_usd+'</span></div><div class="row"><span>На все окна</span><span>$'+L.max_total_exposure_usd+'</span></div><div class="row"><span>Стоп за день</span><span>−$'+L.max_daily_loss_usd+'</span></div><div class="row"><span>Комиссии</span><span>'+s.fee_regime+'</span></div><div class="row"><span>Активы</span><span>'+(s.assets||[]).join(", ")+'</span></div>')
       + edgeCard(s);
   } else if (tab === "errors") {
