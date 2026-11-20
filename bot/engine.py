@@ -165,6 +165,7 @@ class TradingEngine:
         self._merge_history: List[Dict[str, Any]] = []
         self._resolve_history: List[Dict[str, Any]] = []
         self._rtds_ok = False
+        self._price_feed_mode = "unavailable"
         self._day_key = time.strftime("%Y-%m-%d", time.gmtime())
         self._resolve_sem = asyncio.Semaphore(5)
 
@@ -1308,6 +1309,7 @@ class TradingEngine:
                 for t in self.trackers.values()
             )),
             "rtds_ok": self._rtds_ok,
+            "price_feed_mode": self._price_feed_mode,
             "chainlink_twap_ready": all(
                 t.cl_spot is not None and t.cl_twap60 is not None
                 and time.monotonic() - t.cl_recv_mono <= 5.0
