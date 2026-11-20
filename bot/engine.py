@@ -1169,6 +1169,13 @@ class TradingEngine:
                         async with session.get(url) as response:
                             if response.status == 200:
                                 payout_weights = _resolution_payouts(await response.json())
+                            elif response.status in (429, 503):
+                                try:
+                                    retry_after = float(response.headers.get("Retry-After", "30"))
+                                except (TypeError, ValueError):
+                                    retry_after = 30.0
+                                w.last_resolve_attempt_mono = time.monotonic() + max(0.0, retry_after - 15.0)
+                                log.warning("resolution API throttled %s (HTTP %s); retry in %.1fs", w.slug, response.status, retry_after)
             except Exception as exc:
                 log.debug("resolution API not ready for %s: %s", w.slug, exc)
 
