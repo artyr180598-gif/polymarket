@@ -263,6 +263,39 @@ class PaperRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await engine.stop()
             engine.ledger.conn.close()
 
+    async def test_discovery_does_not_stamp_future_window_with_previous_spot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "strike.db"))
+            engine = TradingEngine(cfg)
+            now = 1_800_000_001.0
+            stale_ms = int((now - 5.0) * 1000)
+            engine.trackers["BTC"].on_chainlink_spot(
+                100.0, stale_ms, received_at_ms=stale_ms,
+            )
+            engine._gamma = AsyncMock(return_value={
+                "condition_id": "condition", "up_token": "up", "down_token": "down",
+                "price_to_beat": None,
+            })
+            with patch("bot.engine.time.time", return_value=now):
+                await engine._discover()
+                current = engine.windows["btc-updown-5m-1800000000"]
+                future = engine.windows["btc-updown-5m-1800000300"]
+                self.assertIsNone(current.price_to_beat)
+                self.assertIsNone(future.price_to_beat)
+                now_ms = int(now * 1000)
+                engine._handle_polybolt_frame({
+                    "v": 1, "channel": "price.crypto", "ts": now_ms, "seq": 1,
+                    "snapshot": False,
+                    "payload": {
+                        "symbol": "btcusd", "source": "chainlink", "timestamp": now_ms,
+                        "received_at": now_ms, "value": 101.0,
+                        "full_accuracy_value": "101.0000", "is_carried_forward": False,
+                    },
+                })
+                self.assertEqual(current.price_to_beat, 101.0)
+                self.assertIsNone(future.price_to_beat)
+            engine.ledger.conn.close()
+
     async def test_discovery_retains_expired_unresolved_inventory(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = BotConfig(trading_mode="paper", db_path=str(Path(tmp) / "discovery.db"))
