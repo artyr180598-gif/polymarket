@@ -10,6 +10,34 @@ import time
 from typing import Any
 
 
+# Columns the current code writes or reads. An older database is missing
+# some of them. ALTER TABLE ADD COLUMN is the only change we make: rows
+# stay, and each new column has a default so existing inserts keep working.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "fills": {"order_id": "TEXT NOT NULL DEFAULT ''"},
+    "merges": {
+        "pnl": "TEXT NOT NULL DEFAULT '0'",
+        "tx": "TEXT NOT NULL DEFAULT ''",
+    },
+    "resolutions": {
+        "pnl": "TEXT NOT NULL DEFAULT '0'",
+        "payout": "TEXT NOT NULL DEFAULT '0'",
+    },
+    "equity_points": {"realized": "TEXT NOT NULL DEFAULT '0'"},
+}
+
+# Old names that mean the same thing. Copied once into the new column so
+# history written before the rewrite is still visible. Never the other way.
+_BACKFILL: tuple[tuple[str, str, str], ...] = (
+    ("fills", "order_id", "tx_or_order_id"),
+    ("merges", "pnl", "locked_pnl"),
+    ("merges", "tx", "tx_hash"),
+    ("resolutions", "pnl", "net_pnl"),
+    ("resolutions", "payout", "total_payout"),
+    ("equity_points", "realized", "realized_net_pnl"),
+)
+
+
 class Ledger:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -19,6 +47,7 @@ class Ledger:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        self.added_columns: list[str] = []
         self._init()
 
     def _init(self) -> None:
@@ -78,7 +107,60 @@ class Ledger:
                 );
                 """
             )
+            self._migrate_locked()
             self.conn.commit()
+
+    def _migrate_locked(self) -> None:
+        """Add columns an older file does not have. Never drops or rewrites rows."""
+        added: list[str] = []
+        for table, columns in _ADDED_COLUMNS.items():
+            have = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, declaration in columns.items():
+                if name in have:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                added.append(f"{table}.{name}")
+        for table, new_name, old_name in _BACKFILL:
+            have = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            if new_name not in have or old_name not in have:
+                continue
+            self.conn.execute(
+                f"""
+                UPDATE {table}
+                SET {new_name} = CAST({old_name} AS TEXT)
+                WHERE {new_name} IN ('', '0')
+                  AND {old_name} IS NOT NULL
+                  AND CAST({old_name} AS TEXT) NOT IN ('', '0', '0.0')
+                """
+            )
+        self.added_columns = added
+
+    def _insert(self, table: str, values: dict[str, Any], suffix: str = "") -> None:
+        """Insert, filling any older NOT NULL column this statement does not set.
+
+        Pre-rewrite tables require reason, fair_prob, locked_pnl, net_pnl and
+        similar columns. Adding the new names is not enough: an INSERT that
+        omits a NOT NULL column with no default is rejected. The old value is
+        left untouched; we only supply a zero or an empty string so the new
+        write can land beside it.
+        """
+        info = list(self.conn.execute(f"PRAGMA table_info({table})"))
+        row = dict(values)
+        for col in info:
+            name = col["name"]
+            if name in row or col["pk"]:
+                continue
+            if col["notnull"] and col["dflt_value"] is None:
+                declared = (col["type"] or "").upper()
+                numeric = any(token in declared for token in ("INT", "REAL", "NUM", "FLOA", "DOUB"))
+                row[name] = 0 if numeric else ""
+        columns = list(row)
+        placeholders = ", ".join("?" for _ in columns)
+        names = ", ".join(columns)
+        self.conn.execute(
+            f"INSERT INTO {table} ({names}) VALUES ({placeholders}) {suffix}",
+            [row[name] for name in columns],
+        )
 
     def save_portfolio(self, mode: str, blob: dict) -> None:
         with self._lock:
@@ -97,50 +179,69 @@ class Ledger:
 
     def record_fill(self, **row: Any) -> None:
         with self._lock:
-            self.conn.execute(
-                """
-                INSERT INTO fills (ts, mode, slug, condition_id, asset, timeframe, outcome, role,
-                                   shares, price, notional, fee, order_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row.get("ts", time.time()), row["mode"], row["slug"], row["condition_id"],
-                    row["asset"], row["timeframe"], row["outcome"], row["role"],
-                    str(row["shares"]), str(row["price"]), str(row["notional"]), str(row["fee"]),
-                    row.get("order_id", ""),
-                ),
+            self._insert(
+                "fills",
+                {
+                    "ts": row.get("ts", time.time()),
+                    "mode": row["mode"],
+                    "slug": row["slug"],
+                    "condition_id": row["condition_id"],
+                    "asset": row["asset"],
+                    "timeframe": row["timeframe"],
+                    "outcome": row["outcome"],
+                    "role": row["role"],
+                    "shares": str(row["shares"]),
+                    "price": str(row["price"]),
+                    "notional": str(row["notional"]),
+                    "fee": str(row["fee"]),
+                    "order_id": row.get("order_id", ""),
+                },
             )
             self.conn.commit()
 
     def record_merge(self, **row: Any) -> None:
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO merges (ts, mode, slug, pairs, pnl, tx) VALUES (?, ?, ?, ?, ?, ?)",
-                (time.time(), row["mode"], row["slug"], str(row["pairs"]), str(row["pnl"]), row.get("tx", "")),
+            self._insert(
+                "merges",
+                {
+                    "ts": time.time(),
+                    "mode": row["mode"],
+                    "slug": row["slug"],
+                    "pairs": str(row["pairs"]),
+                    "pnl": str(row["pnl"]),
+                    "tx": row.get("tx", ""),
+                },
             )
             self.conn.commit()
 
     def record_resolution(self, **row: Any) -> None:
         with self._lock:
-            self.conn.execute(
+            self._insert(
+                "resolutions",
+                {
+                    "ts": time.time(),
+                    "mode": row["mode"],
+                    "slug": row["slug"],
+                    "condition_id": row["condition_id"],
+                    "asset": row["asset"],
+                    "timeframe": row["timeframe"],
+                    "winner": row["winner"],
+                    "pnl": str(row["pnl"]),
+                    "payout": str(row["payout"]),
+                },
                 """
-                INSERT INTO resolutions (ts, mode, slug, condition_id, asset, timeframe, winner, pnl, payout)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(mode, slug) DO UPDATE SET
-                    ts = excluded.ts, winner = excluded.winner, pnl = excluded.pnl, payout = excluded.payout
+                    ts = excluded.ts, winner = excluded.winner,
+                    pnl = excluded.pnl, payout = excluded.payout
                 """,
-                (
-                    time.time(), row["mode"], row["slug"], row["condition_id"], row["asset"],
-                    row["timeframe"], row["winner"], str(row["pnl"]), str(row["payout"]),
-                ),
             )
             self.conn.commit()
 
     def record_equity(self, *, mode: str, equity: str, cash: str, realized: str) -> None:
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO equity_points (ts, mode, equity, cash, realized) VALUES (?, ?, ?, ?, ?)",
-                (time.time(), mode, equity, cash, realized),
+            self._insert(
+                "equity_points",
+                {"ts": time.time(), "mode": mode, "equity": equity, "cash": cash, "realized": realized},
             )
             self.conn.commit()
 
