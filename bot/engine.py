@@ -59,6 +59,51 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
     return bases
 
 
+def _slug_bounds(slug: str) -> tuple[str, str, float, float] | None:
+    """asset, timeframe, start, end from ``btc-updown-5m-1795266600``."""
+    parts = slug.split("-")
+    if len(parts) != 4 or parts[1] != "updown":
+        return None
+    timeframe = parts[2]
+    sec = WINDOW_SECONDS.get(timeframe)
+    if not sec:
+        return None
+    try:
+        start = int(parts[3])
+    except ValueError:
+        return None
+    return parts[0].upper(), timeframe, float(start), float(start + sec)
+
+
+def _row_timestamp(row: dict) -> float | None:
+    try:
+        return float(row.get("timestamp"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _oldest_timestamp(rows: list[dict]) -> float | None:
+    oldest: float | None = None
+    for row in rows:
+        ts = _row_timestamp(row)
+        if ts is None:
+            continue
+        oldest = ts if oldest is None else min(oldest, ts)
+    return oldest
+
+
+def _oldest_unseen_ts(rows: list[dict], seen: set[str]) -> float | None:
+    oldest: float | None = None
+    for key, row in _enumerate_prints(rows):
+        if key in seen:
+            continue
+        ts = _row_timestamp(row)
+        if ts is None:
+            continue
+        oldest = ts if oldest is None else min(oldest, ts)
+    return oldest
+
+
 def _print_fingerprint(row: dict) -> str:
     """Stable identity of one tape row, without its place in the page.
 
@@ -117,6 +162,8 @@ class Window:
     fee_exponent: Decimal
     orders: dict[str, str] = field(default_factory=dict)  # "Up@0.42" -> order id
     seen_prints: set[str] = field(default_factory=set)
+    # key -> time.time() when this full-tape row was first observed.
+    pending: dict[str, float] = field(default_factory=dict)
     prints_seeded: bool = False
     resolved: bool = False
     reported: bool = False
@@ -244,6 +291,7 @@ class TradingEngine:
                         self.paper = PaperBroker(self.portfolio)
                         self._persist()
         else:
+            self._release_stale_paper_locks()
             why = "DRY_RUN" if self.cfg.dry_run else "paper"
             self._note(
                 "INFO",
@@ -283,8 +331,10 @@ class TradingEngine:
         if self.cfg.live_requested and not self.live.ready:
             self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
             return
+        self.consecutive_losses = 0
         self.paused = False
         self.halt_reason = ""
+        self._persist()
         self._note("INFO", "Торговля включена", notify=True)
 
     def set_preset(self, key: str) -> bool:
@@ -342,7 +392,21 @@ class TradingEngine:
                 self._note("ERROR", f"Поиск окон: {exc}")
             await asyncio.sleep(8)
 
+    def _release_stale_paper_locks(self) -> None:
+        """Return cash reserved for paper orders that did not survive a restart."""
+        if self.mode != "paper":
+            return
+        alive = set(self.paper.orders) | set(self.paper.ghosts)
+        stale = [order_id for order_id in self.portfolio.locks if order_id not in alive]
+        if not stale:
+            return
+        for order_id in stale:
+            self.portfolio.unlock(order_id)
+        self._persist()
+        self._note("INFO", f"Сняты залоги заявок, которых больше нет: {len(stale)}")
+
     async def _discover(self) -> None:
+        await self._recover_open_books()
         now = time.time()
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
@@ -378,6 +442,32 @@ class TradingEngine:
                             fee_rate=meta["fee_rate"],
                             fee_exponent=meta["fee_exponent"],
                         )
+
+    async def _recover_open_books(self) -> None:
+        """Put every unresolved book back on the loop, even if its window ended."""
+        for slug, book in self.portfolio.markets.items():
+            if book.resolved or book.closed or slug in self.windows:
+                continue
+            bounds = _slug_bounds(slug)
+            if bounds is None:
+                continue
+            asset, timeframe, start, end = bounds
+            meta = await self._gamma(slug)
+            if not meta:
+                continue
+            self.windows[slug] = Window(
+                slug=slug,
+                asset=asset,
+                timeframe=timeframe,
+                condition_id=meta["condition_id"],
+                tokens=meta["tokens"],
+                start_ts=start,
+                end_ts=end,
+                tick=meta["tick"],
+                min_shares=meta["min_shares"],
+                fee_rate=meta["fee_rate"],
+                fee_exponent=meta["fee_exponent"],
+            )
 
     async def _gamma(self, slug: str) -> dict | None:
         if self._session is None:
@@ -446,6 +536,8 @@ class TradingEngine:
                     if window.resolved:
                         continue
                     await self._on_window(window)
+                if self.mode == "paper":
+                    self.paper.release_expired_ghosts(time.time(), self.cfg.tape_settle_s)
             except Exception as exc:  # noqa: BLE001
                 self._note("ERROR", f"Торговля: {exc}")
             await asyncio.sleep(2)
@@ -476,6 +568,7 @@ class TradingEngine:
         if self.mode == "paper":
             for fill in await self._paper_prints(window):
                 self._apply_fill(window, fill)
+            self.paper.release_expired_ghosts(time.time(), self.cfg.tape_settle_s)
         if self.mode == "live":
             await self._pull_live_fills(window)
         self._drop_finished_orders(window)
@@ -483,7 +576,7 @@ class TradingEngine:
         if window.seconds_to_end <= 0:
             self._cancel_window(window)
             await self._merge(window)
-            if window.seconds_to_end < -8:
+            if window.seconds_to_end < -8 and not self._ghosts_for(window):
                 await self._resolve(window)
             return
 
@@ -510,18 +603,18 @@ class TradingEngine:
                 held_shares[name] = lot.shares
         # Collateral already locked by this window's own resting bids is still
         # available to those bids: a re-quote cancels them first.
-        locked_here = sum((self.portfolio.locks.get(oid, _ZERO) for oid in window.orders.values()), _ZERO)
+        budget = self._risk_budget(window)
         quotes = plan_quotes(
             sides,
             tick=window.tick,
             min_shares=window.min_shares,
             share_step=Decimal("0.01"),
             clip_usd=D(str(self.cfg.order_clip_usd)),
-            window_spent=book.cost_basis() if book else _ZERO,
+            window_spent=budget["window_spent"],
             window_cap=D(str(self.cfg.max_window_risk_usd)),
             side_spent=side_spent,
-            free_cash=self.portfolio.cash + locked_here,
-            total_exposure=self.portfolio.exposure_cost() + self.portfolio.reserved - locked_here,
+            free_cash=budget["free_cash"],
+            total_exposure=budget["total_exposure"],
             exposure_cap=D(str(self.cfg.max_total_exposure_usd)),
             held_avg=held_avg,
             held_shares=held_shares,
@@ -637,7 +730,11 @@ class TradingEngine:
         except ValueError as exc:
             self._note("ERROR", f"Филл не записан ({window.slug}): {exc}")
             return
-        if self.mode == "paper" and fill.order_id not in self.paper.orders:
+        if (
+            self.mode == "paper"
+            and fill.order_id not in self.paper.orders
+            and fill.order_id not in self.paper.ghosts
+        ):
             # Full paper fill: release a rounding remainder of the lock.
             # Live orders are not in the paper book; their lock is reduced by
             # buy_fill and released only when the order is fully matched.
@@ -683,7 +780,12 @@ class TradingEngine:
                 self._live_original.pop(order_id, None)
 
     async def _fetch_trade_pages(
-        self, condition_id: str, seen: set[str], *, taker_only: bool,
+        self,
+        condition_id: str,
+        seen: set[str],
+        *,
+        taker_only: bool,
+        stop_older_than: float | None = None,
     ) -> list[dict] | None:
         if self._session is None or not condition_id:
             return []
@@ -713,36 +815,28 @@ class TradingEngine:
             if not page:
                 break
             known = False
-            for row in page:
-                fp = _print_fingerprint(row)
-                n = counts.get(fp, 0)
-                counts[fp] = n + 1
-                if f"{fp}#{n}" in seen:
-                    known = True
+            # The taker tape is stopped by age instead. A seen-key match there
+            # does not line up with full-tape occurrence numbers.
+            if stop_older_than is None:
+                for row in page:
+                    fp = _print_fingerprint(row)
+                    n = counts.get(fp, 0)
+                    counts[fp] = n + 1
+                    if f"{fp}#{n}" in seen:
+                        known = True
             collected.extend(page)
+            oldest = _oldest_timestamp(page)
+            crossed = (
+                stop_older_than is not None
+                and oldest is not None
+                and oldest < stop_older_than
+            )
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
             cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
-            if known or not has_more or not cursor:
+            if crossed or known or not has_more or not cursor:
                 break
         return collected
-
-    async def _recent_trades(self, condition_id: str, seen: set[str]) -> list[dict] | None:
-        """Maker BUY prints only.
-
-        The full tape and the taker-only tape are both fetched. Their
-        difference is the maker side. If the taker tape fails we count
-        nothing: guessing would fill on asks being lifted.
-        """
-        full = await self._fetch_trade_pages(condition_id, seen, taker_only=False)
-        if full is None:
-            return None
-        taker = await self._fetch_trade_pages(condition_id, seen, taker_only=True)
-        if taker is None:
-            self._note("ERROR", f"Лента тейкера недоступна, филлы пропущены {condition_id[:10]}")
-            return None
-        self._last_tape_rows = full
-        return maker_buy_rows(full, taker)
 
     def _absorb_print(self, window: Window, row: dict, *, fill: bool) -> list[Fill]:
         """Fill resting bids from one maker BUY. Seeded rows do not fill."""
@@ -765,29 +859,57 @@ class TradingEngine:
         return self.paper.on_trade(token, price, size, "BUY", trade_ts=trade_ts)
 
     async def _paper_prints(self, window: Window) -> list[Fill]:
-        """Seed the tape once, then fill on new prints at our price.
+        """Seed once, then fill maker buys that have sat on the tape long enough.
 
-        A maker bid fill arrives as side=BUY. The first successful response
-        is history. A failed fetch is not a seed.
+        A taker row often reaches the full tape before takerOnly=true. Classing
+        it immediately marks it seen, and the mistake cannot be undone. New
+        rows wait in ``window.pending`` for ``tape_settle_s``. Each pass
+        rebuilds the maker set from a fresh pair of tapes. Only a row that is
+        still a maker BUY after the wait can fill. If the taker tape fails,
+        this tick counts nothing and does not seed.
         """
-        rows = await self._recent_trades(window.condition_id, window.seen_prints)
-        if rows is None:
+        full = await self._fetch_trade_pages(
+            window.condition_id, window.seen_prints, taker_only=False,
+        )
+        if full is None:
             return []
-        self._warn_if_tape_stale(window, getattr(self, "_last_tape_rows", rows))
-        fresh: list[tuple[str, dict]] = []
-        for key, row in _enumerate_prints(rows):
-            if key in window.seen_prints:
-                continue
-            fresh.append((key, row))
+        oldest_unseen = _oldest_unseen_ts(full, window.seen_prints)
+        if oldest_unseen is None:
+            taker: list[dict] | None = []
+        else:
+            taker = await self._fetch_trade_pages(
+                window.condition_id,
+                window.seen_prints,
+                taker_only=True,
+                stop_older_than=oldest_unseen,
+            )
+        if taker is None:
+            self._note("ERROR", f"Лента тейкера недоступна, филлы пропущены {window.condition_id[:10]}")
+            return []
+        self._last_tape_rows = full
+        self._warn_if_tape_stale(window, full)
+        maker_ids = {id(row) for row in maker_buy_rows(full, taker)}
+        numbered = _enumerate_prints(full)
+        now = time.time()
         if not window.prints_seeded:
-            for key, row in fresh:
+            for key, _row in numbered:
                 window.seen_prints.add(key)
-                self._absorb_print(window, row, fill=False)
             window.prints_seeded = True
             return []
+        for key, _row in numbered:
+            if key not in window.seen_prints:
+                window.pending.setdefault(key, now)
+        by_key = {key: row for key, row in numbered}
+        settle = float(self.cfg.tape_settle_s)
         fills: list[Fill] = []
-        for key, row in fresh:
+        for key, first_seen in list(window.pending.items()):
+            if now - first_seen < settle:
+                continue
+            row = by_key.get(key)
+            window.pending.pop(key, None)
             window.seen_prints.add(key)
+            if row is None or id(row) not in maker_ids:
+                continue
             fills.extend(self._absorb_print(window, row, fill=True))
         return fills
 
@@ -844,8 +966,37 @@ class TradingEngine:
         self._persist()
         return pnl
 
+    def _ghosts_for(self, window: Window) -> list[Resting]:
+        if self.mode != "paper":
+            return []
+        tokens = set(window.tokens.values())
+        return [order for order in self.paper.ghosts.values() if order.token_id in tokens]
+
+    def _risk_budget(self, window: Window) -> dict[str, Decimal]:
+        """Cash still at risk, including cancelled orders waiting on the tape.
+
+        Live rungs of this window are excluded: a re-quote cancels them first.
+        Ghost locks are not. A late fill still spends them, so both the window
+        cap and the account cap count them.
+        """
+        book = self.portfolio.markets.get(window.slug)
+        locked_here = sum(
+            (self.portfolio.locks.get(order_id, _ZERO) for order_id in window.orders.values()),
+            _ZERO,
+        )
+        ghost_here = sum(
+            (self.portfolio.locks.get(order.order_id, _ZERO) for order in self._ghosts_for(window)),
+            _ZERO,
+        )
+        return {
+            "window_spent": (book.cost_basis() if book else _ZERO) + ghost_here,
+            "free_cash": self.portfolio.cash + locked_here,
+            "total_exposure": self.portfolio.exposure_cost() + self.portfolio.reserved - locked_here,
+            "ghost_here": ghost_here,
+        }
+
     async def _resolve(self, window: Window) -> None:
-        if window.resolved or self._session is None:
+        if window.resolved or self._session is None or self._ghosts_for(window):
             return
         winner = await self._official_winner(window)
         if winner is None:

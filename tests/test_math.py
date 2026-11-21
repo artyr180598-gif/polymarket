@@ -481,6 +481,7 @@ class BookTests(unittest.TestCase):
         from bot.engine import TradingEngine, Window
 
         cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        cfg.tape_settle_s = 0
         engine = TradingEngine(cfg)
         engine._session = object()
         window = Window(
@@ -495,22 +496,24 @@ class BookTests(unittest.TestCase):
         )
         window.orders["Up@0.57"] = order_id
 
-        async def failed(_cid, _seen):
+        async def failed(_cid, _seen, *, taker_only, stop_older_than=None):
             return None
 
-        engine._recent_trades = failed  # type: ignore[method-assign]
+        engine._fetch_trade_pages = failed  # type: ignore[method-assign]
         asyncio.run(engine._paper_prints(window))
         self.assertFalse(window.prints_seeded)
 
-        async def empty(_cid, _seen):
+        async def empty(_cid, _seen, *, taker_only, stop_older_than=None):
             return []
 
-        engine._recent_trades = empty  # type: ignore[method-assign]
+        engine._fetch_trade_pages = empty  # type: ignore[method-assign]
         asyncio.run(engine._paper_prints(window))
         self.assertTrue(window.prints_seeded)
 
-        async def late_history(_cid, _seen):
+        async def late_history(_cid, _seen, *, taker_only, stop_older_than=None):
             # The 11:20:06 cluster: sells below 0.57, timestamped before the order.
+            if taker_only:
+                return []
             return [
                 {"transaction_hash": "a", "token_id": "t", "price": "0.51", "size": "1", "timestamp": 100, "side": "SELL"},
                 {"transaction_hash": "b", "token_id": "t", "price": "0.47", "size": "2", "timestamp": 110, "side": "SELL"},
@@ -519,16 +522,18 @@ class BookTests(unittest.TestCase):
             ]
 
         engine.paper.orders[order_id].placed_at = 1000
-        engine._recent_trades = late_history  # type: ignore[method-assign]
+        engine._fetch_trade_pages = late_history  # type: ignore[method-assign]
         self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
         self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("12"))
 
-        async def real_print(_cid, _seen):
+        async def real_print(_cid, _seen, *, taker_only, stop_older_than=None):
+            if taker_only:
+                return []
             return [
                 {"transaction_hash": "e", "token_id": "t", "price": "0.57", "size": "20", "timestamp": 1000, "side": "BUY"},
             ]
 
-        engine._recent_trades = real_print  # type: ignore[method-assign]
+        engine._fetch_trade_pages = real_print  # type: ignore[method-assign]
         fills = asyncio.run(engine._paper_prints(window))
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].shares, Decimal("12"))
@@ -542,6 +547,7 @@ class BookTests(unittest.TestCase):
         from bot.engine import TradingEngine, Window
 
         cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        cfg.tape_settle_s = 0
         engine = TradingEngine(cfg)
         window = Window(
             slug="eth-updown-5m-1", asset="ETH", timeframe="5m", condition_id="c",
@@ -556,13 +562,15 @@ class BookTests(unittest.TestCase):
         window.prints_seeded = True
         engine.paper.orders[order_id].placed_at = 1000
 
-        async def maker_buy(_cid, _seen):
+        async def maker_buy(_cid, _seen, *, taker_only, stop_older_than=None):
+            if taker_only:
+                return []
             return [
                 {"transaction_hash": "m", "token_id": "t", "price": "0.83", "size": "146.95", "timestamp": 1000, "side": "BUY"},
                 {"transaction_hash": "m", "token_id": "t", "price": "0.83", "size": "12", "timestamp": 1000, "side": "SELL"},
             ]
 
-        engine._recent_trades = maker_buy  # type: ignore[method-assign]
+        engine._fetch_trade_pages = maker_buy  # type: ignore[method-assign]
         fills = asyncio.run(engine._paper_prints(window))
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].shares, Decimal("12"))
@@ -577,6 +585,7 @@ class BookTests(unittest.TestCase):
         from bot.engine import TradingEngine, Window
 
         cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=1000)
+        cfg.tape_settle_s = 0
         engine = TradingEngine(cfg)
         window = Window(
             slug="btc-updown-5m-1", asset="BTC", timeframe="5m", condition_id="c",
@@ -601,7 +610,7 @@ class BookTests(unittest.TestCase):
         taker = row("0x8847f391", "BUY", "31")
         sold = row("0xed395b7c", "SELL", "53.78")
 
-        async def ignored(_cid, _seen, *, taker_only):
+        async def ignored(_cid, _seen, *, taker_only, stop_older_than=None):
             return [taker] if taker_only else [taker, sold]
 
         engine._fetch_trade_pages = ignored  # type: ignore[method-assign]
@@ -611,7 +620,7 @@ class BookTests(unittest.TestCase):
 
         maker = row("0xmaker", "BUY", "10")
 
-        async def hit(_cid, _seen, *, taker_only):
+        async def hit(_cid, _seen, *, taker_only, stop_older_than=None):
             return [] if taker_only else [maker]
 
         engine._fetch_trade_pages = hit  # type: ignore[method-assign]
@@ -621,7 +630,7 @@ class BookTests(unittest.TestCase):
 
         finish = row("0xmaker2", "BUY", "50")
 
-        async def through(_cid, _seen, *, taker_only):
+        async def through(_cid, _seen, *, taker_only, stop_older_than=None):
             return [] if taker_only else [finish]
 
         engine._fetch_trade_pages = through  # type: ignore[method-assign]
@@ -631,13 +640,166 @@ class BookTests(unittest.TestCase):
         self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("0"))
         self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("190"))
 
-        async def taker_down(_cid, _seen, *, taker_only):
+        async def taker_down(_cid, _seen, *, taker_only, stop_older_than=None):
             return None if taker_only else [row("0xlate", "BUY", "100")]
 
         engine._fetch_trade_pages = taker_down  # type: ignore[method-assign]
         self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
         self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("190"))
         self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("0"))
+
+    def test_a_late_taker_row_does_not_fill(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        import bot.engine as engine_mod
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        self.assertEqual(cfg.tape_settle_s, 6)
+        engine = TradingEngine(cfg)
+        window = Window(
+            slug="btc-updown-5m-1", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "t", "Down": "d"}, start_ts=0, end_ts=10**12,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        order_id = engine.paper.place(
+            outcome="Up", token_id="t", price=Decimal("0.74"), shares=Decimal("10"),
+            best_ask=Decimal("0.75"), bid_size_at_price=Decimal("0"),
+        )
+        engine.paper.orders[order_id].placed_at = 1000
+        window.prints_seeded = True
+        row = {
+            "transaction_hash": "0x254a5807", "token_id": "t", "asset": "t",
+            "price": "0.74", "size": "1.35135", "timestamp": 1001, "side": "BUY",
+        }
+        tapes = {"taker": []}
+
+        async def pages(_cid, _seen, *, taker_only, stop_older_than=None):
+            return list(tapes["taker"]) if taker_only else [row]
+
+        engine._fetch_trade_pages = pages  # type: ignore[method-assign]
+        clock = {"now": 5_000.0}
+        original = engine_mod.time.time
+        engine_mod.time.time = lambda: clock["now"]
+        try:
+            self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
+            self.assertEqual(len(window.pending), 1)
+            self.assertEqual(window.seen_prints, set())
+            clock["now"] = 5_003.0
+            tapes["taker"] = [row]
+            self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
+            self.assertEqual(window.seen_prints, set())
+            self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("10"))
+            clock["now"] = 5_006.0
+            fills = asyncio.run(engine._paper_prints(window))
+        finally:
+            engine_mod.time.time = original
+        self.assertEqual(fills, [])
+        self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("10"))
+        self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("0"))
+        self.assertEqual(window.pending, {})
+        self.assertEqual(len(window.seen_prints), 1)
+
+    def test_a_ghost_fills_only_while_it_was_resting(self) -> None:
+        port = Portfolio(initial_cash=Decimal("100"), cash=Decimal("100"))
+        broker = PaperBroker(port)
+        order_id = broker.place(
+            outcome="Up", token_id="t", price=Decimal("0.69"), shares=Decimal("10"),
+            best_ask=Decimal("0.70"), bid_size_at_price=Decimal("0"),
+        )
+        broker.orders[order_id].placed_at = 1000.2
+        locked = port.locks[order_id]
+        broker.cancel(order_id)
+        self.assertNotIn(order_id, broker.orders)
+        self.assertIn(order_id, broker.ghosts)
+        self.assertEqual(port.locks[order_id], locked)
+        broker.ghosts[order_id].cancel_ts = 1005.8
+        # The placement second and the second after the cancel do not count.
+        self.assertEqual(broker.on_trade("t", Decimal("0.69"), Decimal("4"), "BUY", trade_ts=1000), [])
+        self.assertEqual(broker.on_trade("t", Decimal("0.69"), Decimal("4"), "BUY", trade_ts=1006), [])
+        self.assertEqual(broker.ghosts[order_id].remaining, Decimal("10"))
+        fills = broker.on_trade("t", Decimal("0.69"), Decimal("128"), "BUY", trade_ts=1003)
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].shares, Decimal("10"))
+        self.assertNotIn(order_id, broker.ghosts)
+        # A partial ghost keeps the lock until the hold expires.
+        order_id = broker.place(
+            outcome="Up", token_id="t", price=Decimal("0.69"), shares=Decimal("10"),
+            best_ask=Decimal("0.70"), bid_size_at_price=Decimal("20"),
+        )
+        broker.orders[order_id].placed_at = 2000.2
+        broker.cancel(order_id)
+        broker.ghosts[order_id].cancel_ts = 3000.0
+        self.assertEqual(
+            broker.on_trade("t", Decimal("0.69"), Decimal("5"), "BUY", trade_ts=2001), [],
+        )
+        self.assertEqual(broker.ghosts[order_id].queue_ahead, Decimal("15"))
+        self.assertEqual(broker.release_expired_ghosts(3000 + 6 + 3.9, 6), [])
+        self.assertIn(order_id, port.locks)
+        released = broker.release_expired_ghosts(3000 + 6 + 4, 6)
+        self.assertEqual(released, [order_id])
+        self.assertNotIn(order_id, port.locks)
+        self.assertNotIn(order_id, broker.ghosts)
+
+    def test_taker_paging_stops_once_older_than_the_oldest_unseen(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine
+
+        class _Resp:
+            def __init__(self, payload: dict) -> None:
+                self.status = 200
+                self.payload = payload
+
+            async def __aenter__(self) -> "_Resp":
+                return self
+
+            async def __aexit__(self, *_exc) -> bool:
+                return False
+
+            async def json(self, content_type=None) -> dict:
+                return self.payload
+
+        class _Session:
+            def __init__(self, pages: list[dict]) -> None:
+                self.pages = list(pages)
+                self.calls: list[dict] = []
+
+            def get(self, _url: str, params: dict | None = None) -> _Resp:
+                self.calls.append(dict(params or {}))
+                return _Resp(self.pages.pop(0))
+
+        def row(tx: str, ts: int) -> dict:
+            return {
+                "transaction_hash": tx, "token_id": "t", "price": "0.50",
+                "size": "1", "timestamp": ts, "side": "BUY",
+            }
+
+        def page(rows: list[dict], cursor: str | None, more: bool) -> dict:
+            return {"data": rows, "pagination": {"has_more": more, "next_cursor": cursor}}
+
+        pages = [
+            page([row("a", 120), row("b", 110)], "c1", True),
+            page([row("c", 100), row("d", 99)], "c2", True),
+            page([row("e", 80)], None, False),
+        ]
+        session = _Session(pages)
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        engine._session = session
+        rows = asyncio.run(engine._fetch_trade_pages(
+            "cid", set(), taker_only=True, stop_older_than=100,
+        ))
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual([row["transaction_hash"] for row in rows], ["a", "b", "c", "d"])
+        self.assertTrue(all(call["takerOnly"] == "true" and "_" in call for call in session.calls))
 
 
 class ResolutionTests(unittest.TestCase):

@@ -249,6 +249,144 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         self.assertGreater(placed[0]["placed_at"], 0)
         self.assertEqual(engine.paper.orders[order_id].queue_at_placement, Decimal("220.32"))
 
+    def test_resume_clears_the_loss_streak(self) -> None:
+        engine = self._engine()
+        engine.consecutive_losses = 10
+        engine.paused = True
+        engine.halt_reason = "10 убыточных окон подряд"
+        engine.resume()
+        self.assertEqual(engine.consecutive_losses, 0)
+        self.assertEqual(engine.halt_reason, "")
+        self.assertFalse(engine.paused)
+        saved = engine.ledger.load_portfolio("paper")
+        self.assertEqual(saved["consecutive_losses"], 0)
+
+    def test_restart_drops_locks_for_orders_that_are_gone(self) -> None:
+        import asyncio
+
+        engine = self._engine()
+        self.assertTrue(engine.portfolio.lock("dead", Decimal("3")))
+        live = engine.paper.place(
+            outcome="Up", token_id="tok", price=Decimal("0.60"), shares=Decimal("5"),
+            best_ask=Decimal("0.61"), bid_size_at_price=Decimal("0"),
+        )
+        engine._release_stale_paper_locks()
+        self.assertNotIn("dead", engine.portfolio.locks)
+        self.assertIn(live, engine.portfolio.locks)
+        self.assertEqual(engine.portfolio.cash, Decimal("2750") - Decimal("3"))
+
+        engine.portfolio.lock("gone", Decimal("2"))
+
+        async def idle() -> None:
+            while engine.running:
+                await asyncio.sleep(0.01)
+
+        engine._discover_loop = idle  # type: ignore[method-assign]
+        engine._trade_loop = idle  # type: ignore[method-assign]
+        engine._housekeep_loop = idle  # type: ignore[method-assign]
+
+        async def boot() -> None:
+            await engine.start()
+            self.assertNotIn("gone", engine.portfolio.locks)
+            self.assertIn(live, engine.portfolio.locks)
+            await engine.stop()
+
+        asyncio.run(boot())
+
+    def test_discover_readds_an_unresolved_book_after_its_window(self) -> None:
+        import asyncio
+
+        from bot.engine import Window
+
+        engine = self._engine()
+        engine._session = object()
+
+        async def gamma(_slug: str) -> dict:
+            return {
+                "condition_id": "cond",
+                "tokens": {"Up": "u", "Down": "d"},
+                "tick": Decimal("0.01"),
+                "min_shares": Decimal("5"),
+                "fee_rate": Decimal("0.07"),
+                "fee_exponent": Decimal("1"),
+            }
+
+        engine._gamma = gamma  # type: ignore[method-assign]
+        common = dict(condition_id="c", asset="BTC", timeframe="5m", fee=Decimal("0"))
+        engine.portfolio.buy_fill(
+            slug="btc-updown-5m-1000", outcome="Up", shares=Decimal("5"), price=Decimal("0.60"), **common,
+        )
+        engine.portfolio.buy_fill(
+            slug="btc-updown-5m-2000", outcome="Up", shares=Decimal("5"), price=Decimal("0.60"), **common,
+        )
+        engine.portfolio.markets["btc-updown-5m-2000"].resolved = True
+        engine.portfolio.buy_fill(
+            slug="btc-updown-5m-3000", outcome="Down", shares=Decimal("5"), price=Decimal("0.40"), **common,
+        )
+        engine.portfolio.markets["btc-updown-5m-3000"].closed = True
+        asyncio.run(engine._discover())
+        self.assertIn("btc-updown-5m-1000", engine.windows)
+        restored = engine.windows["btc-updown-5m-1000"]
+        self.assertIsInstance(restored, Window)
+        self.assertEqual(restored.end_ts, 1300)
+        self.assertEqual(restored.start_ts, 1000)
+        self.assertNotIn("btc-updown-5m-2000", engine.windows)
+        self.assertNotIn("btc-updown-5m-3000", engine.windows)
+
+    def test_ghost_lock_counts_and_resolution_waits(self) -> None:
+        import asyncio
+
+        from bot.engine import Window
+
+        engine = self._engine()
+        engine._session = object()
+        window = Window(
+            slug="btc-updown-5m-1795266600", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "tok", "Down": "tod"}, start_ts=0, end_ts=time.time() - 30,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        order_id = engine.paper.place(
+            outcome="Up", token_id="tok", price=Decimal("0.69"), shares=Decimal("10"),
+            best_ask=Decimal("0.70"), bid_size_at_price=Decimal("0"),
+        )
+        window.orders["Up@0.69"] = order_id
+        before = engine._risk_budget(window)
+        self.assertEqual(before["ghost_here"], Decimal("0"))
+        engine.paper.cancel(order_id)
+        window.orders.pop("Up@0.69", None)
+        locked = engine.portfolio.locks[order_id]
+        budget = engine._risk_budget(window)
+        self.assertEqual(budget["ghost_here"], locked)
+        self.assertEqual(budget["window_spent"], locked)
+        self.assertEqual(
+            budget["total_exposure"],
+            engine.portfolio.exposure_cost() + engine.portfolio.reserved,
+        )
+        self.assertEqual(budget["free_cash"], engine.portfolio.cash)
+
+        called: list[str] = []
+
+        async def resolve(target: Window) -> None:
+            called.append(target.slug)
+
+        async def no_prints(_window: Window) -> list:
+            return []
+
+        async def book(_token: str) -> tuple[list, list]:
+            return [], []
+
+        engine._resolve = resolve  # type: ignore[method-assign]
+        engine._paper_prints = no_prints  # type: ignore[method-assign]
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._on_window(window))
+        self.assertEqual(called, [])
+        self.assertIn(order_id, engine.paper.ghosts)
+        engine.paper.ghosts[order_id].cancel_ts = time.time() - 100
+        asyncio.run(engine._on_window(window))
+        self.assertEqual(called, [window.slug])
+        self.assertNotIn(order_id, engine.paper.ghosts)
+
 
 if __name__ == "__main__":
     unittest.main()

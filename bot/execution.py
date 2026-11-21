@@ -48,12 +48,14 @@ class Resting:
     queue_at_placement: Decimal = _ZERO
     prev_level: Decimal | None = None
     seen_book: bool = False
+    cancel_ts: float | None = None
 
 
 @dataclass
 class PaperBroker:
     portfolio: Portfolio
     orders: dict[str, Resting] = field(default_factory=dict)
+    ghosts: dict[str, Resting] = field(default_factory=dict)
 
     def place(
         self,
@@ -94,10 +96,22 @@ class PaperBroker:
         order = self.orders.pop(order_id, None)
         if order is None:
             return
-        # Release only the unfilled remainder. Filled shares already left the lock.
-        # buy_fill already removed the filled part of the lock. What is left
-        # is the unfilled remainder, and it goes back to free cash.
-        self.portfolio.unlock(order_id)
+        # The tape lags the cancel. Keep the order and its cash lock until
+        # prints from the resting interval have had time to arrive.
+        order.cancel_ts = time.time()
+        self.ghosts[order.order_id] = order
+
+    def release_expired_ghosts(self, now: float, settle_s: float) -> list[str]:
+        """Drop ghosts after cancel_ts + settle + 4s and return their locks."""
+        hold = float(settle_s) + 4.0
+        released: list[str] = []
+        for order_id, order in list(self.ghosts.items()):
+            if order.cancel_ts is None or now < order.cancel_ts + hold:
+                continue
+            self.ghosts.pop(order_id, None)
+            self.portfolio.unlock(order_id)
+            released.append(order_id)
+        return released
 
     def cancel_all(self) -> None:
         for order_id in list(self.orders):
@@ -111,15 +125,24 @@ class PaperBroker:
         taker_side: str,
         trade_ts: float | None = None,
     ) -> list[Fill]:
-        """Fill only from a trade print at our price after we joined the book."""
+        """Fill only from a trade print at our price after we joined the book.
+
+        A ghost (cancelled, lock still held) fills only while it was resting:
+        ceil(placed_at) <= ts <= floor(cancel_ts).
+        """
         fills: list[Fill] = []
-        for order in list(self.orders.values()):
+        for order in list(self.orders.values()) + list(self.ghosts.values()):
             if order.token_id != token_id or order.remaining <= 0:
                 continue
             # Timestamps are whole seconds. The queue snapshot already
             # includes prints from the second we joined, so anything strictly
             # before the next second is history, not a new fill.
-            if trade_ts is None or float(trade_ts) < math.ceil(order.placed_at):
+            if trade_ts is None:
+                continue
+            ts = float(trade_ts)
+            if ts < math.ceil(order.placed_at):
+                continue
+            if order.cancel_ts is not None and ts > math.floor(order.cancel_ts):
                 continue
             placed_at = order.placed_at
             queue_at_placement = order.queue_at_placement
@@ -150,6 +173,7 @@ class PaperBroker:
             if order.remaining <= Decimal("0.0000005"):
                 # The lock stays until buy_fill spends it.
                 self.orders.pop(order.order_id, None)
+                self.ghosts.pop(order.order_id, None)
         return fills
 
     def open_orders(self) -> list[Resting]:
