@@ -59,11 +59,45 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
     return bases
 
 
-def _print_key(row: dict) -> str:
+def _print_fingerprint(row: dict) -> str:
+    """Stable identity of one tape row, without its place in the page.
+
+    Two identical buys in one transaction share this fingerprint. The
+    occurrence number added by ``_enumerate_prints`` keeps both of them,
+    and the same number comes back on the next fetch so the row is not
+    counted twice.
+    """
     return "|".join(
-        str(row.get(name))
-        for name in ("transaction_hash", "token_id", "price", "size", "timestamp", "side")
+        str(row.get(name) or "")
+        for name in (
+            "transaction_hash", "proxy_wallet", "side", "size", "price",
+            "outcome", "timestamp", "token_id",
+        )
     )
+
+
+def _enumerate_prints(rows: list[dict]) -> list[tuple[str, dict]]:
+    counts: dict[str, int] = {}
+    numbered: list[tuple[str, dict]] = []
+    for row in rows:
+        fp = _print_fingerprint(row)
+        n = counts.get(fp, 0)
+        counts[fp] = n + 1
+        numbered.append((f"{fp}#{n}", row))
+    return numbered
+
+
+def _trade_query(condition_id: str, cursor: str | None, now_ms: int) -> dict[str, str]:
+    """CloudFront caches /v2/trades for 300s. A fresh `_` bypasses that."""
+    params = {
+        "condition": condition_id,
+        "limit": "200",
+        "takerOnly": "false",
+        "_": str(now_ms),
+    }
+    if cursor:
+        params["cursor"] = cursor
+    return params
 
 
 @dataclass
@@ -129,6 +163,7 @@ class TradingEngine:
         self._live_original: dict[str, Decimal] = {}
         self._stuck_noted: set[str] = set()
         self._resolution_conflict: set[str] = set()
+        self._stale_tape: set[str] = set()
         self._preset_note = ""
         if cfg.strategy_preset not in ("mo_money",):
             self._preset_note = (
@@ -491,6 +526,9 @@ class TradingEngine:
             held_avg=held_avg,
             held_shares=held_shares,
             hedge_cap=D(str(self.cfg.pair_sum_hedge)),
+            ladder_rungs=self.cfg.ladder_rungs,
+            ladder_step=D(str(self.cfg.ladder_step)),
+            rung_shares=D(str(self.cfg.rung_shares)),
         )
         await self._sync_quotes(window, quotes, books)
         await self._merge(window)
@@ -500,18 +538,9 @@ class TradingEngine:
 
         wanted = {f"{q.outcome}@{q.price}": q for q in quotes}
         for key, order_id in list(window.orders.items()):
-            quote = wanted.get(key)
-            resting = self.paper.orders.get(order_id) if self.mode == "paper" else None
-            # A price that moved from the top rung to a lower one must be
-            # resized. Leaving the old size in place stacks a full clip one
-            # cent behind the touch. A partial fill is left alone.
-            stale_size = False
-            if quote is not None and resting is not None and resting.remaining == resting.original:
-                stale_size = abs(resting.original - quote.shares) >= Decimal("0.01")
-            if self.mode == "live" and quote is not None and order_id in self._live_original:
-                if self._live_left.get(order_id) == self._live_original[order_id]:
-                    stale_size = abs(self._live_original[order_id] - quote.shares) >= Decimal("0.01")
-            if quote is None or stale_size:
+            # Keep a rung whose price is still in the ladder. Replacing it
+            # because the touch moved by one cent would throw away the queue.
+            if key not in wanted:
                 await self._cancel_order(order_id)
                 window.orders.pop(key, None)
         for key, quote in wanted.items():
@@ -664,15 +693,15 @@ class TradingEngine:
             return []
         collected: list[dict] = []
         cursor = None
-        for _ in range(4):
-            params = {"condition": condition_id, "limit": "200", "takerOnly": "false"}
-            if cursor:
-                params["cursor"] = cursor
+        seen_here: set[str] = set()
+        for _page in range(4):
+            params = _trade_query(condition_id, cursor, int(time.time() * 1000))
             try:
                 async with self._session.get(
                     "https://data-api.polymarket.com/v2/trades", params=params,
                 ) as response:
                     if response.status != 200:
+                        self._note("ERROR", f"Лента сделок HTTP {response.status} {condition_id[:10]}")
                         return None if not collected else collected
                     payload = await response.json(content_type=None)
             except Exception as exc:  # noqa: BLE001
@@ -682,11 +711,20 @@ class TradingEngine:
             page = list(rows or [])
             if not page:
                 break
+            numbered = _enumerate_prints(page)
+            # Occurrence numbers are per page here only to decide whether to
+            # stop. The caller renumbers the collected rows from the start.
+            known = False
+            for key, _row in numbered:
+                if key in seen or key in seen_here:
+                    known = True
+                    break
+                seen_here.add(key)
             collected.extend(page)
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
             cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
-            if any(_print_key(row) in seen for row in page) or not has_more or not cursor:
+            if known or not has_more or not cursor:
                 break
         return collected
 
@@ -725,9 +763,9 @@ class TradingEngine:
         rows = await self._recent_trades(window.condition_id, window.seen_prints)
         if rows is None:
             return []
+        self._warn_if_tape_stale(window, rows)
         fresh: list[tuple[str, dict]] = []
-        for row in rows:
-            key = _print_key(row)
+        for key, row in _enumerate_prints(rows):
             if key in window.seen_prints:
                 continue
             fresh.append((key, row))
@@ -742,6 +780,26 @@ class TradingEngine:
             window.seen_prints.add(key)
             fills.extend(self._absorb_print(window, row, fill=True))
         return fills
+
+    def _warn_if_tape_stale(self, window: Window, rows: list[dict]) -> None:
+        """The public tape is cached for about five minutes unless cache-busted."""
+        if window.slug in self._stale_tape:
+            return
+        if window.seconds_from_start < 1 or window.seconds_to_end <= 3:
+            return
+        newest = 0
+        for row in rows:
+            try:
+                newest = max(newest, int(float(row.get("timestamp") or 0)))
+            except (TypeError, ValueError):
+                continue
+        if newest <= 0:
+            return
+        age = time.time() - newest
+        if age <= 20:
+            return
+        self._stale_tape.add(window.slug)
+        self._note("INFO", f"Лента {window.slug} отстаёт на {int(age)} с")
 
     async def _merge(self, window: Window) -> Decimal:
         book = self.portfolio.markets.get(window.slug)
