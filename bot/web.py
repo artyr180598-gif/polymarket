@@ -49,6 +49,10 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
         rows = engine.ledger.fills(engine.mode, since=since, limit=limit)
         return JSONResponse(rows)
 
+    @app.get("/api/copies", dependencies=[Depends(verify_pin)])
+    async def copies(since: Optional[float] = None, limit: Optional[int] = None) -> JSONResponse:
+        return JSONResponse(engine.copies_report(since=since, limit=limit))
+
     @app.post("/api/action/pause", dependencies=[Depends(verify_pin)])
     async def pause() -> dict:
         engine.pause()
@@ -199,7 +203,7 @@ function render(){
       metric("Всё время", money(s.pnl_all), cls(s.pnl_all)) +
       metric("В позициях", "$"+Number(s.exposure).toFixed(2), "") +
       '</div>' +
-      card("Как заработано", '<div class="row"><span>Реализовано</span><b class="'+cls(s.realized)+'">'+money(s.realized)+'</b></div><div class="row"><span>Оценка открытого</span><b class="'+cls(s.unrealized)+'">'+money(s.unrealized)+'</b></div><div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div><div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div><div class="row"><span>Ребейт тейкера</span><span>'+money(s.taker_rebates||0)+'</span></div><div class="row"><span>Награды</span><span>'+money(s.liquidity_rewards||0)+'</span></div><div class="row"><span>В заявках</span><span>$'+Number(s.reserved).toFixed(2)+'</span></div>');
+      card("Как заработано", '<div class="row"><span>Реализовано</span><b class="'+cls(s.realized)+'">'+money(s.realized)+'</b></div><div class="row"><span>Оценка открытого</span><b class="'+cls(s.unrealized)+'">'+money(s.unrealized)+'</b></div>'+(s.shadow_pnl!=null?'<div class="row"><span>Тень кошелька × масштаб</span><b class="'+cls(s.shadow_pnl)+'">'+money(s.shadow_pnl)+'</b></div>':'')+'<div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div><div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div><div class="row"><span>Ребейт тейкера</span><span>'+money(s.taker_rebates||0)+'</span></div><div class="row"><span>Награды</span><span>'+money(s.liquidity_rewards||0)+'</span></div><div class="row"><span>В заявках</span><span>$'+Number(s.reserved).toFixed(2)+'</span></div>');
   } else if (tab === "positions") {
     const rows = s.positions || [];
     el.innerHTML = rows.length ? '<p><small>Открыто позиций: '+rows.length+'</small></p>' + rows.map(p => card(p.asset+" "+p.timeframe+" · "+(p.outcome==="Up"?"Вверх":"Вниз"),
@@ -216,6 +220,12 @@ function render(){
     if (ress.length) el.innerHTML += card("Итоги окон", ress.slice(0,10).map(r => {
       const who = r.winner === "Up" ? "Вверх" : (r.winner === "Down" ? "Вниз" : r.winner);
       return '<div class="row"><span>'+who+' · выплата $'+Number(r.payout||0).toFixed(2)+'</span><b class="'+cls(r.pnl)+'">'+money(r.pnl)+'</b></div>';
+    }).join(""));
+    const copies = s.copies || [];
+    if (copies.length) el.innerHTML += card("Копии кошелька", copies.slice().reverse().slice(0, 20).map(function (c) {
+      const who = c.outcome === "Up" ? "Вверх" : (c.outcome === "Down" ? "Вниз" : c.side);
+      const tail = c.status === "SKIPPED" ? ("SKIPPED " + (c.reason || "")) : (c.our_size + " @ " + c.our_price + " · slip " + c.slippage);
+      return '<div class="row"><span>'+who+' '+Number(c.wallet_size).toFixed(2)+' @ '+c.wallet_price+'</span><span>'+tail+'</span></div>';
     }).join(""));
   } else if (tab === "markets") {
     const rows = s.breakdown || [];

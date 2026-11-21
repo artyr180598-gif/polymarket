@@ -218,6 +218,67 @@ class Portfolio:
         book.realized = usdc(book.realized + pnl)
         return pnl
 
+    def sell_fill(
+        self,
+        *,
+        slug: str,
+        condition_id: str,
+        asset: str,
+        timeframe: str,
+        outcome: str,
+        shares: Decimal,
+        price: Decimal,
+        fee: Decimal,
+    ) -> Decimal:
+        """Sell shares we hold. Proceeds enter cash. The buy fee is realized here."""
+        qty = shares_q(D(shares))
+        px = D(price)
+        if qty <= 0 or px <= 0 or px >= 1:
+            raise ValueError("sell must have positive shares and a price inside (0, 1)")
+        book = self.markets.get(slug)
+        lot = book.lot(outcome) if book is not None else None
+        if lot is None or lot.shares + SHARE < qty:
+            raise ValueError("not enough shares to sell")
+        qty = min(qty, lot.shares)
+        cost, released_fee = _take(lot, qty)
+        proceeds = usdc(qty * px)
+        fee_usdc = usdc(D(fee))
+        if fee_usdc > usdc(self.cash + proceeds):
+            raise ValueError("not enough cash for the sell fee")
+        self.cash = usdc(self.cash + proceeds - fee_usdc)
+        self.fees_paid = usdc(self.fees_paid + fee_usdc)
+        pnl = usdc(proceeds - cost - released_fee - fee_usdc)
+        self.realized = usdc(self.realized + pnl)
+        book.realized = usdc(book.realized + pnl)
+        return pnl
+
+    def split(
+        self,
+        *,
+        slug: str,
+        condition_id: str,
+        asset: str,
+        timeframe: str,
+        pairs: Decimal,
+    ) -> Decimal:
+        """Mint ``pairs`` of Up+Down for $1 each. No fee."""
+        qty = shares_q(D(pairs))
+        if qty <= 0:
+            raise ValueError("split needs a positive size")
+        cost = usdc(qty)
+        if cost > self.cash + Decimal("0.0000005"):
+            raise ValueError("not enough cash to split")
+        self.cash = usdc(self.cash - cost)
+        half = usdc(cost / 2)
+        book = self.market(slug, condition_id, asset, timeframe)
+        up = book.lot("Up")
+        down = book.lot("Down")
+        up.shares = shares_q(up.shares + qty)
+        down.shares = shares_q(down.shares + qty)
+        up.cost = usdc(up.cost + half)
+        down.cost = usdc(down.cost + (cost - half))
+        return cost
+
     def redeem(self, slug: str, winner: str, gas: Decimal = _ZERO) -> Decimal:
         """Settle every remaining share. Winner pays $1, every other outcome pays $0."""
         book = self.markets.get(slug)

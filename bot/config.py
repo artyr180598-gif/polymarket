@@ -31,6 +31,16 @@ def _optional_float(name: str) -> float:
         return 0.0
 
 
+def _optional_scale(name: str) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
+
+
 def _bounded(name: str, default: str, low: float, high: float) -> float:
     try:
         value = float(os.getenv(name, default))
@@ -58,7 +68,9 @@ class BotConfig:
     copy_max_t: float = 240.0
     copy_shares: float = 10.0
     copy_max_per_window: int = 3
-    copy_delay_s: float = 10.0
+    # Empty means equity / wallet portfolio value, refreshed once a UTC day.
+    copy_scale: float | None = None
+    copy_delay_s: float = 1.0
     copy_max_slip: float = 0.03
     enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
@@ -155,7 +167,8 @@ class BotConfig:
             copy_max_t=max(0.0, float(os.getenv("COPY_MAX_T", "240"))),
             copy_shares=max(1.0, float(os.getenv("COPY_SHARES", "10"))),
             copy_max_per_window=max(1, int(os.getenv("COPY_MAX_PER_WINDOW", "3"))),
-            copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "10"))),
+            copy_scale=_optional_scale("COPY_SCALE"),
+            copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "1"))),
             copy_max_slip=max(0.0, float(os.getenv("COPY_MAX_SLIP", "0.03"))),
             enabled_assets=assets,
             enabled_timeframes=frames,
