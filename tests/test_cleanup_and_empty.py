@@ -172,11 +172,12 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
             "Up": ([{"price": "0.87", "size": "10"}], [{"price": "0.88", "size": "10"}]),
             "Down": ([], []),
         }
-        quotes = [Quote("Up", Decimal("0.87"), Decimal("7.20"), Decimal("6.264"))]
+        quotes = [Quote("Up", Decimal("0.87"), Decimal("10"), Decimal("8.70"))]
         asyncio.run(engine._sync_quotes(window, quotes, books))
-        resting = next(iter(engine.paper.orders.values()))
-        self.assertEqual(resting.original, Decimal("7.20"))
-        self.assertEqual(resting.price, Decimal("0.87"))
+        self.assertEqual(window.orders["Up@0.87"], order_id)
+        resting = engine.paper.orders[order_id]
+        self.assertEqual(resting.original, Decimal("12"))
+        self.assertEqual(resting.queue_ahead, Decimal("10"))
 
 
 if __name__ == "__main__":

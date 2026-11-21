@@ -202,9 +202,14 @@ class StrategyTests(unittest.TestCase):
         quotes = self._quote("0.70", "0.30")
         self.assertTrue(quotes)
         self.assertTrue(all(q.outcome == "Up" for q in quotes))
-        self.assertTrue(all(Decimal("0.55") <= q.price <= Decimal("0.90") for q in quotes))
+        self.assertTrue(all(Decimal("0.55") <= q.price <= Decimal("0.95") for q in quotes))
         self.assertEqual(self._quote("0.50", "0.20"), [])
-        self.assertEqual(self._quote("0.92", "0.20"), [])
+        self.assertEqual(self._quote("0.96", "0.20"), [])
+        favourite = [q for q in self._quote("0.70", "0.20") if q.outcome == "Up"]
+        self.assertEqual(len(favourite), 6)
+        self.assertTrue(all(q.shares == Decimal("10") for q in favourite))
+        prices = sorted((q.price for q in favourite), reverse=True)
+        self.assertEqual(prices[0] - prices[1], Decimal("0.01"))
 
     def test_shades_or_drops_when_touches_sum_over_99_cents(self) -> None:
         quotes = self._quote("0.60", "0.60")
@@ -297,7 +302,7 @@ class StrategyTests(unittest.TestCase):
 
     def test_hedge_stays_under_97_minus_the_filled_average(self) -> None:
         quotes = self._quote(
-            "0.92", "0.40",
+            "0.96", "0.40",
             held_avg={"Up": Decimal("0.70")},
             held_shares={"Up": Decimal("12")},
             hedge_cap=Decimal("0.97"),
@@ -310,7 +315,7 @@ class StrategyTests(unittest.TestCase):
         held = dict(held_avg={"Up": Decimal("0.70")}, held_shares={"Up": Decimal("12")}, hedge_cap=Decimal("0.97"))
         faded = self._quote("0.50", "0.20", **held)
         self.assertTrue(all(q.outcome != "Up" for q in faded))
-        rich = self._quote("0.92", "0.20", **held)
+        rich = self._quote("0.96", "0.20", **held)
         self.assertTrue(all(q.outcome != "Up" for q in rich))
         still = self._quote("0.72", "0.20", **held)
         self.assertTrue(any(q.outcome == "Up" for q in still))
@@ -327,6 +332,29 @@ class StrategyTests(unittest.TestCase):
         bases = _window_bases("4h", 14400, 1795165200 + 100)
         self.assertIn(1795165200, bases)
         self.assertIn(1795176000, _window_bases("1h", 3600, 1795176000 + 10))
+
+    def test_trade_query_busts_the_cache_on_every_page(self) -> None:
+        from bot.engine import _trade_query
+        first = _trade_query("0xabc", None, 111)
+        second = _trade_query("0xabc", "cursor-1", 222)
+        self.assertEqual(first["_"], "111")
+        self.assertEqual(second["_"], "222")
+        self.assertEqual(second["cursor"], "cursor-1")
+        self.assertNotIn("cursor", first)
+
+    def test_print_keys_keep_twins_and_repeat_fetches(self) -> None:
+        from bot.engine import _enumerate_prints
+        row = {
+            "transaction_hash": "0x647821", "proxy_wallet": "0xabc", "side": "BUY",
+            "size": "5.0", "price": "0.68", "outcome": "Down",
+            "timestamp": 1795259548, "token_id": "t",
+        }
+        twin = dict(row)
+        keys = [key for key, _row in _enumerate_prints([row, twin])]
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
+        again = [key for key, _row in _enumerate_prints([row, twin])]
+        self.assertEqual(again, keys)
 
     def test_entry_window(self) -> None:
         self.assertFalse(in_entry_window(0.2, 200))

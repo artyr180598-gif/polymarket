@@ -57,6 +57,9 @@ class BotConfig:
     # 1.00 means the pair does not lock a loss. The wallet's median is 1.03,
     # which only pays if a maker rebate we cannot see in advance covers it.
     pair_sum_hedge: float = 1.0
+    ladder_rungs: int = 6
+    ladder_step: float = 0.01
+    rung_shares: float = 10.0
     onchain_gas_usd: float = 0.0
     # Kept so old Railway variables still parse. They never delete the ledger.
     paper_reset_once: bool = False
@@ -127,6 +130,9 @@ class BotConfig:
             max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
             min_merge_shares=max(0.01, float(os.getenv("MIN_MERGE_SHARES", "1"))),
             pair_sum_hedge=min(1.20, max(0.90, float(os.getenv("PAIR_SUM_HEDGE", "1")))),
+            ladder_rungs=max(1, int(os.getenv("LADDER_RUNGS", "6"))),
+            ladder_step=max(0.001, float(os.getenv("LADDER_STEP", "0.01"))),
+            rung_shares=max(1.0, float(os.getenv("RUNG_SHARES", "10"))),
             onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
