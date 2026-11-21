@@ -344,22 +344,25 @@ def walk_book(
     asks: list,
     shares: Decimal,
     wallet_price: Decimal,
+    max_slip: Decimal = Decimal("0.03"),
 ) -> tuple[list[tuple[Decimal, Decimal]] | None, str]:
-    """Levels we can take without paying a worse price than the wallet.
+    """Levels inside the slip band around the wallet's price.
 
-    Returns (None, reason) when the best price is worse than the wallet, or
-    the book is empty. A thin book returns only the size that is really there
-    at a price at least as good as the wallet's.
+    A buy may pay up to ``min(wallet + slip, 0.99)``. A sell may receive down
+    to ``max(wallet − slip, 0.01)``. Anything beyond that is not taken. A thin
+    book returns a partial fill; the caller records the gap and does not carry
+    it into the next trade.
     """
     side = side.upper()
     need = D(shares)
-    limit = D(wallet_price)
+    slip = D(max_slip)
     if side == "BUY":
+        limit = min(D(wallet_price) + slip, Decimal("0.99"))
         levels = sorted(parse_levels(asks), key=lambda item: item[0])
         if not levels:
             return None, "empty book"
         if levels[0][0] > limit:
-            return None, "book worse than wallet"
+            return None, "book worse than slip"
         taken: list[tuple[Decimal, Decimal]] = []
         for px, size in levels:
             if need <= 0 or px > limit:
@@ -369,12 +372,15 @@ def walk_book(
                 continue
             taken.append((px, got))
             need -= got
-        return (taken or None), ("" if taken else "book worse than wallet")
+        if not taken:
+            return None, "book worse than slip"
+        return taken, ("partial" if need > 0 else "")
+    limit = max(D(wallet_price) - slip, Decimal("0.01"))
     levels = sorted(parse_levels(bids), key=lambda item: item[0], reverse=True)
     if not levels:
         return None, "empty book"
     if levels[0][0] < limit:
-        return None, "book worse than wallet"
+        return None, "book worse than slip"
     taken = []
     for px, size in levels:
         if need <= 0 or px < limit:
@@ -384,7 +390,9 @@ def walk_book(
             continue
         taken.append((px, got))
         need -= got
-    return (taken or None), ("" if taken else "book worse than wallet")
+    if not taken:
+        return None, "book worse than slip"
+    return taken, ("partial" if need > 0 else "")
 
 
 def fee_for_lifts(

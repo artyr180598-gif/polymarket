@@ -112,20 +112,45 @@ class ScaleAndBookTests(unittest.TestCase):
         self.assertEqual(carry3, Decimal("0.009"))
         self.assertEqual(traded + traded2 + traded3 + carry3, Decimal("17.99") * Decimal("0.1") + Decimal("3") * Decimal("0.1") + Decimal("2"))
 
-    def test_buy_walks_asks_and_sell_walks_bids_without_a_worse_price(self) -> None:
-        asks = [{"price": "0.74", "size": "4"}, {"price": "0.70", "size": "3"}, {"price": "0.80", "size": "100"}]
-        taken, why = walk_book("BUY", [], asks, Decimal("10"), Decimal("0.74"))
+    def test_slip_boundaries_and_a_partial_book(self) -> None:
+        slip = Decimal("0.03")
+        on_the_line, why = walk_book(
+            "BUY", [], [{"price": "0.73", "size": "10"}], Decimal("10"), Decimal("0.70"), slip,
+        )
         self.assertEqual(why, "")
-        self.assertEqual(taken, [(Decimal("0.70"), Decimal("3")), (Decimal("0.74"), Decimal("4"))])
-        worse, reason = walk_book("BUY", [], [{"price": "0.80", "size": "10"}], Decimal("10"), Decimal("0.74"))
-        self.assertIsNone(worse)
-        self.assertEqual(reason, "book worse than wallet")
-        bids = [{"price": "0.40", "size": "2"}, {"price": "0.50", "size": "8"}, {"price": "0.30", "size": "9"}]
-        sold, _ = walk_book("SELL", bids, [], Decimal("10"), Decimal("0.40"))
-        self.assertEqual(sold, [(Decimal("0.50"), Decimal("8")), (Decimal("0.40"), Decimal("2"))])
-        bad_sell, reason = walk_book("SELL", [{"price": "0.30", "size": "10"}], [], Decimal("1"), Decimal("0.40"))
-        self.assertIsNone(bad_sell)
-        self.assertEqual(reason, "book worse than wallet")
+        self.assertEqual(on_the_line, [(Decimal("0.73"), Decimal("10"))])
+        past, reason = walk_book(
+            "BUY", [], [{"price": "0.74", "size": "10"}], Decimal("10"), Decimal("0.70"), slip,
+        )
+        self.assertIsNone(past)
+        self.assertEqual(reason, "book worse than slip")
+        capped, _ = walk_book(
+            "BUY", [], [{"price": "0.99", "size": "2"}], Decimal("2"), Decimal("0.98"), slip,
+        )
+        self.assertEqual(capped, [(Decimal("0.99"), Decimal("2"))])
+        over_cap, reason = walk_book(
+            "BUY", [], [{"price": "0.991", "size": "2"}], Decimal("2"), Decimal("0.98"), slip,
+        )
+        self.assertIsNone(over_cap)
+        bid_line, _ = walk_book(
+            "SELL", [{"price": "0.37", "size": "5"}], [], Decimal("5"), Decimal("0.40"), slip,
+        )
+        self.assertEqual(bid_line, [(Decimal("0.37"), Decimal("5"))])
+        under, reason = walk_book(
+            "SELL", [{"price": "0.36", "size": "5"}], [], Decimal("5"), Decimal("0.40"), slip,
+        )
+        self.assertIsNone(under)
+        self.assertEqual(reason, "book worse than slip")
+        floor, _ = walk_book(
+            "SELL", [{"price": "0.01", "size": "1"}], [], Decimal("1"), Decimal("0.02"), slip,
+        )
+        self.assertEqual(floor, [(Decimal("0.01"), Decimal("1"))])
+        partial, why = walk_book(
+            "BUY", [], [{"price": "0.70", "size": "4"}, {"price": "0.74", "size": "50"}],
+            Decimal("10"), Decimal("0.70"), slip,
+        )
+        self.assertEqual(why, "partial")
+        self.assertEqual(partial, [(Decimal("0.70"), Decimal("4"))])
 
     def test_fee_is_rate_times_price_times_one_minus_price(self) -> None:
         fee = fee_for_lifts([(Decimal("0.60"), Decimal("10"))], Decimal("0.05"), Decimal("1"))
@@ -171,7 +196,7 @@ class ExecuteTests(unittest.TestCase):
         job = engine.copy.observe(_buy("0xfill", size="100", price="0.70"), now=1_000_050, cfg=cfg)
 
         async def book(_token: str):
-            return [], [{"price": "0.72", "size": "50"}, {"price": "0.70", "size": "4"}]
+            return [], [{"price": "0.74", "size": "50"}, {"price": "0.70", "size": "4"}]
 
         engine._book = book  # type: ignore[method-assign]
         asyncio.run(engine._execute_copy(job, 1_000_051))
@@ -179,9 +204,15 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(lot.shares, Decimal("4"))
         self.assertEqual(lot.fees, taker_fee_usdc(Decimal("4"), Decimal("0.70"), Decimal("0.05"), 1))
         row = engine.ledger.copies("paper")[0]
-        self.assertEqual(row["status"], "FILLED")
+        self.assertEqual(row["status"], "PARTIAL")
         self.assertEqual(row["tx"], "0xfill")
+        self.assertEqual(row["wallet_tx"] if "wallet_tx" in row else row["tx"], "0xfill")
         self.assertIn("book shorter", row["reason"])
+        # The 6 shares the book did not offer are not added to the next trade.
+        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+        report = engine.copies_report()
+        self.assertEqual(report["slip"], "0.03")
+        self.assertEqual(report["copies"][0]["wallet_tx"], "0xfill")
 
     def test_a_worse_book_is_skipped_and_recorded(self) -> None:
         cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000)
@@ -198,7 +229,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(book is None or book.open_shares() == 0)
         row = engine.ledger.copies("paper")[0]
         self.assertEqual(row["status"], "SKIPPED")
-        self.assertEqual(row["reason"], "book worse than wallet")
+        self.assertEqual(row["reason"], "book worse than slip")
 
     def test_exposure_cap_is_a_recorded_skip(self) -> None:
         cfg = _cfg(copy_scale=1, max_total_exposure_usd=1, max_window_risk_usd=1000)
@@ -217,6 +248,16 @@ class ExecuteTests(unittest.TestCase):
         report = engine.copies_report()
         self.assertEqual(len(report["copies"]), 1)
         self.assertIn("shadow_pnl", report)
+
+    def test_unset_scale_is_seven_percent(self) -> None:
+        cfg = BotConfig(strategy="copy_wallet", db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False)
+        self.assertEqual(cfg.copy_scale, 0.07)
+        self.assertFalse(cfg.copy_scale_auto)
+        engine = TradingEngine(cfg)
+        scale = asyncio.run(engine._copy_scale(time.time()))
+        self.assertEqual(scale, Decimal("0.07"))
+        self.assertEqual(engine.snapshot()["copy_scale"], "0.07")
+        self.assertEqual(engine.snapshot()["copy_max_slip"], 0.03)
 
     def test_manual_pause_survives_restart_and_the_daily_reset(self) -> None:
         cfg = _cfg(strategy="maker_ladder", auto_start=True, copy_scale=None)

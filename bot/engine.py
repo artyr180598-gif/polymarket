@@ -79,8 +79,8 @@ def _strategy_lines(cfg) -> list[str]:
         return [
             "Только бумага. LIVE для этого режима не включается.",
             f"Покупки кошелька {cfg.copy_wallet[:6]}…{cfg.copy_wallet[-4:]} на BTC 5м.",
-            f"Каждая покупка и продажа BTC 5м копируется через {cfg.copy_delay_s:g} с по живому стакану, размер = размер кошелька × COPY_SCALE.",
-            "Хуже цены кошелька не берём. Продажа не больше нашей позиции. Пропуск пишется как SKIPPED, а не пропадает.",
+            f"Размер = размер кошелька × {cfg.copy_scale:g}. Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск.",
+            "Недобранный остаток пишется как PARTIAL или SKIPPED и не переносится на следующую сделку.",
             "Рядом с нашим результатом виден теневой PnL: сделки кошелька × масштаб по его ценам, без ребейтов.",
         ]
     return [
@@ -357,6 +357,12 @@ class TradingEngine:
                 )
             why = "DRY_RUN" if self.cfg.dry_run else "paper"
             name = "copy-wallet" if self.cfg.strategy == "copy_wallet" else "мейкер"
+            if self.cfg.strategy == "copy_wallet":
+                if self.cfg.copy_scale_auto:
+                    scale_text = "COPY_SCALE=auto (капитал / стоимость кошелька, раз в сутки)"
+                else:
+                    scale_text = f"COPY_SCALE={self.cfg.copy_scale:g} · допуск {self.cfg.copy_max_slip:g}"
+                self._note("INFO", scale_text)
             self._note(
                 "INFO",
                 f"{why}: банк ${self.portfolio.cash} · {name} "
@@ -704,7 +710,9 @@ class TradingEngine:
             if end is not None and now > end + 30:
                 await self._skip_copy(job, "empty book", now, scale=scale)
             return
-        taken, why = walk_book(job.side, bids, asks, want, job.wallet_price)
+        taken, why = walk_book(
+            job.side, bids, asks, want, job.wallet_price, D(str(self.cfg.copy_max_slip)),
+        )
         if not taken:
             await self._record_copy(
                 job, now, scale, status="SKIPPED", reason=why or "book worse than wallet",
@@ -778,13 +786,16 @@ class TradingEngine:
                 )
         got = sum((sz for _px, sz in taken), _ZERO)
         avg = (cost / got) if got else _ZERO
-        note = ""
-        if job.side == "SELL" and want < desired:
-            note = "capped at holdings"
+        status = "FILLED"
+        notes: list[str] = []
+        if job.side == "SELL" and want + Decimal("0.000001") < desired:
+            status = "PARTIAL"
+            notes.append("capped at holdings")
         if got + Decimal("0.000001") < want:
-            note = (note + "; " if note else "") + "book shorter than the scaled size"
+            status = "PARTIAL"
+            notes.append("book shorter than the scaled size")
         await self._record_copy(
-            job, now, scale, status="FILLED", reason=note,
+            job, now, scale, status=status, reason="; ".join(notes),
             scaled=desired, carry=carry, our_size=got, our_price=avg, fee=fee,
             slip=slippage(job.side, avg, job.wallet_price), levels=taken,
         )
@@ -874,6 +885,13 @@ class TradingEngine:
         else:
             self.copy.shadow.buy(job.slug, job.outcome, exact, job.wallet_price)
 
+    def _scale_label(self) -> str:
+        if self.cfg.copy_scale_auto:
+            cached = getattr(self, "_copy_scale_value", None)
+            return "auto" if cached is None else str(cached)
+        raw = self.cfg.copy_scale if self.cfg.copy_scale is not None else 0.07
+        return str(raw)
+
     def _held_shares(self, slug: str, outcome: str) -> Decimal:
         book = self.portfolio.markets.get(slug)
         if book is None:
@@ -924,8 +942,9 @@ class TradingEngine:
             self._note("INFO", f"SKIPPED {job.slug} {job.side} {job.outcome}: {reason}")
 
     async def _copy_scale(self, now: float) -> Decimal | None:
-        if self.cfg.copy_scale is not None:
-            return D(str(self.cfg.copy_scale))
+        if not self.cfg.copy_scale_auto:
+            raw = self.cfg.copy_scale if self.cfg.copy_scale is not None else 0.07
+            return D(str(raw))
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         cached = getattr(self, "_copy_scale_value", None)
         if cached is not None and getattr(self, "_copy_scale_day", "") == day:
@@ -1060,10 +1079,13 @@ class TradingEngine:
                 "shadow_pnl": str(self.copy.shadow.window_pnl(slug, self.marks)),
                 "our_pnl": str(usdc(our)),
             })
-        scale = self.cfg.copy_scale
+        for row in rows:
+            row["wallet_tx"] = row.get("tx") or ""
+        scale = self._scale_label()
         return {
-            "scale": None if scale is None else str(scale),
-            "scale_mode": "manual" if scale is not None else "equity/value",
+            "scale": scale,
+            "scale_mode": "auto" if self.cfg.copy_scale_auto else "fixed",
+            "slip": str(self.cfg.copy_max_slip),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
@@ -1756,6 +1778,8 @@ class TradingEngine:
             "strategy_title": _strategy_title(self.cfg.strategy),
             "strategy_lines": _strategy_lines(self.cfg),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)) if self.cfg.strategy == "copy_wallet" else None,
+            "copy_scale": self._scale_label() if self.cfg.strategy == "copy_wallet" else None,
+            "copy_max_slip": self.cfg.copy_max_slip if self.cfg.strategy == "copy_wallet" else None,
             "copies": self.ledger.copies(self.mode, limit=40) if self.cfg.strategy == "copy_wallet" else [],
             "equity": str(equity),
             "cash": str(self.portfolio.cash),

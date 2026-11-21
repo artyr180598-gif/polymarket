@@ -31,14 +31,17 @@ def _optional_float(name: str) -> float:
         return 0.0
 
 
-def _optional_scale(name: str) -> float | None:
-    raw = os.getenv(name, "").strip()
+def _scale_setting(name: str) -> tuple[float, bool]:
+    """(scale, auto). Unset is 0.07. ``auto`` uses equity / wallet value."""
+    raw = os.getenv(name, "").strip().lower()
+    if raw == "auto":
+        return 0.07, True
     if not raw:
-        return None
+        return 0.07, False
     try:
-        return max(0.0, float(raw))
+        return max(0.0, float(raw)), False
     except ValueError:
-        return None
+        return 0.07, False
 
 
 def _bounded(name: str, default: str, low: float, high: float) -> float:
@@ -68,8 +71,9 @@ class BotConfig:
     copy_max_t: float = 240.0
     copy_shares: float = 10.0
     copy_max_per_window: int = 3
-    # Empty means equity / wallet portfolio value, refreshed once a UTC day.
-    copy_scale: float | None = None
+    # 0.07 unless COPY_SCALE is a number. COPY_SCALE=auto uses equity / value.
+    copy_scale: float = 0.07
+    copy_scale_auto: bool = False
     copy_delay_s: float = 1.0
     copy_max_slip: float = 0.03
     enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
@@ -152,6 +156,7 @@ class BotConfig:
         frames = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m,15m,1h,4h") if t.lower() in TIMEFRAMES]
         if not frames:
             frames = ["5m", "15m", "1h", "4h"]
+        scale, scale_auto = _scale_setting("COPY_SCALE")
         return cls(
             trading_mode=mode,
             dry_run=_flag("DRY_RUN", "false"),
@@ -167,7 +172,8 @@ class BotConfig:
             copy_max_t=max(0.0, float(os.getenv("COPY_MAX_T", "240"))),
             copy_shares=max(1.0, float(os.getenv("COPY_SHARES", "10"))),
             copy_max_per_window=max(1, int(os.getenv("COPY_MAX_PER_WINDOW", "3"))),
-            copy_scale=_optional_scale("COPY_SCALE"),
+            copy_scale=scale,
+            copy_scale_auto=scale_auto,
             copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "1"))),
             copy_max_slip=max(0.0, float(os.getenv("COPY_MAX_SLIP", "0.03"))),
             enabled_assets=assets,
