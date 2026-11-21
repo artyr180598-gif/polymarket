@@ -182,7 +182,7 @@ async function refresh(){
   state = await api("/api/state");
   const mode = state.mode === "live" ? "реальные деньги" : "учебный режим";
   const run = state.halt_reason ? "стоп: " + state.halt_reason : (state.paused ? "пауза" : "торгует");
-  document.getElementById("subtitle").textContent = mode + " · " + run;
+  document.getElementById("subtitle").textContent = (state.strategy_title || "Стратегия") + " · " + mode + " · " + run;
   render();
 }
 function card(title, body){ return '<section class="card"><div class="k">'+title+'</div>'+body+'</section>'; }
@@ -242,7 +242,8 @@ function render(){
       edgeCard(s);
   } else if (tab === "strategy") {
     const L = s.limits || {};
-    el.innerHTML = card("Что делает бот", "<ul><li>Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль. Продаж нет.</li><li>Первую ногу берём на фаворите, от 55¢ до 95¢, шесть заявок по 10 шар через 1¢.</li><li>Когда одна сторона куплена, вторую добираем до PAIR_SUM_HEDGE (рекомендуется 97¢) и тем же числом шар, не дальше 15¢ от бида.</li><li>Пару дешевле $1 меняем на доллар. Остаток ждёт, пока Gamma или CLOB закроют рынок.</li><li>По умолчанию BTC, ETH, SOL и XRP, окна 5м, 15м, 1ч и 4ч. Сутки, DOGE и BNB выключены.</li></ul>")
+    const lines = (s.strategy_lines || []).map(function (x) { return "<li>"+x+"</li>"; }).join("");
+    el.innerHTML = card(s.strategy_title || "Что делает бот", "<ul>"+lines+"</ul>")
       + card("Лимиты", '<div class="row"><span>Заявка</span><span>$'+L.order_clip_usd+'</span></div><div class="row"><span>На одно окно</span><span>$'+L.max_window_risk_usd+'</span></div><div class="row"><span>На все окна</span><span>$'+L.max_total_exposure_usd+'</span></div><div class="row"><span>Стоп за день</span><span>−$'+L.max_daily_loss_usd+'</span></div><div class="row"><span>Комиссии</span><span>'+s.fee_regime+'</span></div><div class="row"><span>Активы</span><span>'+(s.assets||[]).join(", ")+'</span></div>')
       + edgeCard(s);
   } else if (tab === "errors") {

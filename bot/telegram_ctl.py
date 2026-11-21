@@ -247,14 +247,11 @@ class TelegramController:
         return "\n".join(lines)
 
     def _strategy(self) -> str:
-        limits = self.engine.snapshot().get("limits") or {}
-        return "\n".join([
-            "Стратегия mo-money",
-            "Лестница лимитных покупок на обе стороны, от 1¢ до 98¢.",
-            "Дешёвые крылья — лучшая отдача на доллар. Дороже 90¢ тоже в плюсе, но тонком.",
-            "Средняя цена Up и Down вместе не выше 99¢, иначе вторую сторону не берём.",
-            "Пару дешевле $1 меняем на доллар. Продаж нет.",
-            "Край стакана на истории кошелька не запрещён: убыток давала пара дороже $1, а не сама цена.",
+        snap = self.engine.snapshot()
+        limits = snap.get("limits") or {}
+        lines = [snap.get("strategy_title") or "Стратегия"]
+        lines.extend(snap.get("strategy_lines") or [])
+        lines.extend([
             "",
             f"Размер заявки: ${limits.get('order_clip_usd')}",
             f"Лимит на окно: ${limits.get('max_window_risk_usd')}",
@@ -262,6 +259,7 @@ class TelegramController:
             f"Стоп за день: −${limits.get('max_daily_loss_usd')}",
             f"Комиссии сейчас: {self.engine.snapshot().get('fee_regime')}",
         ])
+        return "\n".join(lines)
 
     def _errors(self) -> str:
         rows = self.engine.snapshot().get("errors") or []

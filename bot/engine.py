@@ -26,8 +26,9 @@ from typing import Any, Callable
 import aiohttp
 
 from .accounting import D, Portfolio, usdc
-from .books import maker_buy_rows, touch
+from .books import maker_buy_rows, parse_levels, touch
 from .config import BotConfig
+from .copy_wallet import CopyBook, fee_for_lifts, price_cap, take_asks
 from .execution import Fill, LiveBroker, PaperBroker, Resting
 from .fees import fallback_taker_fee_rate, fee_regime_label
 from .ledger import Ledger
@@ -57,6 +58,37 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
         if base not in bases:
             bases.append(base)
     return bases
+
+
+def _strategy_title(strategy: str) -> str:
+    if strategy == "copy_wallet":
+        return "copy-wallet: тейкер по фавориту кошелька"
+    return "mo-money: лестница мейкер-бидов"
+
+
+def _strategy_lines(cfg) -> list[str]:
+    if cfg.strategy == "copy_wallet":
+        return [
+            "Только бумага. LIVE для этого режима не включается.",
+            f"Покупки кошелька {cfg.copy_wallet[:6]}…{cfg.copy_wallet[-4:]} на BTC 5м.",
+            f"Через {cfg.copy_delay_s:g} с после того, как мы увидели сделку, берём {cfg.copy_shares:g} шар по реальному аску и платим тейкерскую комиссию.",
+            f"Пропуск, если аск выше {cfg.copy_max_price:g} или дороже цены кошелька больше чем на {cfg.copy_max_slip:g}.",
+            f"Одна сторона на окно, не больше {cfg.copy_max_per_window} копий. Лестницу мейкера не ставим.",
+        ]
+    return [
+        "Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль. Продаж нет.",
+        "Первую ногу берём на фаворите, от 55¢ до 95¢, шесть заявок по 10 шар через 1¢.",
+        "Когда одна сторона куплена, вторую добираем до PAIR_SUM_HEDGE (рекомендуется 97¢) и тем же числом шар, не дальше 15¢ от бида.",
+        "Пару дешевле $1 меняем на доллар. Остаток ждёт, пока Gamma или CLOB закроют рынок.",
+        "По умолчанию BTC, ETH, SOL и XRP, окна 5м, 15м, 1ч и 4ч. Сутки, DOGE и BNB выключены.",
+    ]
+
+
+def _window_end(slug: str) -> float | None:
+    bounds = _slug_bounds(slug)
+    if bounds is None:
+        return None
+    return bounds[3]
 
 
 def _slug_bounds(slug: str) -> tuple[str, str, float, float] | None:
@@ -183,14 +215,20 @@ class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
         self.ledger = Ledger(cfg.db_path)
-        self.mode = "paper" if not cfg.live_requested else "live"
+        # copy_wallet never sends a live order, even if TRADING_MODE=live.
+        self.mode = "paper" if (not cfg.live_requested or cfg.strategy == "copy_wallet") else "live"
         saved = self.ledger.load_portfolio(self.mode)
         self.consecutive_losses = 0
+        self.manual_pause = False
+        self.copy = CopyBook()
         if saved and "portfolio" in saved:
             self.portfolio = Portfolio.from_dict(saved["portfolio"])
             self.consecutive_losses = int(saved.get("consecutive_losses") or 0)
+            self.manual_pause = bool(saved.get("manual_pause"))
+            self.copy = CopyBook.from_dict(saved.get("copy"))
         elif saved and "cash" in saved:
             self.portfolio = Portfolio.from_dict(saved)
+            self.manual_pause = bool(saved.get("manual_pause"))
         else:
             bank = D(str(cfg.bankroll_usd))
             self.portfolio = Portfolio(initial_cash=bank, cash=bank)
@@ -199,7 +237,10 @@ class TradingEngine:
         self.windows: dict[str, Window] = {}
         self.marks: dict[tuple[str, str], Decimal] = {}
         self.running = False
-        self.paused = not cfg.auto_start
+        # A pause from the dashboard is saved. auto_start only applies when
+        # nobody has paused by hand. The daily-loss halt is separate and does
+        # not clear this flag when the UTC day rolls.
+        self.paused = self.manual_pause or not cfg.auto_start
         self.halt_reason = ""
         self.errors: list[str] = []
         self.events: list[str] = []
@@ -250,7 +291,12 @@ class TradingEngine:
         try:
             self.ledger.save_portfolio(
                 self.mode,
-                {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses},
+                {
+                    "portfolio": self.portfolio.to_dict(),
+                    "consecutive_losses": self.consecutive_losses,
+                    "manual_pause": self.manual_pause,
+                    "copy": self.copy.to_dict(),
+                },
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("persist: %s", exc)
@@ -274,7 +320,7 @@ class TradingEngine:
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
         if self._preset_note:
             self._note("INFO", self._preset_note, notify=True)
-        if self.cfg.live_requested:
+        if self.cfg.live_requested and self.cfg.strategy != "copy_wallet":
             if not self.cfg.has_live_credentials:
                 self.paused = True
                 self._note("ERROR", "LIVE без POLYMARKET_PRIVATE_KEY и POLYMARKET_WALLET_ADDRESS. Торговля остановлена.", notify=True)
@@ -293,11 +339,19 @@ class TradingEngine:
                         self.paper = PaperBroker(self.portfolio)
                         self._persist()
         else:
+            self.mode = "paper"
             self._release_stale_paper_locks()
+            if self.cfg.strategy == "copy_wallet" and self.cfg.live_requested:
+                self._note(
+                    "ERROR",
+                    "copy_wallet только бумажный. LIVE не включается.",
+                    notify=True,
+                )
             why = "DRY_RUN" if self.cfg.dry_run else "paper"
+            name = "copy-wallet" if self.cfg.strategy == "copy_wallet" else "мейкер"
             self._note(
                 "INFO",
-                f"{why}: банк ${self.portfolio.cash} · мейкер "
+                f"{why}: банк ${self.portfolio.cash} · {name} "
                 f"{','.join(self.cfg.enabled_assets)} "
                 f"{','.join(self.cfg.enabled_timeframes)} · без SELL",
                 notify=True,
@@ -325,15 +379,18 @@ class TradingEngine:
             self._session = None
 
     def pause(self) -> None:
+        self.manual_pause = True
         self.paused = True
         self._cancel_all()
+        self._persist()
         self._note("INFO", "Пауза. Новые заявки не ставятся.", notify=True)
 
     def resume(self) -> None:
-        if self.cfg.live_requested and not self.live.ready:
+        if self.cfg.strategy != "copy_wallet" and self.cfg.live_requested and not self.live.ready:
             self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
             return
         self.consecutive_losses = 0
+        self.manual_pause = False
         self.paused = False
         self.halt_reason = ""
         self._persist()
@@ -538,6 +595,8 @@ class TradingEngine:
                     if window.resolved:
                         continue
                     await self._on_window(window)
+                if self.cfg.strategy == "copy_wallet" and self.mode == "paper":
+                    await self._copy_wallet_tick()
                 if self.mode == "paper":
                     # No per-window tape here. Only the 60s cap can fire,
                     # which is what unblocks a window whose tape has gone quiet.
@@ -559,7 +618,136 @@ class TradingEngine:
             self._cancel_all()
             self._note("ERROR", f"Стоп риска: {reason}", notify=True)
         elif not reason:
+            # The daily reset clears the halt only. A manual pause stays.
             self.halt_reason = ""
+
+    async def _copy_wallet_tick(self) -> None:
+        """Read the wallet's new buys and lift the ask 10s after we saw them."""
+        now = time.time()
+        rows = await self._fetch_wallet_trades()
+        if rows:
+            # The feed is newest-first. Older prints in the page get the slot first.
+            for row in reversed(rows):
+                self.copy.observe(row, now=now, cfg=self.cfg)
+        if self.paused or self.halt_reason:
+            for job in self.copy.due(now):
+                job.done = True
+            self._persist()
+            return
+        for job in self.copy.due(now):
+            await self._execute_copy(job, now)
+        self._persist()
+
+    async def _execute_copy(self, job, now: float) -> None:
+        window = self.windows.get(job.slug)
+        if window is None:
+            end = _window_end(job.slug)
+            if end is not None and now > end + 15:
+                job.done = True
+            return
+        _bids, asks = await self._book(job.token_id)
+        if not asks:
+            end = _window_end(job.slug)
+            if end is not None and now > end + 15:
+                job.done = True
+            return
+        cap = price_cap(
+            job.wallet_price,
+            max_price=D(str(self.cfg.copy_max_price)),
+            max_slip=D(str(self.cfg.copy_max_slip)),
+        )
+        taken = take_asks(asks, job.shares, cap)
+        if not taken:
+            job.done = True
+            self._note(
+                "INFO",
+                f"Копия {job.slug} {job.outcome} пропущена: аск выше {cap} (кошелёк {job.wallet_price})",
+            )
+            return
+        fee = fee_for_lifts(taken, window.fee_rate, window.fee_exponent)
+        cost = sum((usdc(px * sz) for px, sz in taken), _ZERO)
+        spend = usdc(cost + fee)
+        book = self.portfolio.markets.get(window.slug)
+        spent = book.cost_basis() if book else _ZERO
+        exposure = self.portfolio.exposure_cost() + self.portfolio.reserved
+        if spend > self.portfolio.cash:
+            job.done = True
+            self._note("INFO", f"Копия {job.slug} пропущена: не хватает свободных USDC")
+            return
+        if spent + spend > D(str(self.cfg.max_window_risk_usd)):
+            job.done = True
+            self._note("INFO", f"Копия {job.slug} пропущена: лимит окна")
+            return
+        if exposure + spend > D(str(self.cfg.max_total_exposure_usd)):
+            job.done = True
+            self._note("INFO", f"Копия {job.slug} пропущена: общий лимит")
+            return
+        snapshot = json.dumps(
+            {
+                "asks": [{"price": str(px), "size": str(sz)} for px, sz in parse_levels(asks)],
+                "taken": [{"price": str(px), "size": str(sz)} for px, sz in taken],
+                "wallet_price": str(job.wallet_price),
+                "tx": job.tx,
+                "detected_at": job.detected_at,
+                "execute_at": job.execute_at,
+            },
+            ensure_ascii=False,
+        )
+        for index, (px, sz) in enumerate(taken):
+            level_fee = fee_for_lifts([(px, sz)], window.fee_rate, window.fee_exponent)
+            self._apply_fill(
+                window,
+                Fill(
+                    order_id=f"copy-{job.tx[:10]}-{index}",
+                    outcome=job.outcome,
+                    shares=sz,
+                    price=px,
+                    fee=level_fee,
+                    role="TAKER",
+                    placed_at=job.detected_at,
+                    book=snapshot,
+                ),
+            )
+        job.done = True
+
+    async def _fetch_wallet_trades(self) -> list[dict] | None:
+        if self._session is None or not self.cfg.copy_wallet:
+            return []
+        collected: list[dict] = []
+        cursor = None
+        seen = set(self.copy.seen_tx)
+        for _page in range(4):
+            params = {
+                "user": self.cfg.copy_wallet,
+                "limit": "200",
+                "takerOnly": "false",
+                "_": str(int(time.time() * 1000)),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                async with self._session.get(
+                    "https://data-api.polymarket.com/v2/trades", params=params,
+                ) as response:
+                    if response.status != 200:
+                        self._note("ERROR", f"Лента кошелька HTTP {response.status}")
+                        return None if not collected else collected
+                    payload = await response.json(content_type=None)
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Лента кошелька: {exc}")
+                return None if not collected else collected
+            rows = payload.get("data") if isinstance(payload, dict) else payload
+            page = list(rows or [])
+            if not page:
+                break
+            collected.extend(page)
+            known = any(str(row.get("transaction_hash") or "") in seen for row in page)
+            pagination = payload.get("pagination") if isinstance(payload, dict) else None
+            has_more = bool(pagination and pagination.get("has_more"))
+            cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
+            if known or not has_more or not cursor:
+                break
+        return collected
 
     async def _on_window(self, window: Window) -> None:
         books: dict[str, tuple[list, list]] = {}
@@ -587,6 +775,10 @@ class TradingEngine:
             await self._merge(window)
             if window.seconds_to_end < -8 and not self._ghosts_for(window):
                 await self._resolve(window)
+            return
+
+        if self.cfg.strategy == "copy_wallet":
+            await self._merge(window)
             return
 
         if self.paused or self.halt_reason or not in_entry_window(window.seconds_from_start, window.seconds_to_end):
@@ -755,6 +947,7 @@ class TradingEngine:
             role=fill.role, shares=fill.shares, price=fill.price, notional=notional,
             fee=fill.fee, order_id=fill.order_id,
             placed_at=fill.placed_at, queue_ahead=fill.queue_ahead,
+            book=fill.book,
         )
         side = "Вверх" if fill.outcome == "Up" else "Вниз"
         self._note(
@@ -1237,8 +1430,10 @@ class TradingEngine:
             "running": self.running and not self.paused and not self.halt_reason,
             "paused": self.paused,
             "halt_reason": self.halt_reason,
-            "preset": "mo_money",
-            "strategy_title": "mo-money: лестница мейкер-бидов",
+            "preset": self.cfg.strategy,
+            "strategy": self.cfg.strategy,
+            "strategy_title": _strategy_title(self.cfg.strategy),
+            "strategy_lines": _strategy_lines(self.cfg),
             "equity": str(equity),
             "cash": str(self.portfolio.cash),
             "reserved": str(self.portfolio.reserved),
