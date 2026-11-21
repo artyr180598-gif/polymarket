@@ -738,12 +738,90 @@ class BookTests(unittest.TestCase):
             broker.on_trade("t", Decimal("0.69"), Decimal("5"), "BUY", trade_ts=2001), [],
         )
         self.assertEqual(broker.ghosts[order_id].queue_ahead, Decimal("15"))
-        self.assertEqual(broker.release_expired_ghosts(3000 + 6 + 3.9, 6), [])
+        # settle+4 is not enough on its own, and a settled print at the cancel
+        # second has not moved the tape past floor(cancel_ts).
+        self.assertEqual(
+            broker.release_expired_ghosts(3000 + 6 + 4, 6, settled_tape_ts=3000), [],
+        )
+        self.assertEqual(broker.release_expired_ghosts(3000 + 59.9, 6), [])
         self.assertIn(order_id, port.locks)
-        released = broker.release_expired_ghosts(3000 + 6 + 4, 6)
+        released = broker.release_expired_ghosts(3000 + 60, 6)
         self.assertEqual(released, [order_id])
         self.assertNotIn(order_id, port.locks)
         self.assertNotIn(order_id, broker.ghosts)
+        # Once a settled print is strictly after the cancel second, the
+        # shorter hold is enough.
+        order_id = broker.place(
+            outcome="Up", token_id="t", price=Decimal("0.69"), shares=Decimal("10"),
+            best_ask=Decimal("0.70"), bid_size_at_price=Decimal("0"),
+        )
+        broker.cancel(order_id)
+        broker.ghosts[order_id].cancel_ts = 4000.0
+        self.assertEqual(
+            broker.release_expired_ghosts(4010, 6, settled_tape_ts=4000, token_ids={"t"}), [],
+        )
+        self.assertEqual(
+            broker.release_expired_ghosts(4010, 6, settled_tape_ts=4001, token_ids={"t"}),
+            [order_id],
+        )
+
+    def test_a_print_first_seen_8s_after_cancel_fills_the_ghost(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        import bot.engine as engine_mod
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        window = Window(
+            slug="btc-updown-5m-1", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "u", "Down": "t"}, start_ts=0, end_ts=10**12,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        order_id = engine.paper.place(
+            outcome="Down", token_id="t", price=Decimal("0.75"), shares=Decimal("20"),
+            best_ask=Decimal("0.76"), bid_size_at_price=Decimal("65"),
+        )
+        engine.paper.orders[order_id].placed_at = 9000.0
+        engine.paper.cancel(order_id)
+        engine.paper.ghosts[order_id].cancel_ts = 10_000.0
+        window.prints_seeded = True
+        row = {
+            "transaction_hash": "0xlate", "token_id": "t", "asset": "t",
+            "price": "0.75", "size": "79", "timestamp": 10_000, "side": "BUY",
+        }
+
+        async def pages(_cid, _seen, *, taker_only, stop_older_than=None):
+            return [] if taker_only else [row]
+
+        engine._fetch_trade_pages = pages  # type: ignore[method-assign]
+        clock = {"now": 10_008.0}
+        original = engine_mod.time.time
+        engine_mod.time.time = lambda: clock["now"]
+        try:
+            self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
+            self.assertIn(order_id, engine.paper.ghosts)
+            # The old hold (cancel + 6 + 4) would have dropped it here.
+            self.assertEqual(
+                engine.paper.release_expired_ghosts(
+                    10_010.0, 6,
+                    settled_tape_ts=window.settled_tape_ts or None,
+                    token_ids=set(window.tokens.values()),
+                ),
+                [],
+            )
+            clock["now"] = 10_014.0
+            fills = asyncio.run(engine._paper_prints(window))
+        finally:
+            engine_mod.time.time = original
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].shares, Decimal("14"))
+        self.assertEqual(engine.paper.ghosts[order_id].remaining, Decimal("6"))
+        self.assertEqual(engine.paper.ghosts[order_id].queue_ahead, Decimal("0"))
 
     def test_taker_paging_stops_once_older_than_the_oldest_unseen(self) -> None:
         import asyncio

@@ -164,6 +164,8 @@ class Window:
     seen_prints: set[str] = field(default_factory=set)
     # key -> time.time() when this full-tape row was first observed.
     pending: dict[str, float] = field(default_factory=dict)
+    # Newest trade timestamp that has waited out the settle delay. 0 = none yet.
+    settled_tape_ts: float = 0.0
     prints_seeded: bool = False
     resolved: bool = False
     reported: bool = False
@@ -537,6 +539,8 @@ class TradingEngine:
                         continue
                     await self._on_window(window)
                 if self.mode == "paper":
+                    # No per-window tape here. Only the 60s cap can fire,
+                    # which is what unblocks a window whose tape has gone quiet.
                     self.paper.release_expired_ghosts(time.time(), self.cfg.tape_settle_s)
             except Exception as exc:  # noqa: BLE001
                 self._note("ERROR", f"Торговля: {exc}")
@@ -568,7 +572,12 @@ class TradingEngine:
         if self.mode == "paper":
             for fill in await self._paper_prints(window):
                 self._apply_fill(window, fill)
-            self.paper.release_expired_ghosts(time.time(), self.cfg.tape_settle_s)
+            self.paper.release_expired_ghosts(
+                time.time(),
+                self.cfg.tape_settle_s,
+                settled_tape_ts=window.settled_tape_ts or None,
+                token_ids=set(window.tokens.values()),
+            )
         if self.mode == "live":
             await self._pull_live_fills(window)
         self._drop_finished_orders(window)
@@ -908,6 +917,10 @@ class TradingEngine:
             row = by_key.get(key)
             window.pending.pop(key, None)
             window.seen_prints.add(key)
+            if row is not None:
+                trade_ts = _row_timestamp(row)
+                if trade_ts is not None and trade_ts > window.settled_tape_ts:
+                    window.settled_tape_ts = trade_ts
             if row is None or id(row) not in maker_ids:
                 continue
             fills.extend(self._absorb_print(window, row, fill=True))
@@ -973,11 +986,12 @@ class TradingEngine:
         return [order for order in self.paper.ghosts.values() if order.token_id in tokens]
 
     def _risk_budget(self, window: Window) -> dict[str, Decimal]:
-        """Cash still at risk, including cancelled orders waiting on the tape.
+        """Cash still at risk.
 
         Live rungs of this window are excluded: a re-quote cancels them first.
-        Ghost locks are not. A late fill still spends them, so both the window
-        cap and the account cap count them.
+        A ghost lock is still cash we might spend, so it counts in the account
+        cap. It does not count against this window's own budget: the order is
+        already cancelled and must not shrink the ladder that replaces it.
         """
         book = self.portfolio.markets.get(window.slug)
         locked_here = sum(
@@ -989,7 +1003,7 @@ class TradingEngine:
             _ZERO,
         )
         return {
-            "window_spent": (book.cost_basis() if book else _ZERO) + ghost_here,
+            "window_spent": book.cost_basis() if book else _ZERO,
             "free_cash": self.portfolio.cash + locked_here,
             "total_exposure": self.portfolio.exposure_cost() + self.portfolio.reserved - locked_here,
             "ghost_here": ghost_here,

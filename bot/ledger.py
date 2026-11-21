@@ -329,6 +329,22 @@ class Ledger:
                 "SELECT COUNT(*) AS n, COALESCE(SUM(CAST(pnl AS REAL)), 0) AS pnl FROM merges WHERE mode = ?",
                 (mode,),
             ).fetchone()
+            # A merge in a window that has not resolved yet is realized cash.
+            # Once the window resolves, that profit is already inside resolutions.pnl.
+            open_merges = self.conn.execute(
+                """
+                SELECT COALESCE(SUM(CAST(m.pnl AS REAL)), 0) AS pnl,
+                       COALESCE(SUM(CASE WHEN m.ts >= ? THEN CAST(m.pnl AS REAL) ELSE 0 END), 0) AS today,
+                       COALESCE(SUM(CASE WHEN m.ts >= ? THEN CAST(m.pnl AS REAL) ELSE 0 END), 0) AS week
+                FROM merges m
+                WHERE m.mode = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM resolutions r
+                    WHERE r.mode = m.mode AND r.slug = m.slug
+                  )
+                """,
+                (day, week, mode),
+            ).fetchone()
         n = int(resolved["n"])
         wins = int(resolved["wins"])
         fn = int(fills["n"])
@@ -341,9 +357,9 @@ class Ledger:
             "wins": wins,
             "losses": max(0, n - wins),
             "win_rate_pct": round(100.0 * wins / n, 1) if n else 0.0,
-            "realized_pnl": round(float(resolved["pnl"]), 2),
-            "today_realized": round(float(resolved["today"]), 2),
-            "week_realized": round(float(resolved["week"]), 2),
+            "realized_pnl": round(float(resolved["pnl"]) + float(open_merges["pnl"]), 2),
+            "today_realized": round(float(resolved["today"]) + float(open_merges["today"]), 2),
+            "week_realized": round(float(resolved["week"]) + float(open_merges["week"]), 2),
             "merges": int(merges["n"]),
             "merge_pnl": round(float(merges["pnl"]), 2),
         }

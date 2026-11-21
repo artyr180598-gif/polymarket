@@ -232,7 +232,7 @@ function render(){
       metric("MERGE", String(st.merges||0), "") +
       '</div>' + card("Подробно",
       '<div class="row"><span>Плюс / минус</span><span>'+(st.wins||0)+' / '+(st.losses||0)+'</span></div>'+
-      '<div class="row"><span>Реализовано по окнам</span><span>'+money(st.realized_pnl||0)+'</span></div>'+
+      '<div class="row"><span>Реализовано (итоги и MERGE)</span><span>'+money(st.realized_pnl||0)+'</span></div>'+
       '<div class="row"><span>Оборот</span><span>$'+Number(st.notional||0).toFixed(2)+'</span></div>'+
       '<div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div>'+
       '<div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div>'+
