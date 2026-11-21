@@ -184,7 +184,12 @@ class Portfolio:
                 self.locks[order_id] = left
         if extra > 0:
             self.cash = usdc(self.cash - extra)
-        lot = self.market(slug, condition_id, asset, timeframe).lot(outcome)
+        book = self.market(slug, condition_id, asset, timeframe)
+        # A flat merge used to close the window. A later fill then vanished
+        # from positions and equity. Reopen until the oracle resolves it.
+        if book.closed and not book.resolved:
+            book.closed = False
+        lot = book.lot(outcome)
         lot.shares = shares_q(lot.shares + qty)
         lot.cost = usdc(lot.cost + notional)
         lot.fees = usdc(lot.fees + fee_usdc)
@@ -211,7 +216,6 @@ class Portfolio:
         pnl = usdc(qty - up_cost - dn_cost - up_fee - dn_fee - gas_usdc)
         self.realized = usdc(self.realized + pnl)
         book.realized = usdc(book.realized + pnl)
-        self._maybe_close(book)
         return pnl
 
     def redeem(self, slug: str, winner: str, gas: Decimal = _ZERO) -> Decimal:
@@ -365,11 +369,16 @@ class Portfolio:
             port.markets[slug] = book
         return port
 
-    def _maybe_close(self, book: MarketBook) -> None:
-        if book.resolved:
+    def close_if_finished(self, slug: str, *, ended: bool) -> None:
+        """Close only after the window has ended, or once it is resolved.
+
+        Merging the position flat in the middle of the window is not the end.
+        More fills can still arrive.
+        """
+        book = self.markets.get(slug)
+        if book is None or book.closed:
             return
-        if book.open_shares() <= SHARE and book.cost_basis() <= USDC:
-            # Fully merged before the oracle. The economic result is already in realized.
+        if book.resolved or (ended and book.open_shares() <= SHARE and book.cost_basis() <= USDC):
             book.closed = True
 
 

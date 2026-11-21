@@ -1,11 +1,13 @@
 """Order-book helpers and the paper maker fill model.
 
-Paper fills only when a sell print at our price trades the queue in front
-of a resting bid. A cheaper print and a cancel are not fills. No maker fee.
+A resting bid is filled only by a maker BUY at that price: someone sold
+into the bid. A taker BUY lifts an ask and does not touch our bid. A maker
+SELL is the ask that was lifted. No maker fee.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from decimal import Decimal
 
 from .accounting import D
@@ -47,31 +49,33 @@ def size_at(bids: list, price: Decimal) -> Decimal:
     return sum((sz for px, sz in parse_levels(bids) if px == D(price)), _ZERO)
 
 
-def queue_print_delta(
-    buy: Decimal,
-    sell: Decimal,
-    side: str,
-    size: Decimal,
-) -> tuple[Decimal, Decimal, Decimal]:
-    """New buy total, new sell total, and shares that newly traded.
+def _tape_match_key(row: dict) -> tuple:
+    """Identity shared by the taker row and the maker row of one print."""
+    return (
+        str(row.get("transaction_hash") or ""),
+        str(row.get("asset") or row.get("token_id") or row.get("outcome") or ""),
+        str(row.get("side") or "").upper(),
+        str(row.get("size") or ""),
+        str(row.get("price") or ""),
+    )
 
-    /v2/trades lists the buyer and the seller as separate rows. A maker bid
-    fill is usually only the BUY row (the maker bought). When both rows are
-    present they are one trade, so the queue moves by the larger of the two
-    totals, not by their sum.
+
+def maker_buy_rows(all_rows: list[dict], taker_rows: list[dict]) -> list[dict]:
+    """Maker BUY rows: the full tape minus the taker-only rows.
+
+    A taker BUY lifts an ask. A maker SELL is that ask. Neither fills a
+    resting bid. Only a maker BUY means a seller hit bids at this price.
     """
-    buy = D(buy)
-    sell = D(sell)
-    size = D(size)
-    if size <= 0:
-        return buy, sell, _ZERO
-    before = buy if buy >= sell else sell
-    if (side or "").upper() == "BUY":
-        buy += size
-    else:
-        sell += size
-    after = buy if buy >= sell else sell
-    return buy, sell, after - before
+    leftover: Counter = Counter(_tape_match_key(row) for row in taker_rows)
+    kept: list[dict] = []
+    for row in all_rows:
+        key = _tape_match_key(row)
+        if leftover[key] > 0:
+            leftover[key] -= 1
+            continue
+        if str(row.get("side") or "").upper() == "BUY":
+            kept.append(row)
+    return kept
 
 
 def apply_trade_print(
@@ -85,18 +89,17 @@ def apply_trade_print(
 ) -> tuple[Decimal, Decimal]:
     """Return (new_queue_ahead, shares_filled).
 
-    Only a sell print at our own price fills a resting bid, and only by
-    the size of that print. A cancel that shrinks the book is not a trade.
+    Only a maker BUY at our own price fills a resting bid, and only by
+    the size of that print. A maker SELL or a taker BUY traded the ask.
     A print above us traded a better bid. A print below us traded a worse
-    bid. Neither one is our queue, so neither one fills us or moves it.
-    We never fill more than the print itself.
+    bid. We never fill more than the print itself.
     """
     queue = D(queue_ahead)
     left = D(remaining)
     size = D(trade_size)
     if left <= 0 or size <= 0:
         return queue, _ZERO
-    if (taker_side or "").upper() == "BUY":
+    if (taker_side or "").upper() != "BUY":
         return queue, _ZERO
     # Half a thousandth: 0.570000 and 0.57 are the same level, 0.569 is not.
     if abs(D(trade_price) - D(our_price)) > Decimal("0.0005"):

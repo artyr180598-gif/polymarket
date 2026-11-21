@@ -26,7 +26,7 @@ from typing import Any, Callable
 import aiohttp
 
 from .accounting import D, Portfolio, usdc
-from .books import queue_print_delta, touch
+from .books import maker_buy_rows, touch
 from .config import BotConfig
 from .execution import Fill, LiveBroker, PaperBroker, Resting
 from .fees import fallback_taker_fee_rate, fee_regime_label
@@ -87,12 +87,14 @@ def _enumerate_prints(rows: list[dict]) -> list[tuple[str, dict]]:
     return numbered
 
 
-def _trade_query(condition_id: str, cursor: str | None, now_ms: int) -> dict[str, str]:
+def _trade_query(
+    condition_id: str, cursor: str | None, now_ms: int, *, taker_only: bool,
+) -> dict[str, str]:
     """CloudFront caches /v2/trades for 300s. A fresh `_` bypasses that."""
     params = {
         "condition": condition_id,
         "limit": "200",
-        "takerOnly": "false",
+        "takerOnly": "true" if taker_only else "false",
         "_": str(now_ms),
     }
     if cursor:
@@ -115,8 +117,6 @@ class Window:
     fee_exponent: Decimal
     orders: dict[str, str] = field(default_factory=dict)  # "Up@0.42" -> order id
     seen_prints: set[str] = field(default_factory=set)
-    # (buy size, sell size) already counted for one tx + token + price.
-    print_volume: dict[str, tuple[Decimal, Decimal]] = field(default_factory=dict)
     prints_seeded: bool = False
     resolved: bool = False
     reported: bool = False
@@ -648,6 +648,7 @@ class TradingEngine:
             asset=window.asset, timeframe=window.timeframe, outcome=fill.outcome,
             role=fill.role, shares=fill.shares, price=fill.price, notional=notional,
             fee=fill.fee, order_id=fill.order_id,
+            placed_at=fill.placed_at, queue_ahead=fill.queue_ahead,
         )
         side = "Вверх" if fill.outcome == "Up" else "Вниз"
         self._note(
@@ -681,45 +682,43 @@ class TradingEngine:
                 self._live_left.pop(order_id, None)
                 self._live_original.pop(order_id, None)
 
-    async def _recent_trades(self, condition_id: str, seen: set[str]) -> list[dict] | None:
-        """Newest prints, including maker buys.
-
-        The default feed is short and drops the BUY row of a maker fill.
-        ``takerOnly=false`` keeps both sides. Pages continue until one row
-        was already seen, so a burst between polls is not lost off the end
-        of a single page of 80.
-        """
+    async def _fetch_trade_pages(
+        self, condition_id: str, seen: set[str], *, taker_only: bool,
+    ) -> list[dict] | None:
         if self._session is None or not condition_id:
             return []
         collected: list[dict] = []
         cursor = None
-        seen_here: set[str] = set()
+        counts: dict[str, int] = {}
         for _page in range(4):
-            params = _trade_query(condition_id, cursor, int(time.time() * 1000))
+            params = _trade_query(
+                condition_id, cursor, int(time.time() * 1000), taker_only=taker_only,
+            )
             try:
                 async with self._session.get(
                     "https://data-api.polymarket.com/v2/trades", params=params,
                 ) as response:
                     if response.status != 200:
-                        self._note("ERROR", f"Лента сделок HTTP {response.status} {condition_id[:10]}")
-                        return None if not collected else collected
+                        self._note(
+                            "ERROR",
+                            f"Лента сделок HTTP {response.status} takerOnly={params['takerOnly']} {condition_id[:10]}",
+                        )
+                        return None
                     payload = await response.json(content_type=None)
             except Exception as exc:  # noqa: BLE001
                 self._note("ERROR", f"Лента сделок: {exc}")
-                return None if not collected else collected
+                return None
             rows = payload.get("data") if isinstance(payload, dict) else payload
             page = list(rows or [])
             if not page:
                 break
-            numbered = _enumerate_prints(page)
-            # Occurrence numbers are per page here only to decide whether to
-            # stop. The caller renumbers the collected rows from the start.
             known = False
-            for key, _row in numbered:
-                if key in seen or key in seen_here:
+            for row in page:
+                fp = _print_fingerprint(row)
+                n = counts.get(fp, 0)
+                counts[fp] = n + 1
+                if f"{fp}#{n}" in seen:
                     known = True
-                    break
-                seen_here.add(key)
             collected.extend(page)
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
@@ -728,10 +727,25 @@ class TradingEngine:
                 break
         return collected
 
-    def _absorb_print(self, window: Window, row: dict, *, fill: bool) -> list[Fill]:
-        """Count one tape row toward the queue. Seeded rows update the
-        buy/sell totals and do not fill.
+    async def _recent_trades(self, condition_id: str, seen: set[str]) -> list[dict] | None:
+        """Maker BUY prints only.
+
+        The full tape and the taker-only tape are both fetched. Their
+        difference is the maker side. If the taker tape fails we count
+        nothing: guessing would fill on asks being lifted.
         """
+        full = await self._fetch_trade_pages(condition_id, seen, taker_only=False)
+        if full is None:
+            return None
+        taker = await self._fetch_trade_pages(condition_id, seen, taker_only=True)
+        if taker is None:
+            self._note("ERROR", f"Лента тейкера недоступна, филлы пропущены {condition_id[:10]}")
+            return None
+        self._last_tape_rows = full
+        return maker_buy_rows(full, taker)
+
+    def _absorb_print(self, window: Window, row: dict, *, fill: bool) -> list[Fill]:
+        """Fill resting bids from one maker BUY. Seeded rows do not fill."""
         try:
             price = D(row.get("price"))
             size = D(row.get("size"))
@@ -739,20 +753,16 @@ class TradingEngine:
             return []
         token = str(row.get("token_id") or "")
         side = str(row.get("side") or "")
-        vol_key = f"{row.get('transaction_hash')}|{token}|{price}"
-        buy, sell = window.print_volume.get(vol_key, (_ZERO, _ZERO))
-        buy, sell, delta = queue_print_delta(buy, sell, side, size)
-        window.print_volume[vol_key] = (buy, sell)
-        if not fill or delta <= 0:
+        if side.upper() != "BUY" or size <= 0:
+            return []
+        if not fill:
             return []
         raw_ts = row.get("timestamp")
         try:
             trade_ts = float(raw_ts) if raw_ts is not None else None
         except (TypeError, ValueError):
             trade_ts = None
-        # The delta is already one trade. Pass it as a sell so the price
-        # check runs; the side filter must not drop a maker BUY.
-        return self.paper.on_trade(token, price, delta, "SELL", trade_ts=trade_ts)
+        return self.paper.on_trade(token, price, size, "BUY", trade_ts=trade_ts)
 
     async def _paper_prints(self, window: Window) -> list[Fill]:
         """Seed the tape once, then fill on new prints at our price.
@@ -763,7 +773,7 @@ class TradingEngine:
         rows = await self._recent_trades(window.condition_id, window.seen_prints)
         if rows is None:
             return []
-        self._warn_if_tape_stale(window, rows)
+        self._warn_if_tape_stale(window, getattr(self, "_last_tape_rows", rows))
         fresh: list[tuple[str, dict]] = []
         for key, row in _enumerate_prints(rows):
             if key in window.seen_prints:
@@ -803,7 +813,7 @@ class TradingEngine:
 
     async def _merge(self, window: Window) -> Decimal:
         book = self.portfolio.markets.get(window.slug)
-        if book is None or book.closed:
+        if book is None or book.resolved:
             return _ZERO
         up = book.outcomes.get("Up")
         down = book.outcomes.get("Down")
@@ -831,7 +841,6 @@ class TradingEngine:
             return _ZERO
         self.ledger.record_merge(mode=self.mode, slug=window.slug, pairs=pairs, pnl=pnl, tx=tx)
         self._note("INFO", f"MERGE {pairs} пар · результат ${pnl} · {window.asset} {window.timeframe}", notify=True)
-        self._report_if_closed(window)
         self._persist()
         return pnl
 
@@ -846,6 +855,7 @@ class TradingEngine:
         book = self.portfolio.markets.get(window.slug)
         if book is None or book.open_shares() <= 0:
             window.resolved = True
+            self.portfolio.close_if_finished(window.slug, ended=True)
             self._report_if_closed(window)
             return
         gas = self._gas()
@@ -889,6 +899,9 @@ class TradingEngine:
         if book is None or not book.closed or window.reported:
             return
         if book.resolved:
+            return
+        # A flat book in the middle of the window is not a result yet.
+        if window.seconds_to_end > 0:
             return
         window.reported = True
         if book.realized < 0:
@@ -1051,6 +1064,7 @@ class TradingEngine:
                     "price": str(order.price),
                     "remaining": str(order.remaining),
                     "queue_ahead": str(order.queue_ahead),
+                    "placed_at": order.placed_at,
                     "slug": slug_by_order.get(order.order_id, ""),
                 })
         return {

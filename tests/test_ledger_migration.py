@@ -130,6 +130,8 @@ class OldLedgerMigrationTests(unittest.TestCase):
             ledger.added_columns,
             [
                 "fills.order_id",
+                "fills.placed_at",
+                "fills.queue_ahead",
                 "merges.pnl",
                 "merges.tx",
                 "resolutions.pnl",
