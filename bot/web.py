@@ -44,6 +44,11 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
     async def state() -> JSONResponse:
         return JSONResponse(engine.snapshot())
 
+    @app.get("/api/fills", dependencies=[Depends(verify_pin)])
+    async def fills(since: Optional[float] = None, limit: Optional[int] = None) -> JSONResponse:
+        rows = engine.ledger.fills(engine.mode, since=since, limit=limit)
+        return JSONResponse(rows)
+
     @app.post("/api/action/pause", dependencies=[Depends(verify_pin)])
     async def pause() -> dict:
         engine.pause()

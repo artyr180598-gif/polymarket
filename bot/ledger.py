@@ -14,7 +14,11 @@ from typing import Any
 # some of them. ALTER TABLE ADD COLUMN is the only change we make: rows
 # stay, and each new column has a default so existing inserts keep working.
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
-    "fills": {"order_id": "TEXT NOT NULL DEFAULT ''"},
+    "fills": {
+        "order_id": "TEXT NOT NULL DEFAULT ''",
+        "placed_at": "TEXT NOT NULL DEFAULT ''",
+        "queue_ahead": "TEXT NOT NULL DEFAULT ''",
+    },
     "merges": {
         "pnl": "TEXT NOT NULL DEFAULT '0'",
         "tx": "TEXT NOT NULL DEFAULT ''",
@@ -73,7 +77,9 @@ class Ledger:
                     price TEXT NOT NULL,
                     notional TEXT NOT NULL,
                     fee TEXT NOT NULL,
-                    order_id TEXT DEFAULT ''
+                    order_id TEXT DEFAULT '',
+                    placed_at TEXT DEFAULT '',
+                    queue_ahead TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS merges (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +201,8 @@ class Ledger:
                     "notional": str(row["notional"]),
                     "fee": str(row["fee"]),
                     "order_id": row.get("order_id", ""),
+                    "placed_at": str(row.get("placed_at", "")),
+                    "queue_ahead": str(row.get("queue_ahead", "")),
                 },
             )
             self.conn.commit()
@@ -230,9 +238,7 @@ class Ledger:
                     "payout": str(row["payout"]),
                 },
                 """
-                ON CONFLICT(mode, slug) DO UPDATE SET
-                    ts = excluded.ts, winner = excluded.winner,
-                    pnl = excluded.pnl, payout = excluded.payout
+                ON CONFLICT(mode, slug) DO NOTHING
                 """,
             )
             self.conn.commit()
@@ -244,6 +250,21 @@ class Ledger:
                 {"ts": time.time(), "mode": mode, "equity": equity, "cash": cash, "realized": realized},
             )
             self.conn.commit()
+
+    def fills(self, mode: str, since: float | None = None, limit: int | None = None) -> list[dict]:
+        """Every fill, oldest first. ``limit`` None means the whole table."""
+        sql = "SELECT * FROM fills WHERE mode = ?"
+        args: list[Any] = [mode]
+        if since is not None:
+            sql += " AND ts >= ?"
+            args.append(since)
+        sql += " ORDER BY id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
 
     def recent_fills(self, mode: str, limit: int = 40) -> list[dict]:
         with self._lock:

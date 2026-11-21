@@ -179,6 +179,76 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         self.assertEqual(resting.original, Decimal("12"))
         self.assertEqual(resting.queue_ahead, Decimal("10"))
 
+    def test_flat_merge_stays_open_and_resolves_once(self) -> None:
+        from bot.engine import Window
+
+        engine = self._engine()
+        book_args = dict(slug="w", condition_id="c", asset="BTC", timeframe="5m", fee=Decimal("0"))
+        engine.portfolio.buy_fill(outcome="Up", shares=Decimal("10"), price=Decimal("0.40"), **book_args)
+        engine.portfolio.buy_fill(outcome="Down", shares=Decimal("10"), price=Decimal("0.40"), **book_args)
+        engine.portfolio.merge("w", Decimal("10"))
+        book = engine.portfolio.markets["w"]
+        self.assertFalse(book.closed)
+        self.assertFalse(book.resolved)
+        window = Window(
+            slug="w", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "u", "Down": "d"}, start_ts=0, end_ts=time.time() + 120,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        book.closed = True
+        engine._report_if_closed(window)
+        self.assertEqual(
+            engine.ledger.conn.execute("SELECT * FROM resolutions").fetchall(), [],
+        )
+        engine.portfolio.buy_fill(outcome="Up", shares=Decimal("4"), price=Decimal("0.50"), **book_args)
+        self.assertFalse(book.closed)
+        self.assertEqual(book.lot("Up").shares, Decimal("4"))
+        self.assertGreater(engine.portfolio.mark_value({}), 0)
+        engine.ledger.record_resolution(
+            mode="paper", slug="w", condition_id="c", asset="BTC", timeframe="5m",
+            winner="Up", pnl="1", payout="4",
+        )
+        engine.ledger.record_resolution(
+            mode="paper", slug="w", condition_id="c", asset="BTC", timeframe="5m",
+            winner="Down", pnl="99", payout="0",
+        )
+        saved = engine.ledger.conn.execute(
+            "SELECT winner, pnl FROM resolutions WHERE slug = 'w'",
+        ).fetchall()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["winner"], "Up")
+        self.assertEqual(saved[0]["pnl"], "1")
+
+    def test_fills_endpoint_returns_every_fill(self) -> None:
+        from fastapi.testclient import TestClient
+
+        engine = self._engine()
+        for index in range(3):
+            engine.ledger.record_fill(
+                mode="paper", slug=f"w{index}", condition_id="c", asset="BTC", timeframe="5m",
+                outcome="Down", role="MAKER", shares="10", price="0.67", notional="6.7", fee="0",
+                order_id=f"order-{index}", placed_at=1000.4 + index, queue_ahead="220.32",
+                ts=1000 + index,
+            )
+        order_id = engine.paper.place(
+            outcome="Down", token_id="t", price=Decimal("0.67"), shares=Decimal("10"),
+            best_ask=Decimal("0.68"), bid_size_at_price=Decimal("220.32"),
+        )
+        client = TestClient(create_app(engine))
+        rows = client.get("/api/fills").json()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["order_id"] for row in rows], ["order-0", "order-1", "order-2"])
+        self.assertEqual(rows[0]["placed_at"], "1000.4")
+        self.assertEqual(rows[0]["queue_ahead"], "220.32")
+        self.assertEqual(len(client.get("/api/fills?since=1001&limit=1").json()), 1)
+        orders = client.get("/api/state").json()["orders"]
+        placed = [order for order in orders if order["remaining"] == "10"]
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0]["queue_ahead"], "220.32")
+        self.assertGreater(placed[0]["placed_at"], 0)
+        self.assertEqual(engine.paper.orders[order_id].queue_at_placement, Decimal("220.32"))
+
 
 if __name__ == "__main__":
     unittest.main()

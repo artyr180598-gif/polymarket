@@ -335,12 +335,14 @@ class StrategyTests(unittest.TestCase):
 
     def test_trade_query_busts_the_cache_on_every_page(self) -> None:
         from bot.engine import _trade_query
-        first = _trade_query("0xabc", None, 111)
-        second = _trade_query("0xabc", "cursor-1", 222)
+        first = _trade_query("0xabc", None, 111, taker_only=False)
+        second = _trade_query("0xabc", "cursor-1", 222, taker_only=True)
         self.assertEqual(first["_"], "111")
         self.assertEqual(second["_"], "222")
         self.assertEqual(second["cursor"], "cursor-1")
         self.assertNotIn("cursor", first)
+        self.assertEqual(first["takerOnly"], "false")
+        self.assertEqual(second["takerOnly"], "true")
 
     def test_print_keys_keep_twins_and_repeat_fetches(self) -> None:
         from bot.engine import _enumerate_prints
@@ -377,21 +379,22 @@ class BookTests(unittest.TestCase):
         from bot.books import apply_trade_print
         queue, got = apply_trade_print(
             queue_ahead=Decimal("100"), remaining=Decimal("10"), our_price=Decimal("0.40"),
-            trade_price=Decimal("0.40"), trade_size=Decimal("30"), taker_side="SELL",
+            trade_price=Decimal("0.40"), trade_size=Decimal("30"), taker_side="BUY",
         )
         self.assertEqual(got, Decimal("0"))
         self.assertEqual(queue, Decimal("70"))
         _, got = apply_trade_print(
             queue_ahead=queue, remaining=Decimal("10"), our_price=Decimal("0.40"),
-            trade_price=Decimal("0.40"), trade_size=Decimal("80"), taker_side="SELL",
+            trade_price=Decimal("0.40"), trade_size=Decimal("80"), taker_side="BUY",
         )
         self.assertEqual(got, Decimal("10"))
-        # A buy print and a print above us do not fill.
-        _, got = apply_trade_print(
+        # A maker SELL is an ask being lifted. It does not touch our bid.
+        queue, got = apply_trade_print(
             queue_ahead=Decimal("0"), remaining=Decimal("10"), our_price=Decimal("0.40"),
-            trade_price=Decimal("0.40"), trade_size=Decimal("50"), taker_side="BUY",
+            trade_price=Decimal("0.40"), trade_size=Decimal("50"), taker_side="SELL",
         )
         self.assertEqual(got, Decimal("0"))
+        self.assertEqual(queue, Decimal("0"))
         _, got = apply_trade_print(
             queue_ahead=Decimal("0"), remaining=Decimal("10"), our_price=Decimal("0.40"),
             trade_price=Decimal("0.41"), trade_size=Decimal("50"), taker_side="SELL",
@@ -407,7 +410,7 @@ class BookTests(unittest.TestCase):
         # Half a 0.001 tick: 0.966 and 0.9660004 are one level, 0.965 is the next.
         _, got = apply_trade_print(
             queue_ahead=Decimal("0"), remaining=Decimal("5"), our_price=Decimal("0.966"),
-            trade_price=Decimal("0.9660004"), trade_size=Decimal("3"), taker_side="SELL",
+            trade_price=Decimal("0.9660004"), trade_size=Decimal("3"), taker_side="BUY",
         )
         self.assertEqual(got, Decimal("3"))
         _, got = apply_trade_print(
@@ -416,14 +419,13 @@ class BookTests(unittest.TestCase):
         )
         self.assertEqual(got, Decimal("0"))
 
-    def test_maker_buy_is_one_trade_even_when_the_sell_row_arrives_too(self) -> None:
-        from bot.books import queue_print_delta
-        buy, sell, delta = queue_print_delta(Decimal(0), Decimal(0), "BUY", Decimal("146.95"))
-        self.assertEqual(delta, Decimal("146.95"))
-        _, _, again = queue_print_delta(buy, sell, "SELL", Decimal("20"))
-        self.assertEqual(again, Decimal(0))
-        _, _, extra = queue_print_delta(buy, sell, "SELL", Decimal("200"))
-        self.assertEqual(extra, Decimal("200") - Decimal("146.95"))
+    def test_only_a_maker_buy_hits_our_bid(self) -> None:
+        from bot.books import maker_buy_rows
+        maker = {"transaction_hash": "0x1", "token_id": "t", "side": "BUY", "size": "10", "price": "0.67"}
+        taker_buy = {"transaction_hash": "0x2", "token_id": "t", "side": "BUY", "size": "31", "price": "0.67"}
+        maker_sell = {"transaction_hash": "0x3", "token_id": "t", "side": "SELL", "size": "53.78", "price": "0.67"}
+        kept = maker_buy_rows([maker, taker_buy, maker_sell], [taker_buy])
+        self.assertEqual(kept, [maker])
 
     def test_paper_broker_fills_only_on_a_sell_print(self) -> None:
         port = Portfolio(initial_cash=Decimal("1000"), cash=Decimal("1000"))
@@ -439,15 +441,16 @@ class BookTests(unittest.TestCase):
         )
         self.assertIsNotNone(order_id)
         self.assertEqual(port.cash, Decimal("996"))
-        now = time.time()
-        # Book disappearing is not a fill. A print below our price is not either.
-        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "BUY", trade_ts=now), [])
-        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "SELL", trade_ts=now), [])
+        broker.orders[order_id].placed_at = 1000.4
+        # A print stamped in the placement second is already in the queue snapshot.
+        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("100"), "BUY", trade_ts=1000), [])
         self.assertEqual(broker.orders[order_id].queue_ahead, Decimal("50"))
-        # A print from before we joined the book does not fill, even at our price.
-        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("100"), "SELL", trade_ts=now - 30), [])
-        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("20"), "SELL", trade_ts=now), [])
-        fills = broker.on_trade("t", Decimal("0.40"), Decimal("40"), "SELL", trade_ts=now)
+        # A maker SELL and a print below our price do not fill.
+        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("100"), "SELL", trade_ts=1001), [])
+        self.assertEqual(broker.on_trade("t", Decimal("0.39"), Decimal("100"), "BUY", trade_ts=1001), [])
+        self.assertEqual(broker.orders[order_id].queue_ahead, Decimal("50"))
+        self.assertEqual(broker.on_trade("t", Decimal("0.40"), Decimal("20"), "BUY", trade_ts=1001), [])
+        fills = broker.on_trade("t", Decimal("0.40"), Decimal("40"), "BUY", trade_ts=1001)
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].shares, Decimal("10"))
         self.assertEqual(fills[0].fee, Decimal("0"))
@@ -522,7 +525,7 @@ class BookTests(unittest.TestCase):
 
         async def real_print(_cid, _seen):
             return [
-                {"transaction_hash": "e", "token_id": "t", "price": "0.57", "size": "20", "timestamp": 1000, "side": "SELL"},
+                {"transaction_hash": "e", "token_id": "t", "price": "0.57", "size": "20", "timestamp": 1000, "side": "BUY"},
             ]
 
         engine._recent_trades = real_print  # type: ignore[method-assign]
@@ -564,6 +567,77 @@ class BookTests(unittest.TestCase):
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].shares, Decimal("12"))
         self.assertEqual(engine.paper.orders.get(order_id), None)
+
+    def test_taker_buy_and_maker_sell_do_not_fill(self) -> None:
+        import asyncio
+        import os
+        import tempfile
+
+        from bot.config import BotConfig
+        from bot.engine import TradingEngine, Window
+
+        cfg = BotConfig(db_path=os.path.join(tempfile.mkdtemp(), "t.db"), auto_start=False, bankroll_usd=1000)
+        engine = TradingEngine(cfg)
+        window = Window(
+            slug="btc-updown-5m-1", asset="BTC", timeframe="5m", condition_id="c",
+            tokens={"Up": "u", "Down": "t"}, start_ts=0, end_ts=10**12,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.07"), fee_exponent=Decimal("1"),
+        )
+        order_id = engine.paper.place(
+            outcome="Down", token_id="t", price=Decimal("0.67"), shares=Decimal("200"),
+            best_ask=Decimal("0.68"), bid_size_at_price=Decimal("50"),
+        )
+        engine.paper.orders[order_id].placed_at = 1000.4
+        window.prints_seeded = True
+        window.orders["Down@0.67"] = order_id
+
+        def row(tx: str, side: str, size: str) -> dict:
+            return {
+                "transaction_hash": tx, "token_id": "t", "asset": "t",
+                "price": "0.67", "size": size, "timestamp": 1001, "side": side,
+            }
+
+        taker = row("0x8847f391", "BUY", "31")
+        sold = row("0xed395b7c", "SELL", "53.78")
+
+        async def ignored(_cid, _seen, *, taker_only):
+            return [taker] if taker_only else [taker, sold]
+
+        engine._fetch_trade_pages = ignored  # type: ignore[method-assign]
+        self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
+        self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("50"))
+        self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("200"))
+
+        maker = row("0xmaker", "BUY", "10")
+
+        async def hit(_cid, _seen, *, taker_only):
+            return [] if taker_only else [maker]
+
+        engine._fetch_trade_pages = hit  # type: ignore[method-assign]
+        fills = asyncio.run(engine._paper_prints(window))
+        self.assertEqual(fills, [])
+        self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("40"))
+
+        finish = row("0xmaker2", "BUY", "50")
+
+        async def through(_cid, _seen, *, taker_only):
+            return [] if taker_only else [finish]
+
+        engine._fetch_trade_pages = through  # type: ignore[method-assign]
+        fills = asyncio.run(engine._paper_prints(window))
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].shares, Decimal("10"))
+        self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("0"))
+        self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("190"))
+
+        async def taker_down(_cid, _seen, *, taker_only):
+            return None if taker_only else [row("0xlate", "BUY", "100")]
+
+        engine._fetch_trade_pages = taker_down  # type: ignore[method-assign]
+        self.assertEqual(asyncio.run(engine._paper_prints(window)), [])
+        self.assertEqual(engine.paper.orders[order_id].remaining, Decimal("190"))
+        self.assertEqual(engine.paper.orders[order_id].queue_ahead, Decimal("0"))
 
 
 class ResolutionTests(unittest.TestCase):

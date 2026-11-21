@@ -8,6 +8,7 @@ the geoblock check fail, the engine stays paused instead of pretending to trade.
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ class Fill:
     price: Decimal
     fee: Decimal
     role: str
+    placed_at: float = 0.0
+    queue_ahead: Decimal = _ZERO
 
 
 @dataclass
@@ -42,6 +45,7 @@ class Resting:
     original: Decimal
     queue_ahead: Decimal
     placed_at: float = 0.0
+    queue_at_placement: Decimal = _ZERO
     prev_level: Decimal | None = None
     seen_book: bool = False
 
@@ -80,6 +84,7 @@ class PaperBroker:
             original=shares,
             queue_ahead=D(bid_size_at_price),
             placed_at=time.time(),
+            queue_at_placement=D(bid_size_at_price),
             prev_level=D(bid_size_at_price),
             seen_book=True,
         )
@@ -111,11 +116,13 @@ class PaperBroker:
         for order in list(self.orders.values()):
             if order.token_id != token_id or order.remaining <= 0:
                 continue
-            # data-api timestamps are whole seconds. A print from the second
-            # we joined can be ours. A print from an earlier second cannot:
-            # the tape often shows it only after the order is already up.
-            if trade_ts is None or float(trade_ts) + 1 < order.placed_at:
+            # Timestamps are whole seconds. The queue snapshot already
+            # includes prints from the second we joined, so anything strictly
+            # before the next second is history, not a new fill.
+            if trade_ts is None or float(trade_ts) < math.ceil(order.placed_at):
                 continue
+            placed_at = order.placed_at
+            queue_at_placement = order.queue_at_placement
             queue, got = apply_trade_print(
                 queue_ahead=order.queue_ahead,
                 remaining=order.remaining,
@@ -136,6 +143,8 @@ class PaperBroker:
                     price=order.price,
                     fee=_ZERO,
                     role="MAKER",
+                    placed_at=placed_at,
+                    queue_ahead=queue_at_placement,
                 )
             )
             if order.remaining <= Decimal("0.0000005"):
