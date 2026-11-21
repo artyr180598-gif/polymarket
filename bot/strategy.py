@@ -20,14 +20,13 @@ from .accounting import D, floor_to_step
 # under the ask, so 0.99 is not a price we can rest against a 0.99 ask.
 BID_MIN = Decimal("0.01")
 BID_MAX = Decimal("0.98")
-# Matched shares pay $1. The first leg is the favourite, 55–90¢. A 24h tape
-# of 1,536 windows showed cheap 5–55¢ maker buys lose on 5m, while buying
-# the favourite and hedging so the pair stays ≤ $0.97 was about +8% per dollar.
-# The hedge itself is unchanged: up to PAIR_SUM_HEDGE minus the filled average,
-# at most 15¢ behind the touch, sized to the shares already held.
+# First leg is the favourite, 55–95¢. A 24h tape showed cheap maker buys
+# lose on 5m, while a 55–95¢ ladder hedged so the pair stays ≤ $0.97 was
+# about +8% per dollar. The hedge is unchanged: up to PAIR_SUM_HEDGE minus
+# the filled average, at most 15¢ behind the touch, sized to the missing shares.
 PAIR_SUM_MAX = Decimal("0.99")
 PAIR_SUM_HEDGE = Decimal("1.03")
-OPEN_BID_MAX = Decimal("0.90")
+OPEN_BID_MAX = Decimal("0.95")
 OPEN_BID_MIN = Decimal("0.55")
 # How far we will improve a touch so the two sides still sum to the cap.
 MAX_SHADE = Decimal("0.05")
@@ -39,10 +38,12 @@ HEDGE_SHADE = Decimal("0.15")
 # keep quoting until the last few seconds.
 START_AFTER_SEC = 1
 STOP_BEFORE_END_SEC = 3
-LADDER_LEVELS = 3
-# Last 6 days: median 2 distinct prices per side, p75 is 4. The smallest
-# gap between those prices has median 2¢.
-LADDER_GAP = Decimal("0.02")
+# Wallet-like favourite ladder: 6 bids, 1¢ apart, 10 shares each.
+LADDER_RUNGS = 6
+LADDER_STEP = Decimal("0.01")
+RUNG_SHARES = Decimal("10")
+# Hedge still splits the missing shares across three prices.
+_HEDGE_RUNGS = 3
 SIDE_BUDGET_FRACTION = Decimal("0.80")
 _LEVEL_WEIGHTS = (Decimal("0.50"), Decimal("0.30"), Decimal("0.20"))
 
@@ -134,6 +135,9 @@ def plan_quotes(
     held_avg: dict[str, Decimal] | None = None,
     held_shares: dict[str, Decimal] | None = None,
     hedge_cap: Decimal | None = None,
+    ladder_rungs: int = LADDER_RUNGS,
+    ladder_step: Decimal = LADDER_STEP,
+    rung_shares: Decimal = RUNG_SHARES,
 ) -> list[Quote]:
     """Up to three resting bids per outcome.
 
@@ -144,7 +148,10 @@ def plan_quotes(
     tick = D(tick)
     if tick <= 0:
         tick = Decimal("0.01")
-    gap = LADDER_GAP if LADDER_GAP >= tick else tick
+    step_gap = D(ladder_step)
+    gap = step_gap if step_gap >= tick else tick
+    open_rungs = max(1, int(ladder_rungs))
+    each = D(rung_shares)
     held_avg = {k: D(v) for k, v in (held_avg or {}).items()}
     held_shares = {k: D(v) for k, v in (held_shares or {}).items()}
     min_shares = D(min_shares)
@@ -216,9 +223,12 @@ def plan_quotes(
     quotes: list[Quote] = []
     planned_high: dict[str, Decimal] = {}
     for outcome, (touch, ask, balance_to) in chosen.items():
+        hedging = balance_to is not None
         target = _target_shares(touch, D(clip_usd), min_shares, balance_to)
         side_room = D(window_cap) * SIDE_BUDGET_FRACTION - D(side_spent.get(outcome, 0))
-        for level, weight in enumerate(_LEVEL_WEIGHTS[:LADDER_LEVELS]):
+        level_count = _HEDGE_RUNGS if hedging else open_rungs
+        for level in range(level_count):
+            weight = _LEVEL_WEIGHTS[level] if hedging and level < len(_LEVEL_WEIGHTS) else None
             raw = touch - (gap * level)
             px = _on_tick(raw, tick)
             if px < BID_MIN or px > BID_MAX:
@@ -227,7 +237,7 @@ def plan_quotes(
                 continue
             if ask is not None and px >= ask:
                 continue
-            qty = floor_to_step(target * weight, step)
+            qty = floor_to_step(each if weight is None else target * weight, step)
             if qty < min_shares:
                 # Keep a second rung when the clip can pay for it.
                 # A wing that is only a few shares stays a single bid.
