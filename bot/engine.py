@@ -31,8 +31,11 @@ from .config import BotConfig
 from .copy_wallet import (
     DEFAULT_WALLET,
     CopyBook,
+    CopyJob,
+    exact_redeem_cash,
     fee_for_lifts,
     is_target_wallet,
+    row_key,
     scale_size,
     slippage,
     walk_book,
@@ -70,7 +73,7 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
 
 def _strategy_title(strategy: str) -> str:
     if strategy == "copy_wallet":
-        return "copy-wallet: тейкер по фавориту кошелька"
+        return "copy-wallet: точная копия BTC 5м × масштаб"
     return "mo-money: лестница мейкер-бидов"
 
 
@@ -78,9 +81,8 @@ def _strategy_lines(cfg) -> list[str]:
     if cfg.strategy == "copy_wallet":
         return [
             "Только бумага. LIVE для этого режима не включается.",
-            f"Покупки кошелька {cfg.copy_wallet[:6]}…{cfg.copy_wallet[-4:]} на BTC 5м.",
-            f"Размер = размер кошелька × {cfg.copy_scale:g}. Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск.",
-            "Недобранный остаток пишется как PARTIAL или SKIPPED и не переносится на следующую сделку.",
+            f"Кошелёк {cfg.copy_wallet[:6]}…{cfg.copy_wallet[-4:]}: каждая покупка и продажа BTC 5м, размер × {cfg.copy_scale:g}.",
+            f"Допуск {cfg.copy_max_slip:g}. Меньше минимума рынка копится по окну и стороне, пока не наберётся размер. Пропуск и хвост пишутся, не пропадают.",
             "Рядом с нашим результатом виден теневой PnL: сделки кошелька × масштаб по его ценам, без ребейтов.",
         ]
     return [
@@ -245,6 +247,8 @@ class TradingEngine:
         self.windows: dict[str, Window] = {}
         self.marks: dict[tuple[str, str], Decimal] = {}
         self.running = False
+        self.started_at = time.time()
+        self._order_min: dict[str, Decimal] = {}
         # A pause from the dashboard is saved. auto_start only applies when
         # nobody has paused by hand. The daily-loss halt is separate and does
         # not clear this flag when the UTC day rolls.
@@ -357,6 +361,7 @@ class TradingEngine:
                 )
             why = "DRY_RUN" if self.cfg.dry_run else "paper"
             name = "copy-wallet" if self.cfg.strategy == "copy_wallet" else "мейкер"
+            tail = "без SELL" if self.cfg.strategy != "copy_wallet" else "покупки и продажи"
             if self.cfg.strategy == "copy_wallet":
                 if self.cfg.copy_scale_auto:
                     scale_text = "COPY_SCALE=auto (капитал / стоимость кошелька, раз в сутки)"
@@ -367,7 +372,7 @@ class TradingEngine:
                 "INFO",
                 f"{why}: банк ${self.portfolio.cash} · {name} "
                 f"{','.join(self.cfg.enabled_assets)} "
-                f"{','.join(self.cfg.enabled_timeframes)} · без SELL",
+                f"{','.join(self.cfg.enabled_timeframes)} · {tail}",
                 notify=True,
             )
         self.running = True
@@ -599,6 +604,12 @@ class TradingEngine:
         except Exception as exc:  # noqa: BLE001
             self._note("ERROR", f"Стакан: {exc}")
             return [], []
+        raw_min = payload.get("min_order_size")
+        if raw_min not in (None, ""):
+            try:
+                self._order_min[str(token_id)] = D(str(raw_min))
+            except (TypeError, ValueError, ArithmeticError):
+                pass
         return payload.get("bids") or [], payload.get("asks") or []
 
     async def _trade_loop(self) -> None:
@@ -643,15 +654,17 @@ class TradingEngine:
         incoming = list(rows or []) + [row for row in (activity or []) if str(row.get("type") or "").upper() != "TRADE"]
         if incoming:
             for row in reversed(incoming):
-                self.copy.observe(row, now=now, cfg=self.cfg)
+                self.copy.observe(row, now=now, cfg=self.cfg, boot_ts=self.started_at)
         if self.paused or self.halt_reason:
             reason = "paused" if self.paused else (self.halt_reason or "halt")
             for job in self.copy.due(now):
                 await self._skip_copy(job, reason, now)
+            await self._flush_unfilled_carry(now)
             self._persist()
             return
         for job in self.copy.due(now):
             await self._execute_copy(job, now)
+        await self._flush_unfilled_carry(now)
         self._persist()
 
     async def _execute_copy(self, job, now: float) -> None:
@@ -666,41 +679,69 @@ class TradingEngine:
             await self._skip_copy(job, "scale unknown", now)
             return
         if job.kind == "REDEEM":
-            if job.payout > 0:
-                self.copy.shadow.redeem(job.slug, job.outcome)
-            else:
-                self.copy.shadow.drop(job.slug, job.outcome)
-            await self._skip_copy(job, "redeem waits for official resolution", now, scale=scale)
+            have = D(self.copy.shadow._lot(job.slug, job.outcome)[0])
+            remove, payout = exact_redeem_cash(job.wallet_size, job.payout, have, scale)
+            self.copy.shadow.settle_outcome(job.slug, job.outcome, remove, payout)
+            price = (payout / remove) if remove else _ZERO
+            await self._record_copy(
+                job, now, scale, status="RECORDED",
+                reason="redeem waits for official resolution",
+                scaled=job.wallet_size * scale, carry=_ZERO,
+                our_size=remove, our_price=price,
+            )
+            job.done = True
             return
         if job.kind in ("MERGE", "SPLIT"):
             await self._mirror_inventory(job, now, scale, window)
             return
         await self._mirror_trade(job, now, scale, window)
 
+    def _min_shares(self, token_id: str, window: Window | None) -> Decimal:
+        """Per-market CLOB minimum. Gamma orderMinSize, else the book field, else 5."""
+        found = self._order_min.get(str(token_id or ""))
+        if found is not None and found > 0:
+            return found
+        if window is not None and window.min_shares > 0:
+            return window.min_shares
+        return Decimal("5")
+
     async def _mirror_trade(self, job, now: float, scale: Decimal, window: Window | None) -> None:
-        min_shares = window.min_shares if window is not None else Decimal("5")
         fee_rate = Decimal("0.05")
         fee_exp = Decimal("1")
-        key = f"{job.token_id}|{job.side}"
-        desired, carry = self._size_once(job, scale, key, min_shares, shadow=True)
-        if desired <= 0:
+        scaled = job.wallet_size * scale
+        if job.tx not in self.copy.sized:
+            self._shadow_trade(job, scaled)
+            self.copy.add_bucket(job.slug, job.outcome, job.side, scaled, job.wallet_price, job.tx)
+            self.copy.sized[job.tx] = [str(scaled)]
+        lot = self.copy.bucket(job.slug, job.outcome, job.side) or {"shares": "0", "notional": "0"}
+        total = D(lot.get("shares") or 0)
+        vwap = (D(lot.get("notional") or 0) / total) if total else job.wallet_price
+        min_shares = self._min_shares(job.token_id, window)
+        if total < min_shares:
             await self._record_copy(
-                job, now, scale, status="SKIPPED", reason="below minimum, carried",
-                scaled=job.wallet_size * scale, carry=carry,
+                job, now, scale, status="CARRIED", reason="below minimum, carried",
+                scaled=scaled, carry=total,
             )
             job.done = True
             return
+        desired = total
+        carry = _ZERO
+        held_gap = _ZERO
         held = self._held_shares(job.slug, job.outcome)
         want = desired
         if job.side == "SELL":
-            want = min(desired, held)
-            if want <= 0:
+            if held <= 0 or held < min_shares:
+                self.copy.clear_bucket(job.slug, job.outcome, job.side)
                 await self._record_copy(
-                    job, now, scale, status="SKIPPED", reason="no inventory",
-                    scaled=desired, carry=carry,
+                    job, now, scale, status="SKIPPED",
+                    reason="no inventory" if held <= 0 else "holdings below minimum",
+                    scaled=desired, carry=desired,
                 )
                 job.done = True
                 return
+            if held + Decimal("0.000001") < desired:
+                held_gap = desired - held
+                want = held
         if not job.token_id:
             await self._skip_copy(job, "missing token", now, scale=scale)
             return
@@ -711,12 +752,13 @@ class TradingEngine:
                 await self._skip_copy(job, "empty book", now, scale=scale)
             return
         taken, why = walk_book(
-            job.side, bids, asks, want, job.wallet_price, D(str(self.cfg.copy_max_slip)),
+            job.side, bids, asks, want, vwap, D(str(self.cfg.copy_max_slip)),
         )
         if not taken:
+            self.copy.clear_bucket(job.slug, job.outcome, job.side)
             await self._record_copy(
-                job, now, scale, status="SKIPPED", reason=why or "book worse than wallet",
-                scaled=desired, carry=carry,
+                job, now, scale, status="SKIPPED", reason=why or "book worse than slip",
+                scaled=desired, carry=desired,
             )
             job.done = True
             return
@@ -725,13 +767,15 @@ class TradingEngine:
         spend = fee if job.side == "SELL" else usdc(cost + fee)
         blocked = self._copy_block_reason(job.slug, spend, cost if job.side == "BUY" else _ZERO)
         if blocked:
+            self.copy.clear_bucket(job.slug, job.outcome, job.side)
             await self._record_copy(
                 job, now, scale, status="SKIPPED", reason=blocked,
-                scaled=desired, carry=self.copy.carry_of(key),
+                scaled=desired, carry=desired,
             )
             job.done = True
             return
         if window is None:
+            self.copy.clear_bucket(job.slug, job.outcome, job.side)
             await self._skip_copy(job, "window unknown", now, scale=scale)
             return
         snapshot = json.dumps(
@@ -757,9 +801,10 @@ class TradingEngine:
                         outcome=job.outcome, shares=sz, price=px, fee=level_fee,
                     )
                 except ValueError as exc:
+                    self.copy.clear_bucket(job.slug, job.outcome, job.side)
                     await self._record_copy(
                         job, now, scale, status="SKIPPED", reason=str(exc),
-                        scaled=desired, carry=carry,
+                        scaled=desired, carry=desired,
                     )
                     job.done = True
                     return
@@ -788,16 +833,17 @@ class TradingEngine:
         avg = (cost / got) if got else _ZERO
         status = "FILLED"
         notes: list[str] = []
-        if job.side == "SELL" and want + Decimal("0.000001") < desired:
+        if held_gap > 0:
             status = "PARTIAL"
-            notes.append("capped at holdings")
+            notes.append(f"capped at holdings; skipped {held_gap}")
         if got + Decimal("0.000001") < want:
             status = "PARTIAL"
-            notes.append("book shorter than the scaled size")
+            notes.append(f"book shorter than the scaled size; skipped {want - got}")
+        self.copy.clear_bucket(job.slug, job.outcome, job.side)
         await self._record_copy(
             job, now, scale, status=status, reason="; ".join(notes),
             scaled=desired, carry=carry, our_size=got, our_price=avg, fee=fee,
-            slip=slippage(job.side, avg, job.wallet_price), levels=taken,
+            slip=slippage(job.side, avg, vwap), levels=taken,
         )
         job.done = True
 
@@ -913,7 +959,73 @@ class TradingEngine:
             return "exposure cap"
         return ""
 
+    async def _flush_unfilled_carry(self, now: float) -> None:
+        """Remainders still under the minimum when the window ends are recorded, not dropped."""
+        scale = await self._copy_scale(now)
+        if scale is None:
+            scale = _ZERO
+        for key in list(self.copy.buckets):
+            parts = key.split("|")
+            if len(parts) != 3:
+                continue
+            slug, outcome, side = parts
+            end = _window_end(slug)
+            if end is None or now < end:
+                continue
+            lot = self.copy.buckets.get(key) or {}
+            shares = D(lot.get("shares") or 0)
+            if shares <= 0:
+                self.copy.clear_bucket(slug, outcome, side)
+                continue
+            notional = D(lot.get("notional") or 0)
+            price = notional / shares if shares else _ZERO
+            txs = lot.get("txs") or [""]
+            stub = CopyJob(
+                tx=str(txs[-1] if txs else ""),
+                slug=slug, outcome=outcome, token_id="", condition_id="",
+                side=side, kind="TRADE", wallet_price=price, wallet_size=shares,
+                trade_ts=end, detected_at=now, execute_at=now,
+            )
+            await self._record_copy(
+                stub, now, scale, status="SKIPPED", reason="below_min_unfilled",
+                scaled=shares, carry=shares,
+            )
+            self.copy.clear_bucket(slug, outcome, side)
+
+    def _fidelity(self, rows: list[dict]) -> dict:
+        full = partial = 0
+        skipped: dict[str, int] = {}
+        copied_notional = _ZERO
+        for row in rows:
+            status = str(row.get("status") or "")
+            if status == "FILLED":
+                full += 1
+            elif status == "PARTIAL":
+                partial += 1
+            elif status == "SKIPPED":
+                reason = str(row.get("reason") or "")
+                skipped[reason] = skipped.get(reason, 0) + 1
+            if status in ("FILLED", "PARTIAL"):
+                try:
+                    copied_notional += D(row.get("our_size") or 0) * D(row.get("our_price") or 0)
+                except (TypeError, ValueError, ArithmeticError):
+                    pass
+        return {
+            "wallet_trades_seen": self.copy.signals + self.copy.backlog,
+            "backlog_ignored": self.copy.backlog,
+            "copied_full": full,
+            "copied_partial": partial,
+            "carried_pending": str(self.copy.pending_shares()),
+            "skipped_by_reason": skipped,
+            "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
+            "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
+            "copied_notional": str(usdc(copied_notional)),
+            "shadow_notional": str(self.copy.shadow.notional),
+        }
+
     async def _skip_copy(self, job, reason: str, now: float, scale: Decimal | None = None) -> None:
+        if getattr(job, "kind", "TRADE") == "TRADE":
+            self.copy.clear_bucket(job.slug, job.outcome, job.side)
         job.done = True
         await self._record_copy(
             job, now, scale if scale is not None else _ZERO,
@@ -1015,7 +1127,7 @@ class TradingEngine:
             if not page:
                 break
             collected.extend(page)
-            known = any(str(row.get("transaction_hash") or "") in seen for row in page)
+            known = any(row_key(row) in seen for row in page)
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
             cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
@@ -1053,7 +1165,7 @@ class TradingEngine:
             if not page:
                 break
             collected.extend(page)
-            known = any(str(row.get("transaction_hash") or "") in seen for row in page)
+            known = any(row_key(row) in seen for row in page)
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
             cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
@@ -1082,10 +1194,12 @@ class TradingEngine:
         for row in rows:
             row["wallet_tx"] = row.get("tx") or ""
         scale = self._scale_label()
+        fidelity = self._fidelity(rows if limit is None and since is None else self.ledger.copies(self.mode))
         return {
             "scale": scale,
             "scale_mode": "auto" if self.cfg.copy_scale_auto else "fixed",
             "slip": str(self.cfg.copy_max_slip),
+            "fidelity": fidelity,
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
@@ -1780,6 +1894,7 @@ class TradingEngine:
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)) if self.cfg.strategy == "copy_wallet" else None,
             "copy_scale": self._scale_label() if self.cfg.strategy == "copy_wallet" else None,
             "copy_max_slip": self.cfg.copy_max_slip if self.cfg.strategy == "copy_wallet" else None,
+            "fidelity": self._fidelity(self.ledger.copies(self.mode)) if self.cfg.strategy == "copy_wallet" else None,
             "copies": self.ledger.copies(self.mode, limit=40) if self.cfg.strategy == "copy_wallet" else [],
             "equity": str(equity),
             "cash": str(self.portfolio.cash),
