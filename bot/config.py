@@ -60,6 +60,9 @@ class BotConfig:
     ladder_rungs: int = 6
     ladder_step: float = 0.01
     rung_shares: float = 10.0
+    # A taker row can hit the full tape before takerOnly=true. Wait this
+    # long, then classify again, before a print can fill a bid.
+    tape_settle_s: float = 6.0
     onchain_gas_usd: float = 0.0
     # Kept so old Railway variables still parse. They never delete the ledger.
     paper_reset_once: bool = False
@@ -133,6 +136,7 @@ class BotConfig:
             ladder_rungs=max(1, int(os.getenv("LADDER_RUNGS", "6"))),
             ladder_step=max(0.001, float(os.getenv("LADDER_STEP", "0.01"))),
             rung_shares=max(1.0, float(os.getenv("RUNG_SHARES", "10"))),
+            tape_settle_s=max(0.0, float(os.getenv("TAPE_SETTLE_S", "6"))),
             onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
