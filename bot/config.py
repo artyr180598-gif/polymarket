@@ -76,6 +76,7 @@ class BotConfig:
     copy_scale_auto: bool = False
     copy_delay_s: float = 1.0
     copy_max_slip: float = 0.03
+    copy_min_notional_usd: float = 1.0
     enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
     auto_start: bool = True
@@ -176,6 +177,7 @@ class BotConfig:
             copy_scale_auto=scale_auto,
             copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "1"))),
             copy_max_slip=max(0.0, float(os.getenv("COPY_MAX_SLIP", "0.03"))),
+            copy_min_notional_usd=max(0.0, float(os.getenv("COPY_MIN_NOTIONAL_USD", "1"))),
             enabled_assets=assets,
             enabled_timeframes=frames,
             auto_start=_flag("AUTO_START", "true"),

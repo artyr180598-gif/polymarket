@@ -22,8 +22,9 @@ from bot.copy_wallet import (
     scale_size,
     walk_book,
 )
-from bot.engine import TradingEngine, Window
+from bot.engine import TradingEngine, Window, fee_rate_from_market
 from bot.fees import taker_fee_usdc
+from bot.ledger import Ledger
 
 
 def _cfg(**overrides) -> BotConfig:
@@ -218,7 +219,7 @@ class ExecuteTests(unittest.TestCase):
         cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000)
         engine = TradingEngine(cfg)
         self._window(engine)
-        job = engine.copy.observe(_buy("0xbad", size="2", price="0.40"), now=1_000_050, cfg=cfg)
+        job = engine.copy.observe(_buy("0xbad", size="5", price="0.40"), now=1_000_050, cfg=cfg)
 
         async def book(_token: str):
             return [{"price": "0.20", "size": "10"}], [{"price": "0.55", "size": "10"}]
@@ -275,6 +276,281 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(restarted.halt_reason, "")
         self.assertTrue(restarted.paused)
         self.assertTrue(restarted.manual_pause)
+
+
+class FidelityTests(unittest.TestCase):
+    def _engine(self, **overrides) -> TradingEngine:
+        cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000, **overrides)
+        engine = TradingEngine(cfg)
+        window = Window(
+            slug="btc-updown-5m-1000000", asset="BTC", timeframe="5m", condition_id="cond",
+            tokens={"Up": "tok-Up", "Down": "tok-Down"}, start_ts=1_000_000, end_ts=1_000_300,
+            tick=Decimal("0.01"), min_shares=Decimal("5"),
+            fee_rate=Decimal("0.05"), fee_exponent=Decimal("1"),
+        )
+        engine.windows[window.slug] = window
+        engine._order_min["tok-Up"] = Decimal("5")
+        engine._order_min["tok-Down"] = Decimal("5")
+        # The synthetic window opens at t=1_000_000. Treat the process as already running.
+        engine.started_at = 0
+        return engine
+
+    def test_small_buys_accumulate_then_fire_at_the_average_price(self) -> None:
+        engine = self._engine()
+        cfg = engine.cfg
+
+        async def book(_token: str):
+            return [], [{"price": "0.52", "size": "20"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        first = engine.copy.observe(_buy("0xa", size="2", price="0.40"), now=1_000_010, cfg=cfg)
+        asyncio.run(engine._execute_copy(first, 1_000_011))
+        self.assertEqual(engine.ledger.copies("paper")[-1]["status"], "CARRIED")
+        self.assertEqual(Decimal(engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY")["shares"]), Decimal("2"))
+        second = engine.copy.observe(_buy("0xb", size="4", price="0.60"), now=1_000_020, cfg=cfg)
+        asyncio.run(engine._execute_copy(second, 1_000_021))
+        lot = engine.portfolio.markets["btc-updown-5m-1000000"].lot("Up")
+        self.assertEqual(lot.shares, Decimal("6"))
+        # VWAP of 2@0.40 and 4@0.60 is 0.5333; 0.52 is inside the 3 cent band.
+        self.assertLess(lot.avg_price(), Decimal("0.53"))
+        self.assertIsNone(engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY"))
+        stats = engine.snapshot()["fidelity"]
+        self.assertEqual(stats["copied_full"], 1)
+        self.assertEqual(stats["wallet_trades_seen"], 2)
+
+    def test_a_slip_skip_records_the_size_and_does_not_carry_it(self) -> None:
+        engine = self._engine()
+        job = engine.copy.observe(_buy("0xskip", size="6", price="0.40"), now=1_000_010, cfg=engine.cfg)
+
+        async def book(_token: str):
+            return [], [{"price": "0.50", "size": "20"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_011))
+        row = engine.ledger.copies("paper")[-1]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "book worse than slip")
+        self.assertEqual(Decimal(row["scaled_size"]), Decimal("6"))
+        self.assertIsNone(engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY"))
+        nxt = engine.copy.observe(_buy("0xnext", size="1", price="0.40"), now=1_000_030, cfg=engine.cfg)
+        asyncio.run(engine._execute_copy(nxt, 1_000_031))
+        self.assertEqual(Decimal(engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY")["shares"]), Decimal("1"))
+
+    def test_a_sell_is_capped_at_what_we_hold(self) -> None:
+        engine = self._engine()
+        engine.portfolio.buy_fill(
+            slug="btc-updown-5m-1000000", condition_id="cond", asset="BTC", timeframe="5m",
+            outcome="Up", shares=Decimal("6"), price=Decimal("0.40"), fee=Decimal("0"),
+        )
+        job = engine.copy.observe(_buy("0xsell", side="SELL", size="10", price="0.50"), now=1_000_040, cfg=engine.cfg)
+
+        async def book(_token: str):
+            return [{"price": "0.50", "size": "20"}], []
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_041))
+        left = engine.portfolio.markets["btc-updown-5m-1000000"].lot("Up").shares
+        self.assertEqual(left, Decimal("0"))
+        row = engine.ledger.copies("paper")[-1]
+        self.assertEqual(row["status"], "PARTIAL")
+        self.assertIn("skipped 4", row["reason"])
+        self.assertEqual(Decimal(row["our_size"]), Decimal("6"))
+
+    def test_both_redeem_rows_in_one_transaction_are_exact(self) -> None:
+        engine = self._engine()
+        engine.copy.shadow.buy("btc-updown-5m-1000000", "Up", Decimal("10"), Decimal("0.40"))
+        engine.copy.shadow.buy("btc-updown-5m-1000000", "Down", Decimal("10"), Decimal("0.60"))
+        cfg = engine.cfg
+        win = {
+            "transaction_hash": "0xsame", "proxy_wallet": DEFAULT_WALLET, "type": "REDEEM",
+            "side": "", "outcome": "Up", "size": "10", "usdc_size": "10", "price": "0",
+            "timestamp": 1_000_200, "slug": "btc-updown-5m-1000000", "token_id": "tok-Up",
+            "condition_id": "cond",
+        }
+        lose = dict(win, outcome="Down", size="10", usdc_size="0", token_id="tok-Down")
+        first = engine.copy.observe(win, now=1_000_210, cfg=cfg)
+        second = engine.copy.observe(lose, now=1_000_210, cfg=cfg)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        asyncio.run(engine._execute_copy(first, 1_000_211))
+        asyncio.run(engine._execute_copy(second, 1_000_211))
+        rows = engine.ledger.copies("paper")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["outcome"] for row in rows}, {"Up", "Down"})
+        # 10 shares of Up bought at 0.40 pay exactly 10. Down's 6 of cost is lost.
+        self.assertEqual(engine.copy.shadow.window_pnl("btc-updown-5m-1000000"), Decimal("0"))
+        # 10 payout - 4 cost - 6 cost = 0. Exact, not 9.99.
+
+    def test_trades_from_before_boot_are_backlog_not_copy_rows(self) -> None:
+        engine = self._engine()
+        engine.started_at = 5_000_000
+        old = _buy("0xold", ts=1_000_100)
+        self.assertIsNone(engine.copy.observe(old, now=5_000_010, cfg=engine.cfg, boot_ts=engine.started_at))
+        self.assertEqual(engine.copy.backlog, 1)
+        self.assertEqual(engine.copy.jobs, [])
+        self.assertIsNone(engine.copy.observe(old, now=5_000_011, cfg=engine.cfg, boot_ts=engine.started_at))
+        self.assertEqual(engine.copy.backlog, 1)
+        fresh = _buy("0xnew", ts=5_000_050)
+        self.assertIsNotNone(engine.copy.observe(fresh, now=5_000_051, cfg=engine.cfg, boot_ts=engine.started_at))
+        end = engine.snapshot()["fidelity"]
+        self.assertEqual(end["backlog_ignored"], 1)
+        self.assertEqual(end["wallet_trades_seen"], 2)
+
+    def test_a_remainder_left_at_the_window_end_is_recorded(self) -> None:
+        engine = self._engine()
+        job = engine.copy.observe(_buy("0xtiny", size="1", price="0.40"), now=1_000_010, cfg=engine.cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_011))
+        self.assertEqual(engine.ledger.copies("paper")[-1]["status"], "CARRIED")
+        asyncio.run(engine._flush_unfilled_carry(1_000_300))
+        row = engine.ledger.copies("paper")[-1]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "below_min_unfilled")
+        self.assertEqual(Decimal(row["scaled_size"]), Decimal("1"))
+        self.assertEqual(engine.copy.pending_shares(), Decimal("0"))
+
+    def test_two_rows_in_one_transaction_are_both_shadowed_and_copied(self) -> None:
+        engine = self._engine()
+
+        async def book(_token: str):
+            return [], [{"price": "0.89", "size": "1000"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        first = engine.copy.observe(
+            _buy("0xsame", size="500", price="0.89"), now=1_000_010, cfg=engine.cfg,
+        )
+        second = engine.copy.observe(
+            _buy("0xsame", size="390.77", price="0.93"), now=1_000_010, cfg=engine.cfg,
+        )
+        self.assertNotEqual(first.ident, second.ident)
+        asyncio.run(engine._execute_copy(first, 1_000_011))
+        asyncio.run(engine._execute_copy(second, 1_000_011))
+        filled = [row for row in engine.ledger.copies("paper") if row["status"] == "FILLED"]
+        self.assertEqual(len(filled), 2)
+        self.assertEqual(sum(Decimal(row["our_size"]) for row in filled), Decimal("890.77"))
+        shadow = Decimal(engine.copy.shadow._lot("btc-updown-5m-1000000", "Up")[0])
+        self.assertEqual(shadow, Decimal("890.77"))
+
+    def test_executed_size_is_floored_to_one_cent_and_the_dust_stays(self) -> None:
+        engine = self._engine()
+
+        async def book(_token: str):
+            return [], [{"price": "0.50", "size": "100"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        job = engine.copy.observe(
+            _buy("0xdust", size="6.62340875", price="0.50"), now=1_000_010, cfg=engine.cfg,
+        )
+        asyncio.run(engine._execute_copy(job, 1_000_011))
+        row = engine.ledger.copies("paper")[-1]
+        self.assertEqual(row["status"], "FILLED")
+        self.assertEqual(Decimal(row["our_size"]), Decimal("6.62"))
+        left = engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY")
+        self.assertEqual(Decimal(left["shares"]), Decimal("0.00340875"))
+
+    def test_a_buy_under_one_dollar_keeps_carrying(self) -> None:
+        engine = self._engine()
+        job = engine.copy.observe(
+            _buy("0xcheap", size="5", price="0.10"), now=1_000_010, cfg=engine.cfg,
+        )
+        asyncio.run(engine._execute_copy(job, 1_000_011))
+        self.assertEqual(engine.ledger.copies("paper")[-1]["status"], "CARRIED")
+        self.assertEqual(Decimal(engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY")["shares"]), Decimal("5"))
+        more = engine.copy.observe(
+            _buy("0xcheap2", size="5", price="0.10"), now=1_000_020, cfg=engine.cfg,
+        )
+
+        async def book(_token: str):
+            return [], [{"price": "0.10", "size": "20"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(more, 1_000_021))
+        self.assertEqual(engine.portfolio.markets["btc-updown-5m-1000000"].lot("Up").shares, Decimal("10"))
+
+    def test_the_fee_comes_from_the_market_rate(self) -> None:
+        engine = self._engine()
+        engine.windows["btc-updown-5m-1000000"].fee_rate = Decimal("0.02")
+
+        async def book(_token: str):
+            return [], [{"price": "0.60", "size": "20"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        job = engine.copy.observe(_buy("0xfee", size="10", price="0.60"), now=1_000_010, cfg=engine.cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_011))
+        fee = engine.portfolio.markets["btc-updown-5m-1000000"].lot("Up").fees
+        self.assertEqual(fee, taker_fee_usdc(Decimal("10"), Decimal("0.60"), Decimal("0.02"), 1))
+        self.assertEqual(fee_rate_from_market({"feeSchedule": {"rate": "0.05"}}, "BTC", "5m"), Decimal("0.05"))
+        self.assertEqual(fee_rate_from_market({"feeRate": "0.04"}, "BTC", "5m"), Decimal("0.04"))
+        self.assertEqual(fee_rate_from_market({"takerBaseFee": 1000}, "BTC", "5m"), Decimal("0.05"))
+        self.assertEqual(fee_rate_from_market({}, "BTC", "5m"), Decimal("0.05"))
+
+    def test_window_end_does_not_relabel_a_bucket_that_already_meets_the_minimum(self) -> None:
+        engine = self._engine()
+        engine.copy.add_bucket("btc-updown-5m-1000000", "Up", "BUY", Decimal("10"), Decimal("0.50"), "0xbig")
+        engine.copy.add_bucket("btc-updown-5m-1000000", "Down", "BUY", Decimal("1"), Decimal("0.40"), "0xtiny")
+        asyncio.run(engine._flush_unfilled_carry(1_000_300))
+        reasons = [row["reason"] for row in engine.ledger.copies("paper")]
+        self.assertEqual(reasons, ["below_min_unfilled"])
+        self.assertEqual(
+            Decimal(engine.copy.bucket("btc-updown-5m-1000000", "Up", "BUY")["shares"]),
+            Decimal("10"),
+        )
+        self.assertIsNone(engine.copy.bucket("btc-updown-5m-1000000", "Down", "BUY"))
+
+    def test_a_window_already_open_at_boot_is_not_in_the_shadow(self) -> None:
+        engine = self._engine()
+        engine.started_at = 1_000_050
+
+        async def book(_token: str):
+            return [], [{"price": "0.60", "size": "20"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        job = engine.copy.observe(_buy("0xlate", size="10", price="0.60", ts=1_000_060), now=1_000_060, cfg=engine.cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_061))
+        self.assertEqual(engine.portfolio.markets["btc-updown-5m-1000000"].lot("Up").shares, Decimal("10"))
+        self.assertEqual(Decimal(engine.copy.shadow._lot("btc-updown-5m-1000000", "Up")[0]), Decimal("0"))
+        self.assertEqual(Decimal(engine.snapshot()["fidelity"]["shadow_pnl"]), Decimal("0"))
+        self.assertEqual(Decimal(engine.snapshot()["fidelity"]["shadow_buy_notional"]), Decimal("0"))
+
+    def test_fidelity_splits_buy_sell_and_merge_notional(self) -> None:
+        engine = self._engine()
+
+        async def book(token: str):
+            price = "0.40" if token == "tok-Up" else "0.40"
+            return [], [{"price": price, "size": "20"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        up = engine.copy.observe(_buy("0xup", size="6", price="0.40"), now=1_000_010, cfg=engine.cfg)
+        down = engine.copy.observe(
+            _buy("0xdown", outcome="Down", size="6", price="0.40"), now=1_000_011, cfg=engine.cfg,
+        )
+        asyncio.run(engine._execute_copy(up, 1_000_012))
+        asyncio.run(engine._execute_copy(down, 1_000_013))
+        merge = {
+            "transaction_hash": "0xmerge", "proxy_wallet": DEFAULT_WALLET, "type": "MERGE",
+            "side": "", "outcome": "", "size": "6", "price": "0", "usdc_size": "6",
+            "timestamp": 1_000_020, "slug": "btc-updown-5m-1000000", "condition_id": "cond",
+        }
+        job = engine.copy.observe(merge, now=1_000_021, cfg=engine.cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_022))
+        stats = engine.snapshot()["fidelity"]
+        self.assertEqual(Decimal(stats["copied_buy_notional"]), Decimal("4.8"))
+        self.assertEqual(Decimal(stats["copied_merge_notional"]), Decimal("6"))
+        self.assertEqual(Decimal(stats["copied_sell_notional"]), Decimal("0"))
+        self.assertEqual(Decimal(stats["shadow_buy_notional"]), Decimal("4.8"))
+        self.assertEqual(Decimal(stats["shadow_merge_notional"]), Decimal("6"))
+        self.assertNotIn("copied_notional", stats)
+
+    def test_a_limited_copy_list_is_newest_first(self) -> None:
+        ledger = Ledger(os.path.join(tempfile.mkdtemp(), "copies.db"))
+        for name in ("old", "mid", "new"):
+            ledger.record_copy(
+                mode="paper", slug="btc-updown-5m-1000000", tx=name,
+                side="BUY", outcome="Up", status="FILLED",
+                wallet_size="1", wallet_price="0.5", our_size="1", our_price="0.5",
+            )
+        limited = ledger.copies("paper", limit=2)
+        self.assertEqual([row["tx"] for row in limited], ["new", "mid"])
+        self.assertEqual([row["tx"] for row in ledger.copies("paper")], ["old", "mid", "new"])
 
 
 class TapeReplayTests(unittest.TestCase):

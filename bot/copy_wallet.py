@@ -32,6 +32,24 @@ def is_target_wallet(row: dict, target: str) -> bool:
     return bool(found) and found == str(target or "").strip().lower()
 
 
+def row_key(row: dict) -> str:
+    """Identity of one feed row. Two redeems in one transaction stay distinct."""
+    tx = str(row.get("transaction_hash") or "")
+    kind = str(row.get("type") or "TRADE").upper()
+    side = str(row.get("side") or "").upper()
+    outcome = str(row.get("outcome") or "")
+    size = str(row.get("size") or "")
+    price = str(row.get("price") or "")
+    payout = str(row.get("usdc_size") or "")
+    if kind == "REDEEM":
+        return f"{tx}|REDEEM|{outcome}|{size}|{payout}"
+    return f"{tx}|{kind}|{side}|{outcome}|{size}|{price}"
+
+
+def bucket_key(slug: str, outcome: str, side: str) -> str:
+    return f"{slug}|{outcome}|{side}"
+
+
 @dataclass
 class CopyJob:
     tx: str
@@ -48,6 +66,7 @@ class CopyJob:
     execute_at: float
     done: bool = False
     payout: Decimal = _ZERO
+    ident: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -65,6 +84,7 @@ class CopyJob:
             "detected_at": self.detected_at,
             "execute_at": self.execute_at,
             "done": self.done,
+            "ident": self.ident,
         }
 
     @classmethod
@@ -84,6 +104,7 @@ class CopyJob:
             detected_at=float(raw.get("detected_at") or 0),
             execute_at=float(raw.get("execute_at") or 0),
             done=bool(raw.get("done")),
+            ident=str(raw.get("ident") or ""),
         )
 
 
@@ -93,6 +114,10 @@ class ShadowBook:
 
     lots: dict[str, dict[str, list]] = field(default_factory=dict)
     realized: dict[str, str] = field(default_factory=dict)
+    notional: str = "0"
+    buy_notional: str = "0"
+    sell_notional: str = "0"
+    merge_notional: str = "0"
 
     def _lot(self, slug: str, outcome: str) -> list:
         book = self.lots.setdefault(slug, {})
@@ -102,10 +127,17 @@ class ShadowBook:
             book[outcome] = lot
         return lot
 
+    def _add_notional(self, field: str, amount: Decimal, *, total: bool = True) -> None:
+        current = D(getattr(self, field))
+        setattr(self, field, str(current + D(amount)))
+        if total:
+            self.notional = str(D(self.notional) + D(amount))
+
     def buy(self, slug: str, outcome: str, shares: Decimal, price: Decimal) -> None:
         lot = self._lot(slug, outcome)
         lot[0] = str(D(lot[0]) + D(shares))
         lot[1] = str(D(lot[1]) + D(shares) * D(price))
+        self._add_notional("buy_notional", D(shares) * D(price))
 
     def sell(self, slug: str, outcome: str, shares: Decimal, price: Decimal) -> Decimal:
         lot = self._lot(slug, outcome)
@@ -118,6 +150,7 @@ class ShadowBook:
         lot[1] = str(D(lot[1]) - cost)
         pnl = usdc(qty * D(price) - cost)
         self.realized[slug] = str(D(self.realized.get(slug, 0)) + pnl)
+        self._add_notional("sell_notional", qty * D(price))
         return pnl
 
     def merge(self, slug: str, pairs: Decimal) -> Decimal:
@@ -137,6 +170,7 @@ class ShadowBook:
             return cost
         pnl = usdc(qty - take(up) - take(down))
         self.realized[slug] = str(D(self.realized.get(slug, 0)) + pnl)
+        self._add_notional("merge_notional", qty, total=False)
         return pnl
 
     def split(self, slug: str, pairs: Decimal) -> None:
@@ -175,6 +209,26 @@ class ShadowBook:
         self.realized[slug] = str(D(self.realized.get(slug, 0)) + pnl)
         return pnl
 
+    def settle_outcome(self, slug: str, outcome: str, shares: Decimal, payout: Decimal) -> Decimal:
+        """Remove ``shares`` of one outcome and book ``payout`` cash.
+
+        The other outcome is left alone, so both redeem rows in one
+        transaction can be applied. ``payout`` is exact dollars, not a
+        rounded share count.
+        """
+        lot = self._lot(slug, outcome)
+        have = D(lot[0])
+        qty = min(D(shares), have)
+        if qty <= 0 or have <= 0:
+            return _ZERO
+        cost = D(lot[1]) * qty / have
+        lot[0] = str(have - qty)
+        lot[1] = str(D(lot[1]) - cost)
+        pay = D(payout) * (qty / D(shares)) if D(shares) else _ZERO
+        pnl = usdc(pay - cost)
+        self.realized[slug] = str(D(self.realized.get(slug, 0)) + pnl)
+        return pnl
+
     def window_pnl(self, slug: str, marks: dict[tuple[str, str], Decimal] | None = None) -> Decimal:
         realized = D(self.realized.get(slug, 0))
         value = _ZERO
@@ -194,12 +248,46 @@ class ShadowBook:
         return usdc(sum((self.window_pnl(slug, marks) for slug in slugs), _ZERO))
 
     def to_dict(self) -> dict:
-        return {"lots": self.lots, "realized": self.realized}
+        return {
+            "lots": self.lots,
+            "realized": self.realized,
+            "notional": self.notional,
+            "buy_notional": self.buy_notional,
+            "sell_notional": self.sell_notional,
+            "merge_notional": self.merge_notional,
+        }
 
     @classmethod
     def from_dict(cls, raw: dict | None) -> "ShadowBook":
         raw = raw or {}
-        return cls(lots=dict(raw.get("lots") or {}), realized=dict(raw.get("realized") or {}))
+        return cls(
+            lots=dict(raw.get("lots") or {}),
+            realized=dict(raw.get("realized") or {}),
+            notional=str(raw.get("notional") or "0"),
+            buy_notional=str(raw.get("buy_notional") or "0"),
+            sell_notional=str(raw.get("sell_notional") or "0"),
+            merge_notional=str(raw.get("merge_notional") or "0"),
+        )
+
+
+def exact_redeem_cash(wallet_size: Decimal, usdc_size: Decimal, shadow_shares: Decimal, scale: Decimal) -> tuple[Decimal, Decimal]:
+    """Shares to remove and the exact cash those shares pay.
+
+    A redeem that paid one USDC per share pays exactly $1 per share we
+    shadow. A zero payout drops the shares and pays nothing.
+    """
+    wallet_size = D(wallet_size)
+    paid = D(usdc_size)
+    have = D(shadow_shares)
+    scaled = wallet_size * D(scale)
+    remove = min(have, scaled) if scaled > 0 else _ZERO
+    if remove <= 0 or wallet_size <= 0:
+        return _ZERO, _ZERO
+    if paid <= 0:
+        return remove, _ZERO
+    if abs(paid - wallet_size) <= wallet_size * Decimal("0.000001"):
+        return remove, remove
+    return remove, (paid * D(scale)) * (remove / scaled)
 
 
 @dataclass
@@ -209,12 +297,15 @@ class CopyBook:
     carry: dict[str, str] = field(default_factory=dict)
     sized: dict[str, list] = field(default_factory=dict)
     shadow: ShadowBook = field(default_factory=ShadowBook)
+    buckets: dict[str, dict] = field(default_factory=dict)
+    backlog: int = 0
+    signals: int = 0
     _seen: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self._seen = set(self.seen_tx)
 
-    def observe(self, row: dict, *, now: float, cfg) -> CopyJob | None:
+    def observe(self, row: dict, *, now: float, cfg, boot_ts: float | None = None) -> CopyJob | None:
         """Schedule a copy of one target-wallet row. Other wallets are ignored.
 
         The transaction is remembered only after the wallet field matches, so a
@@ -223,7 +314,16 @@ class CopyBook:
         if not is_target_wallet(row, cfg.copy_wallet):
             return None
         tx = str(row.get("transaction_hash") or "")
-        if not tx or tx in self._seen:
+        ident = row_key(row)
+        if not tx or ident in self._seen:
+            return None
+        try:
+            trade_ts_raw = float(row.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            trade_ts_raw = 0.0
+        if boot_ts is not None and trade_ts_raw and trade_ts_raw < float(boot_ts):
+            self._remember(ident)
+            self.backlog += 1
             return None
         kind = str(row.get("type") or "TRADE").upper()
         if kind == "TRADE":
@@ -255,7 +355,8 @@ class CopyBook:
             return None
         if kind == "TRADE" and (price <= 0 or price >= 1):
             return None
-        self._remember(tx)
+        self._remember(ident)
+        self.signals += 1
         delay = float(cfg.copy_delay_s)
         payout = D(row.get("usdc_size") or 0) if kind == "REDEEM" else _ZERO
         job = CopyJob(
@@ -269,6 +370,7 @@ class CopyBook:
             wallet_price=price,
             wallet_size=size,
             payout=payout,
+            ident=ident,
             trade_ts=trade_ts,
             detected_at=float(now),
             execute_at=float(now) + delay,
@@ -284,6 +386,30 @@ class CopyBook:
 
     def set_carry(self, key: str, value: Decimal) -> None:
         self.carry[key] = str(D(value))
+
+    def add_bucket(self, slug: str, outcome: str, side: str, shares: Decimal, price: Decimal, tx: str) -> dict:
+        """Add a scaled trade that is still under the minimum, or waiting to fire."""
+        key = bucket_key(slug, outcome, side)
+        raw = self.buckets.get(key) or {"shares": "0", "notional": "0", "txs": []}
+        shares = D(shares)
+        price = D(price)
+        total = D(raw.get("shares") or 0) + shares
+        notional = D(raw.get("notional") or 0) + shares * price
+        txs = list(raw.get("txs") or [])
+        if tx and tx not in txs:
+            txs.append(tx)
+        lot = {"shares": str(total), "notional": str(notional), "txs": txs}
+        self.buckets[key] = lot
+        return lot
+
+    def bucket(self, slug: str, outcome: str, side: str) -> dict | None:
+        return self.buckets.get(bucket_key(slug, outcome, side))
+
+    def clear_bucket(self, slug: str, outcome: str, side: str) -> dict | None:
+        return self.buckets.pop(bucket_key(slug, outcome, side), None)
+
+    def pending_shares(self) -> Decimal:
+        return sum((D(lot.get("shares") or 0) for lot in self.buckets.values()), _ZERO)
 
     def _remember(self, tx: str) -> None:
         if tx in self._seen:
@@ -302,6 +428,9 @@ class CopyBook:
             "carry": dict(self.carry),
             "sized": {k: list(v) for k, v in self.sized.items()},
             "shadow": self.shadow.to_dict(),
+            "buckets": self.buckets,
+            "backlog": self.backlog,
+            "signals": self.signals,
             "jobs": [job.to_dict() for job in self.jobs if not job.done],
         }
 
@@ -313,6 +442,9 @@ class CopyBook:
             carry={str(k): str(v) for k, v in (raw.get("carry") or {}).items()},
             sized={str(k): list(v) for k, v in (raw.get("sized") or {}).items()},
             shadow=ShadowBook.from_dict(raw.get("shadow")),
+            buckets={str(k): dict(v) for k, v in (raw.get("buckets") or {}).items()},
+            backlog=int(raw.get("backlog") or 0),
+            signals=int(raw.get("signals") or 0),
             jobs=[CopyJob.from_dict(item) for item in (raw.get("jobs") or [])],
         )
 

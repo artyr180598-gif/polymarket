@@ -314,10 +314,11 @@ class Ledger:
         if since is not None:
             sql += " AND wallet_ts >= ?"
             args.append(since)
-        sql += " ORDER BY id ASC"
         if limit is not None:
-            sql += " LIMIT ?"
+            sql += " ORDER BY id DESC LIMIT ?"
             args.append(int(limit))
+        else:
+            sql += " ORDER BY id ASC"
         with self._lock:
             rows = self.conn.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
