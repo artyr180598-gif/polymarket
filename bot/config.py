@@ -31,6 +31,14 @@ def _optional_float(name: str) -> float:
         return 0.0
 
 
+def _bounded(name: str, default: str, low: float, high: float) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except ValueError:
+        value = float(default)
+    return min(high, max(low, value))
+
+
 def _list(name: str, default: str) -> list[str]:
     return [part.strip() for part in os.getenv(name, default).split(",") if part.strip()]
 
@@ -41,6 +49,17 @@ class BotConfig:
     dry_run: bool = False
     bankroll_usd: float = 2750.0
     strategy_preset: str = "mo_money"
+    # maker_ladder is the resting-bid strategy. copy_wallet is paper-only.
+    strategy: str = "maker_ladder"
+    copy_wallet: str = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
+    copy_min_price: float = 0.50
+    copy_max_price: float = 0.95
+    copy_min_t: float = 0.0
+    copy_max_t: float = 240.0
+    copy_shares: float = 10.0
+    copy_max_per_window: int = 3
+    copy_delay_s: float = 10.0
+    copy_max_slip: float = 0.03
     enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
     auto_start: bool = True
@@ -112,6 +131,9 @@ class BotConfig:
         if mode not in ("paper", "live"):
             mode = "paper"
         preset = os.getenv("STRATEGY_PRESET", "mo_money").strip().lower() or "mo_money"
+        strategy = os.getenv("STRATEGY", "maker_ladder").strip().lower() or "maker_ladder"
+        if strategy not in ("maker_ladder", "copy_wallet"):
+            strategy = "maker_ladder"
         assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL,XRP") if a.upper() in ASSETS]
         if not assets:
             assets = ["BTC", "ETH", "SOL", "XRP"]
@@ -123,6 +145,18 @@ class BotConfig:
             dry_run=_flag("DRY_RUN", "false"),
             bankroll_usd=max(50.0, float(os.getenv("BANKROLL_USD", "2750"))),
             strategy_preset=preset,
+            strategy=strategy,
+            copy_wallet=os.getenv(
+                "COPY_WALLET", "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
+            ).strip() or "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
+            copy_min_price=_bounded("COPY_MIN_PRICE", "0.50", 0.01, 0.99),
+            copy_max_price=_bounded("COPY_MAX_PRICE", "0.95", 0.01, 0.99),
+            copy_min_t=max(0.0, float(os.getenv("COPY_MIN_T", "0"))),
+            copy_max_t=max(0.0, float(os.getenv("COPY_MAX_T", "240"))),
+            copy_shares=max(1.0, float(os.getenv("COPY_SHARES", "10"))),
+            copy_max_per_window=max(1, int(os.getenv("COPY_MAX_PER_WINDOW", "3"))),
+            copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "10"))),
+            copy_max_slip=max(0.0, float(os.getenv("COPY_MAX_SLIP", "0.03"))),
             enabled_assets=assets,
             enabled_timeframes=frames,
             auto_start=_flag("AUTO_START", "true"),

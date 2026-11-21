@@ -18,6 +18,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "order_id": "TEXT NOT NULL DEFAULT ''",
         "placed_at": "TEXT NOT NULL DEFAULT ''",
         "queue_ahead": "TEXT NOT NULL DEFAULT ''",
+        "book": "TEXT NOT NULL DEFAULT ''",
     },
     "merges": {
         "pnl": "TEXT NOT NULL DEFAULT '0'",
@@ -79,7 +80,8 @@ class Ledger:
                     fee TEXT NOT NULL,
                     order_id TEXT DEFAULT '',
                     placed_at TEXT DEFAULT '',
-                    queue_ahead TEXT DEFAULT ''
+                    queue_ahead TEXT DEFAULT '',
+                    book TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS merges (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -203,6 +205,7 @@ class Ledger:
                     "order_id": row.get("order_id", ""),
                     "placed_at": str(row.get("placed_at", "")),
                     "queue_ahead": str(row.get("queue_ahead", "")),
+                    "book": str(row.get("book", "")),
                 },
             )
             self.conn.commit()

@@ -33,6 +33,7 @@ class Fill:
     role: str
     placed_at: float = 0.0
     queue_ahead: Decimal = _ZERO
+    book: str = ""
 
 
 @dataclass

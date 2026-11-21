@@ -132,6 +132,7 @@ class OldLedgerMigrationTests(unittest.TestCase):
                 "fills.order_id",
                 "fills.placed_at",
                 "fills.queue_ahead",
+                "fills.book",
                 "merges.pnl",
                 "merges.tx",
                 "resolutions.pnl",
