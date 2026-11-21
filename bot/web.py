@@ -226,10 +226,12 @@ function render(){
       '<div class="row"><span>Сделки кошелька</span><span>'+fid.wallet_trades_seen+'</span></div>'+
       '<div class="row"><span>Скопировано полностью / частично</span><span>'+fid.copied_full+' / '+fid.copied_partial+'</span></div>'+
       '<div class="row"><span>Ждёт минимума</span><span>'+fid.carried_pending+'</span></div>'+
-      '<div class="row"><span>Номинал наш / тень</span><span>'+fid.copied_notional+' / '+fid.shadow_notional+'</span></div>'+
+      '<div class="row"><span>Покупки наш / тень</span><span>'+fid.copied_buy_notional+' / '+fid.shadow_buy_notional+'</span></div>'+
+      '<div class="row"><span>Продажи наш / тень</span><span>'+fid.copied_sell_notional+' / '+fid.shadow_sell_notional+'</span></div>'+
+      '<div class="row"><span>MERGE наш / тень</span><span>'+fid.copied_merge_notional+' / '+fid.shadow_merge_notional+'</span></div>'+
       '<div class="row"><span>Наш PnL / тень</span><span>'+fid.our_pnl+' / '+fid.shadow_pnl+'</span></div>');
     const copies = s.copies || [];
-    if (copies.length) el.innerHTML += card("Копии кошелька", copies.slice().reverse().slice(0, 20).map(function (c) {
+    if (copies.length) el.innerHTML += card("Копии кошелька", copies.slice(0, 20).map(function (c) {
       const who = c.outcome === "Up" ? "Вверх" : (c.outcome === "Down" ? "Вниз" : c.side);
       const tail = c.status === "FILLED"
         ? (c.our_size + " @ " + c.our_price)

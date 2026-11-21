@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 import aiohttp
 
-from .accounting import D, Portfolio, usdc
+from .accounting import D, Portfolio, floor_to_step, usdc
 from .books import maker_buy_rows, parse_levels, touch
 from .config import BotConfig
 from .copy_wallet import (
@@ -82,7 +82,7 @@ def _strategy_lines(cfg) -> list[str]:
         return [
             "Только бумага. LIVE для этого режима не включается.",
             f"Кошелёк {cfg.copy_wallet[:6]}…{cfg.copy_wallet[-4:]}: каждая покупка и продажа BTC 5м, размер × {cfg.copy_scale:g}.",
-            f"Допуск {cfg.copy_max_slip:g}. Меньше минимума рынка копится по окну и стороне, пока не наберётся размер. Пропуск и хвост пишутся, не пропадают.",
+            f"Допуск {cfg.copy_max_slip:g}. Покупка копится, пока нет минимума рынка и ${cfg.copy_min_notional_usd:g}. Пропуск и хвост пишутся, не пропадают.",
             "Рядом с нашим результатом виден теневой PnL: сделки кошелька × масштаб по его ценам, без ребейтов.",
         ]
     return [
@@ -92,6 +92,26 @@ def _strategy_lines(cfg) -> list[str]:
         "Пару дешевле $1 меняем на доллар. Остаток ждёт, пока Gamma или CLOB закроют рынок.",
         "По умолчанию BTC, ETH, SOL и XRP, окна 5м, 15м, 1ч и 4ч. Сутки, DOGE и BNB выключены.",
     ]
+
+
+def fee_rate_from_market(market: dict, asset: str, timeframe: str) -> Decimal:
+    """Curve rate from Gamma. feeRate, then feeSchedule.rate, then a fractional takerBaseFee, else 0.05."""
+    schedule = market.get("feeSchedule") or {}
+    if market.get("feeRate") not in (None, ""):
+        return D(str(market.get("feeRate")))
+    if schedule.get("rate") is not None:
+        return D(str(schedule.get("rate")))
+    raw_base = market.get("takerBaseFee")
+    fee_rate = fallback_taker_fee_rate(asset, timeframe)
+    if raw_base not in (None, ""):
+        try:
+            base = D(str(raw_base))
+        except (TypeError, ValueError, ArithmeticError):
+            base = Decimal("-1")
+        # CLOB base_fee 1000 is not the 0.05 curve coefficient.
+        if 0 < base <= 1:
+            fee_rate = base
+    return fee_rate
 
 
 def _window_end(slug: str) -> float | None:
@@ -579,10 +599,7 @@ class TradingEngine:
         schedule = market.get("feeSchedule") or {}
         asset = slug.split("-")[0].upper()
         tf = slug.split("-")[2] if slug.count("-") >= 3 else "5m"
-        if schedule.get("rate") is not None:
-            fee_rate = D(schedule.get("rate"))
-        else:
-            fee_rate = fallback_taker_fee_rate(asset, tf)
+        fee_rate = fee_rate_from_market(market, asset, tf)
         fee_exp = D(schedule.get("exponent") or 1)
         return {
             "condition_id": str(market.get("conditionId") or ""),
@@ -681,7 +698,8 @@ class TradingEngine:
         if job.kind == "REDEEM":
             have = D(self.copy.shadow._lot(job.slug, job.outcome)[0])
             remove, payout = exact_redeem_cash(job.wallet_size, job.payout, have, scale)
-            self.copy.shadow.settle_outcome(job.slug, job.outcome, remove, payout)
+            if self._window_opened_after_boot(job.slug):
+                self.copy.shadow.settle_outcome(job.slug, job.outcome, remove, payout)
             price = (payout / remove) if remove else _ZERO
             await self._record_copy(
                 job, now, scale, status="RECORDED",
@@ -697,7 +715,7 @@ class TradingEngine:
         await self._mirror_trade(job, now, scale, window)
 
     def _min_shares(self, token_id: str, window: Window | None) -> Decimal:
-        """Per-market CLOB minimum. Gamma orderMinSize, else the book field, else 5."""
+        """Book min_order_size, then Gamma orderMinSize, then 5."""
         found = self._order_min.get(str(token_id or ""))
         if found is not None and found > 0:
             return found
@@ -706,26 +724,31 @@ class TradingEngine:
         return Decimal("5")
 
     async def _mirror_trade(self, job, now: float, scale: Decimal, window: Window | None) -> None:
-        fee_rate = Decimal("0.05")
-        fee_exp = Decimal("1")
+        fee_rate = window.fee_rate if window is not None and window.fee_rate > 0 else Decimal("0.05")
+        fee_exp = window.fee_exponent if window is not None and window.fee_exponent >= 0 else Decimal("1")
         scaled = job.wallet_size * scale
-        if job.tx not in self.copy.sized:
+        ident = job.ident or job.tx
+        if ident not in self.copy.sized:
             self._shadow_trade(job, scaled)
             self.copy.add_bucket(job.slug, job.outcome, job.side, scaled, job.wallet_price, job.tx)
-            self.copy.sized[job.tx] = [str(scaled)]
+            self.copy.sized[ident] = [str(scaled)]
         lot = self.copy.bucket(job.slug, job.outcome, job.side) or {"shares": "0", "notional": "0"}
         total = D(lot.get("shares") or 0)
         vwap = (D(lot.get("notional") or 0) / total) if total else job.wallet_price
         min_shares = self._min_shares(job.token_id, window)
-        if total < min_shares:
+        min_notional = D(str(self.cfg.copy_min_notional_usd))
+        tradable = floor_to_step(total, Decimal("0.01"))
+        below_dollar = job.side == "BUY" and tradable * vwap < min_notional
+        if tradable < min_shares or below_dollar:
             await self._record_copy(
                 job, now, scale, status="CARRIED", reason="below minimum, carried",
                 scaled=scaled, carry=total,
             )
             job.done = True
             return
-        desired = total
-        carry = _ZERO
+        dust = total - tradable
+        desired = tradable
+        carry = dust
         held_gap = _ZERO
         held = self._held_shares(job.slug, job.outcome)
         want = desired
@@ -840,6 +863,8 @@ class TradingEngine:
             status = "PARTIAL"
             notes.append(f"book shorter than the scaled size; skipped {want - got}")
         self.copy.clear_bucket(job.slug, job.outcome, job.side)
+        if dust > 0:
+            self.copy.add_bucket(job.slug, job.outcome, job.side, dust, vwap, "")
         await self._record_copy(
             job, now, scale, status=status, reason="; ".join(notes),
             scaled=desired, carry=carry, our_size=got, our_price=avg, fee=fee,
@@ -851,13 +876,15 @@ class TradingEngine:
         key = f"{job.slug}|{job.kind}"
         min_shares = D(str(self.cfg.min_merge_shares))
         desired, carry = self._size_once(job, scale, key, min_shares, shadow=False)
-        if job.tx not in self.copy.sized or len(self.copy.sized[job.tx]) < 3:
+        ident = job.ident or job.tx
+        if ident not in self.copy.sized or len(self.copy.sized.get(ident) or []) < 3:
             exact = job.wallet_size * scale
-            if job.kind == "MERGE":
-                self.copy.shadow.merge(job.slug, exact)
-            else:
-                self.copy.shadow.split(job.slug, exact)
-            self.copy.sized[job.tx] = [str(desired), str(carry), "1"]
+            if self._window_opened_after_boot(job.slug):
+                if job.kind == "MERGE":
+                    self.copy.shadow.merge(job.slug, exact)
+                else:
+                    self.copy.shadow.split(job.slug, exact)
+            self.copy.sized[ident] = [str(desired), str(carry), "1"]
         if desired <= 0:
             await self._record_copy(
                 job, now, scale, status="SKIPPED", reason="below minimum, carried",
@@ -915,17 +942,36 @@ class TradingEngine:
         job.done = True
 
     def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal, *, shadow: bool) -> tuple[Decimal, Decimal]:
-        saved = self.copy.sized.get(job.tx)
+        ident = job.ident or job.tx
+        saved = self.copy.sized.get(ident)
         if saved:
             return D(saved[0]), D(saved[1])
         desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
         self.copy.set_carry(key, carry)
-        self.copy.sized[job.tx] = [str(desired), str(carry)]
+        self.copy.sized[ident] = [str(desired), str(carry)]
         if shadow:
             self._shadow_trade(job, job.wallet_size * scale)
         return desired, carry
 
+    def _window_opened_after_boot(self, slug: str) -> bool:
+        bounds = _slug_bounds(slug)
+        if bounds is None:
+            return False
+        return bounds[2] >= self.started_at
+
+    def _shadow_pnl(self) -> Decimal:
+        marks = self.marks
+        total = _ZERO
+        slugs = set(self.copy.shadow.lots) | set(self.copy.shadow.realized)
+        for slug in slugs:
+            if not self._window_opened_after_boot(slug):
+                continue
+            total += self.copy.shadow.window_pnl(slug, marks)
+        return usdc(total)
+
     def _shadow_trade(self, job, exact: Decimal) -> None:
+        if not self._window_opened_after_boot(job.slug):
+            return
         if job.side == "SELL":
             self.copy.shadow.sell(job.slug, job.outcome, exact, job.wallet_price)
         else:
@@ -979,6 +1025,12 @@ class TradingEngine:
                 continue
             notional = D(lot.get("notional") or 0)
             price = notional / shares if shares else _ZERO
+            tradable = floor_to_step(shares, Decimal("0.01"))
+            min_shares = self._min_shares("", self.windows.get(slug))
+            min_notional = D(str(self.cfg.copy_min_notional_usd))
+            below_dollar = side == "BUY" and tradable * price < min_notional
+            if tradable >= min_shares and not below_dollar:
+                continue
             txs = lot.get("txs") or [""]
             stub = CopyJob(
                 tx=str(txs[-1] if txs else ""),
@@ -995,7 +1047,9 @@ class TradingEngine:
     def _fidelity(self, rows: list[dict]) -> dict:
         full = partial = 0
         skipped: dict[str, int] = {}
-        copied_notional = _ZERO
+        copied_buy = _ZERO
+        copied_sell = _ZERO
+        copied_merge = _ZERO
         for row in rows:
             status = str(row.get("status") or "")
             if status == "FILLED":
@@ -1005,11 +1059,20 @@ class TradingEngine:
             elif status == "SKIPPED":
                 reason = str(row.get("reason") or "")
                 skipped[reason] = skipped.get(reason, 0) + 1
-            if status in ("FILLED", "PARTIAL"):
-                try:
-                    copied_notional += D(row.get("our_size") or 0) * D(row.get("our_price") or 0)
-                except (TypeError, ValueError, ArithmeticError):
-                    pass
+            if status not in ("FILLED", "PARTIAL"):
+                continue
+            try:
+                notion = D(row.get("our_size") or 0) * D(row.get("our_price") or 0)
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+            side = str(row.get("side") or "").upper()
+            if side == "SELL":
+                copied_sell += notion
+            elif side == "MERGE":
+                copied_merge += D(row.get("our_size") or 0)
+            elif side == "BUY":
+                copied_buy += notion
+        shadow = self.copy.shadow
         return {
             "wallet_trades_seen": self.copy.signals + self.copy.backlog,
             "backlog_ignored": self.copy.backlog,
@@ -1018,9 +1081,13 @@ class TradingEngine:
             "carried_pending": str(self.copy.pending_shares()),
             "skipped_by_reason": skipped,
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
-            "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
-            "copied_notional": str(usdc(copied_notional)),
-            "shadow_notional": str(self.copy.shadow.notional),
+            "shadow_pnl": str(self._shadow_pnl()),
+            "copied_buy_notional": str(usdc(copied_buy)),
+            "copied_sell_notional": str(usdc(copied_sell)),
+            "copied_merge_notional": str(usdc(copied_merge)),
+            "shadow_buy_notional": str(shadow.buy_notional),
+            "shadow_sell_notional": str(shadow.sell_notional),
+            "shadow_merge_notional": str(shadow.merge_notional),
         }
 
     async def _skip_copy(self, job, reason: str, now: float, scale: Decimal | None = None) -> None:
@@ -1186,9 +1253,13 @@ class TradingEngine:
                         continue
                     mark = self.marks.get((slug, name), lot.avg_price())
                     our += lot.shares * mark - lot.cost - lot.fees
+            shadow = (
+                self.copy.shadow.window_pnl(slug, self.marks)
+                if self._window_opened_after_boot(slug) else _ZERO
+            )
             windows.append({
                 "slug": slug,
-                "shadow_pnl": str(self.copy.shadow.window_pnl(slug, self.marks)),
+                "shadow_pnl": str(usdc(shadow)),
                 "our_pnl": str(usdc(our)),
             })
         for row in rows:
@@ -1200,7 +1271,7 @@ class TradingEngine:
             "scale_mode": "auto" if self.cfg.copy_scale_auto else "fixed",
             "slip": str(self.cfg.copy_max_slip),
             "fidelity": fidelity,
-            "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
+            "shadow_pnl": str(self._shadow_pnl()),
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
             "copies": rows,
@@ -1891,7 +1962,7 @@ class TradingEngine:
             "strategy": self.cfg.strategy,
             "strategy_title": _strategy_title(self.cfg.strategy),
             "strategy_lines": _strategy_lines(self.cfg),
-            "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)) if self.cfg.strategy == "copy_wallet" else None,
+            "shadow_pnl": str(self._shadow_pnl()) if self.cfg.strategy == "copy_wallet" else None,
             "copy_scale": self._scale_label() if self.cfg.strategy == "copy_wallet" else None,
             "copy_max_slip": self.cfg.copy_max_slip if self.cfg.strategy == "copy_wallet" else None,
             "fidelity": self._fidelity(self.ledger.copies(self.mode)) if self.cfg.strategy == "copy_wallet" else None,

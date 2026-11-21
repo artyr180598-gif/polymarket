@@ -66,6 +66,7 @@ class CopyJob:
     execute_at: float
     done: bool = False
     payout: Decimal = _ZERO
+    ident: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +84,7 @@ class CopyJob:
             "detected_at": self.detected_at,
             "execute_at": self.execute_at,
             "done": self.done,
+            "ident": self.ident,
         }
 
     @classmethod
@@ -102,6 +104,7 @@ class CopyJob:
             detected_at=float(raw.get("detected_at") or 0),
             execute_at=float(raw.get("execute_at") or 0),
             done=bool(raw.get("done")),
+            ident=str(raw.get("ident") or ""),
         )
 
 
@@ -112,6 +115,9 @@ class ShadowBook:
     lots: dict[str, dict[str, list]] = field(default_factory=dict)
     realized: dict[str, str] = field(default_factory=dict)
     notional: str = "0"
+    buy_notional: str = "0"
+    sell_notional: str = "0"
+    merge_notional: str = "0"
 
     def _lot(self, slug: str, outcome: str) -> list:
         book = self.lots.setdefault(slug, {})
@@ -121,14 +127,17 @@ class ShadowBook:
             book[outcome] = lot
         return lot
 
-    def _add_notional(self, shares: Decimal, price: Decimal) -> None:
-        self.notional = str(D(self.notional) + D(shares) * D(price))
+    def _add_notional(self, field: str, amount: Decimal, *, total: bool = True) -> None:
+        current = D(getattr(self, field))
+        setattr(self, field, str(current + D(amount)))
+        if total:
+            self.notional = str(D(self.notional) + D(amount))
 
     def buy(self, slug: str, outcome: str, shares: Decimal, price: Decimal) -> None:
         lot = self._lot(slug, outcome)
         lot[0] = str(D(lot[0]) + D(shares))
         lot[1] = str(D(lot[1]) + D(shares) * D(price))
-        self._add_notional(shares, price)
+        self._add_notional("buy_notional", D(shares) * D(price))
 
     def sell(self, slug: str, outcome: str, shares: Decimal, price: Decimal) -> Decimal:
         lot = self._lot(slug, outcome)
@@ -141,7 +150,7 @@ class ShadowBook:
         lot[1] = str(D(lot[1]) - cost)
         pnl = usdc(qty * D(price) - cost)
         self.realized[slug] = str(D(self.realized.get(slug, 0)) + pnl)
-        self._add_notional(qty, price)
+        self._add_notional("sell_notional", qty * D(price))
         return pnl
 
     def merge(self, slug: str, pairs: Decimal) -> Decimal:
@@ -161,6 +170,7 @@ class ShadowBook:
             return cost
         pnl = usdc(qty - take(up) - take(down))
         self.realized[slug] = str(D(self.realized.get(slug, 0)) + pnl)
+        self._add_notional("merge_notional", qty, total=False)
         return pnl
 
     def split(self, slug: str, pairs: Decimal) -> None:
@@ -238,7 +248,14 @@ class ShadowBook:
         return usdc(sum((self.window_pnl(slug, marks) for slug in slugs), _ZERO))
 
     def to_dict(self) -> dict:
-        return {"lots": self.lots, "realized": self.realized, "notional": self.notional}
+        return {
+            "lots": self.lots,
+            "realized": self.realized,
+            "notional": self.notional,
+            "buy_notional": self.buy_notional,
+            "sell_notional": self.sell_notional,
+            "merge_notional": self.merge_notional,
+        }
 
     @classmethod
     def from_dict(cls, raw: dict | None) -> "ShadowBook":
@@ -247,6 +264,9 @@ class ShadowBook:
             lots=dict(raw.get("lots") or {}),
             realized=dict(raw.get("realized") or {}),
             notional=str(raw.get("notional") or "0"),
+            buy_notional=str(raw.get("buy_notional") or "0"),
+            sell_notional=str(raw.get("sell_notional") or "0"),
+            merge_notional=str(raw.get("merge_notional") or "0"),
         )
 
 
@@ -350,6 +370,7 @@ class CopyBook:
             wallet_price=price,
             wallet_size=size,
             payout=payout,
+            ident=ident,
             trade_ts=trade_ts,
             detected_at=float(now),
             execute_at=float(now) + delay,
