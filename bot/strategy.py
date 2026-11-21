@@ -20,17 +20,15 @@ from .accounting import D, floor_to_step
 # under the ask, so 0.99 is not a price we can rest against a 0.99 ask.
 BID_MIN = Decimal("0.01")
 BID_MAX = Decimal("0.98")
-# Matched shares pay $1. With nothing held, both bids stay under $0.99.
-# After one side has filled, the other may reach PAIR_SUM_HEDGE (default $1).
-# The wallet's median pair is $1.03, but that 3¢ is a locked loss: the maker
-# rebate is at most about 0.35¢ per share at 50¢ and 0 for a new account
-# after the 2026-11-20 tier change. Do not open above OPEN_BID_MAX: on BTC 5m
-# a first leg in the 40–55¢ band was two-sided 85% of the time, while a first
-# leg above 70¢ left a pair that does not fit under $1.
+# Matched shares pay $1. The first leg is the favourite, 55–90¢. A 24h tape
+# of 1,536 windows showed cheap 5–55¢ maker buys lose on 5m, while buying
+# the favourite and hedging so the pair stays ≤ $0.97 was about +8% per dollar.
+# The hedge itself is unchanged: up to PAIR_SUM_HEDGE minus the filled average,
+# at most 15¢ behind the touch, sized to the shares already held.
 PAIR_SUM_MAX = Decimal("0.99")
 PAIR_SUM_HEDGE = Decimal("1.03")
-OPEN_BID_MAX = Decimal("0.55")
-OPEN_BID_MIN = Decimal("0.05")
+OPEN_BID_MAX = Decimal("0.90")
+OPEN_BID_MIN = Decimal("0.55")
 # How far we will improve a touch so the two sides still sum to the cap.
 MAX_SHADE = Decimal("0.05")
 # A balancing bid may sit this far behind the touch. Further than this it
