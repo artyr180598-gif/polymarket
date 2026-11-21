@@ -101,12 +101,42 @@ class PaperBroker:
         order.cancel_ts = time.time()
         self.ghosts[order.order_id] = order
 
-    def release_expired_ghosts(self, now: float, settle_s: float) -> list[str]:
-        """Drop ghosts after cancel_ts + settle + 4s and return their locks."""
+    def release_expired_ghosts(
+        self,
+        now: float,
+        settle_s: float,
+        *,
+        settled_tape_ts: float | None = None,
+        token_ids: set[str] | None = None,
+    ) -> list[str]:
+        """Return locks for ghosts the tape can no longer fill.
+
+        Both of these must hold, unless the hard cap has been reached:
+
+        (a) ``now >= cancel_ts + settle + 4s``
+        (b) the newest settled print on this window is strictly after
+            ``floor(cancel_ts)`` — the tape has moved past the cancel second.
+
+        The public tape lags the cancel (median ~5s, sometimes minutes).
+        Releasing on the clock alone drops fills that have not been polled
+        yet. After the window ends no newer print arrives, so (b) can stay
+        false forever. The cap at ``cancel_ts + 60s`` releases those ghosts
+        so resolution is not stuck.
+        """
         hold = float(settle_s) + 4.0
         released: list[str] = []
         for order_id, order in list(self.ghosts.items()):
-            if order.cancel_ts is None or now < order.cancel_ts + hold:
+            if token_ids is not None and order.token_id not in token_ids:
+                continue
+            if order.cancel_ts is None:
+                continue
+            capped = now >= order.cancel_ts + 60.0
+            aged = now >= order.cancel_ts + hold
+            caught_up = (
+                settled_tape_ts is not None
+                and settled_tape_ts > math.floor(order.cancel_ts)
+            )
+            if not capped and not (aged and caught_up):
                 continue
             self.ghosts.pop(order_id, None)
             self.portfolio.unlock(order_id)

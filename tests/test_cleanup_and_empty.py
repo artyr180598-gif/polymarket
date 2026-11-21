@@ -358,11 +358,12 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         locked = engine.portfolio.locks[order_id]
         budget = engine._risk_budget(window)
         self.assertEqual(budget["ghost_here"], locked)
-        self.assertEqual(budget["window_spent"], locked)
+        self.assertEqual(budget["window_spent"], Decimal("0"))
         self.assertEqual(
             budget["total_exposure"],
             engine.portfolio.exposure_cost() + engine.portfolio.reserved,
         )
+        self.assertGreaterEqual(budget["total_exposure"], locked)
         self.assertEqual(budget["free_cash"], engine.portfolio.cash)
 
         called: list[str] = []
@@ -382,10 +383,30 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         asyncio.run(engine._on_window(window))
         self.assertEqual(called, [])
         self.assertIn(order_id, engine.paper.ghosts)
-        engine.paper.ghosts[order_id].cancel_ts = time.time() - 100
+        # Past the old 10s hold, but the tape never moved past the cancel and
+        # the 60s cap has not been reached. Resolution must keep waiting.
+        engine.paper.ghosts[order_id].cancel_ts = time.time() - 30
+        asyncio.run(engine._on_window(window))
+        self.assertEqual(called, [])
+        self.assertIn(order_id, engine.paper.ghosts)
+        # The window has ended, so no newer print will arrive. The cap lets go.
+        engine.paper.ghosts[order_id].cancel_ts = time.time() - 60
         asyncio.run(engine._on_window(window))
         self.assertEqual(called, [window.slug])
         self.assertNotIn(order_id, engine.paper.ghosts)
+
+    def test_realized_stats_include_merges_in_open_windows(self) -> None:
+        engine = self._engine()
+        common = dict(condition_id="c", asset="BTC", timeframe="5m")
+        engine.ledger.record_resolution(
+            mode="paper", slug="closed", winner="Up", pnl="2", payout="3", **common,
+        )
+        engine.ledger.record_merge(mode="paper", slug="closed", pairs="1", pnl="5")
+        engine.ledger.record_merge(mode="paper", slug="still-open", pairs="2", pnl="1.5")
+        stats = engine.ledger.stats("paper")
+        self.assertEqual(stats["realized_pnl"], 3.5)
+        self.assertEqual(stats["merge_pnl"], 6.5)
+        self.assertEqual(stats["today_realized"], 3.5)
 
 
 if __name__ == "__main__":
