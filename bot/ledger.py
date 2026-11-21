@@ -105,6 +105,30 @@ class Ledger:
                     payout TEXT NOT NULL,
                     UNIQUE(mode, slug)
                 );
+                CREATE TABLE IF NOT EXISTS copies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    mode TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    tx TEXT NOT NULL,
+                    wallet_ts REAL NOT NULL,
+                    detected_at REAL NOT NULL,
+                    lag_s REAL NOT NULL,
+                    side TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    wallet_size TEXT NOT NULL,
+                    wallet_price TEXT NOT NULL,
+                    scale TEXT NOT NULL,
+                    scaled_size TEXT NOT NULL,
+                    carry TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    our_size TEXT NOT NULL DEFAULT '',
+                    our_price TEXT NOT NULL DEFAULT '',
+                    fee TEXT NOT NULL DEFAULT '',
+                    slippage TEXT NOT NULL DEFAULT '',
+                    levels TEXT NOT NULL DEFAULT ''
+                );
                 CREATE TABLE IF NOT EXISTS equity_points (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts REAL NOT NULL,
@@ -253,6 +277,50 @@ class Ledger:
                 {"ts": time.time(), "mode": mode, "equity": equity, "cash": cash, "realized": realized},
             )
             self.conn.commit()
+
+    def record_copy(self, **row: Any) -> None:
+        with self._lock:
+            self._insert(
+                "copies",
+                {
+                    "ts": row.get("ts", time.time()),
+                    "mode": row["mode"],
+                    "slug": row["slug"],
+                    "tx": row.get("tx", ""),
+                    "wallet_ts": row.get("wallet_ts", 0),
+                    "detected_at": row.get("detected_at", 0),
+                    "lag_s": row.get("lag_s", 0),
+                    "side": row.get("side", ""),
+                    "outcome": row.get("outcome", ""),
+                    "wallet_size": str(row.get("wallet_size", "")),
+                    "wallet_price": str(row.get("wallet_price", "")),
+                    "scale": str(row.get("scale", "")),
+                    "scaled_size": str(row.get("scaled_size", "")),
+                    "carry": str(row.get("carry", "")),
+                    "status": row.get("status", ""),
+                    "reason": row.get("reason", ""),
+                    "our_size": str(row.get("our_size", "")),
+                    "our_price": str(row.get("our_price", "")),
+                    "fee": str(row.get("fee", "")),
+                    "slippage": str(row.get("slippage", "")),
+                    "levels": row.get("levels", ""),
+                },
+            )
+            self.conn.commit()
+
+    def copies(self, mode: str, since: float | None = None, limit: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM copies WHERE mode = ?"
+        args: list[Any] = [mode]
+        if since is not None:
+            sql += " AND wallet_ts >= ?"
+            args.append(since)
+        sql += " ORDER BY id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(int(limit))
+        with self._lock:
+            rows = self.conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
 
     def fills(self, mode: str, since: float | None = None, limit: int | None = None) -> list[dict]:
         """Every fill, oldest first. ``limit`` None means the whole table."""
