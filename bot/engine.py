@@ -335,6 +335,9 @@ class TradingEngine:
             if not is_valid_wallet_address(self.cfg.copy_wallet):
                 self.paused = True
                 self._note("ERROR", "COPY_WALLET имеет неверный формат адреса. Копирование остановлено.", notify=True)
+            elif "BTC" not in self.cfg.enabled_assets or "5m" not in self.cfg.enabled_timeframes:
+                self.paused = True
+                self._note("ERROR", "Для copy_wallet обязательны BTC и 5m в ENABLED_ASSETS / ENABLED_TIMEFRAMES. Копирование остановлено.", notify=True)
             else:
                 self._note("INFO", f"COPY_WALLET target: {self.cfg.copy_wallet.lower()}")
         if self._preset_note:
