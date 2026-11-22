@@ -355,6 +355,24 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(recorded["reason"], "exposure cap")
         self.assertEqual(engine.portfolio.exposure_cost(), Decimal("0"))
 
+    def test_copy_is_rejected_if_market_closes_during_book_request(self) -> None:
+        cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        job = engine.copy.observe(_buy("0xclose-during-book", size="100"), now=1_000_050, cfg=cfg)
+
+        async def book(_token: str):
+            # Simulate a slow book request returning after the market closes.
+            window.end_ts = time.time() - 1
+            return [], [{"price": "0.70", "size": "10"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        self.assertEqual(engine.portfolio.exposure_cost(), Decimal("0"))
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "market closed")
+
     def test_a_worse_book_is_skipped_and_recorded(self) -> None:
         cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000)
         engine = TradingEngine(cfg)
