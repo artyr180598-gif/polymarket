@@ -19,6 +19,8 @@ from bot.copy_wallet import (
     ShadowBook,
     fee_for_lifts,
     is_target_wallet,
+    event_key,
+    is_valid_wallet_address,
     scale_size,
     walk_book,
 )
@@ -78,6 +80,30 @@ class WalletFilterTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertIsNone(book.observe(real, now=1_000_052, cfg=cfg))
         self.assertEqual(len(book.jobs), 1)
+
+    def test_distinct_fills_in_one_transaction_are_not_collapsed(self) -> None:
+        book = CopyBook()
+        cfg = _cfg()
+        first = _buy("0xmulti", size="10", price="0.40", ts=1_000_101)
+        second = _buy("0xmulti", size="20", price="0.41", ts=1_000_102)
+        one = book.observe(first, now=1_000_110, cfg=cfg)
+        two = book.observe(second, now=1_000_111, cfg=cfg)
+        self.assertIsNotNone(one)
+        self.assertIsNotNone(two)
+        self.assertNotEqual(one.event_id, two.event_id)
+        self.assertEqual(len(book.jobs), 2)
+        restored = CopyBook.from_dict(book.to_dict())
+        self.assertIsNone(restored.observe(first, now=1_000_120, cfg=cfg))
+        self.assertIsNone(restored.observe(second, now=1_000_121, cfg=cfg))
+
+    def test_legacy_tx_only_seen_state_is_still_honored(self) -> None:
+        book = CopyBook.from_dict({"seen_tx": ["0xlegacy"]})
+        self.assertIsNone(book.observe(_buy("0xlegacy"), now=1_000_120, cfg=_cfg()))
+
+    def test_wallet_address_validation(self) -> None:
+        self.assertTrue(is_valid_wallet_address(DEFAULT_WALLET))
+        self.assertFalse(is_valid_wallet_address("0x1234"))
+        self.assertFalse(is_valid_wallet_address("not-an-address"))
 
     def test_every_side_and_price_is_eligible(self) -> None:
         book = CopyBook()
@@ -214,6 +240,42 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(report["slip"], "0.03")
         self.assertEqual(report["copies"][0]["wallet_tx"], "0xfill")
 
+    def test_copy_fee_uses_the_market_fee_schedule(self) -> None:
+        cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        window.fee_rate = Decimal("0.01")
+        job = engine.copy.observe(_buy("0xmarketfee", size="100", price="0.70"), now=1_000_050, cfg=cfg)
+
+        async def book(_token: str):
+            return [], [{"price": "0.70", "size": "10"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        lot = engine.portfolio.markets[window.slug].lot("Up")
+        self.assertEqual(lot.fees, taker_fee_usdc(Decimal("10"), Decimal("0.70"), Decimal("0.01"), 1))
+
+    def test_partial_merge_is_not_reported_as_fully_filled(self) -> None:
+        cfg = _cfg(copy_scale=0.1, min_merge_shares=0.1)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        for outcome, shares in (("Up", "1"), ("Down", "0.5")):
+            engine.portfolio.buy_fill(
+                slug=window.slug, condition_id=window.condition_id, asset="BTC", timeframe="5m",
+                outcome=outcome, shares=Decimal(shares), price=Decimal("0.40"), fee=Decimal("0"),
+            )
+        row = {
+            "transaction_hash": "0xpartialmerge", "proxy_wallet": DEFAULT_WALLET,
+            "type": "MERGE", "slug": window.slug, "size": "10",
+            "timestamp": 1_000_100, "condition_id": window.condition_id,
+        }
+        job = engine.copy.observe(row, now=1_000_110, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_111))
+        recorded = engine.ledger.copies("paper")[0]
+        self.assertEqual(recorded["status"], "PARTIAL")
+        self.assertEqual(Decimal(recorded["our_size"]), Decimal("0.5"))
+        self.assertEqual(recorded["event_id"], job.event_id)
+
     def test_a_worse_book_is_skipped_and_recorded(self) -> None:
         cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000)
         engine = TradingEngine(cfg)
@@ -275,6 +337,61 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(restarted.halt_reason, "")
         self.assertTrue(restarted.paused)
         self.assertTrue(restarted.manual_pause)
+
+
+class _FakeResponse:
+    def __init__(self, payload, status=200, headers=None):
+        self.payload = payload
+        self.status = status
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def json(self, content_type=None):
+        return self.payload
+
+
+class _FakeSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, params=None):
+        self.calls.append((url, dict(params or {})))
+        return self.responses.pop(0)
+
+
+class WalletApiTests(unittest.TestCase):
+    def test_wallet_trade_pagination_does_not_stop_on_one_known_row(self) -> None:
+        engine = TradingEngine(_cfg())
+        known = _buy("0xknown", size="10", ts=1_000_100)
+        fresh = _buy("0xfresh", size="11", ts=1_000_101)
+        older = _buy("0xolder", size="12", ts=1_000_099)
+        engine.copy._remember(event_key(known))
+        engine._session = _FakeSession([
+            _FakeResponse({"data": [known, fresh], "pagination": {"has_more": True, "next_cursor": "next"}}),
+            _FakeResponse({"data": [older], "pagination": {"has_more": False, "next_cursor": None}}),
+        ])
+        rows = asyncio.run(engine._fetch_wallet_trades())
+        self.assertEqual([row["transaction_hash"] for row in rows], ["0xfresh", "0xolder"])
+        self.assertEqual(len(engine._session.calls), 2)
+
+    def test_wallet_api_retries_transient_server_errors(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([
+            _FakeResponse({}, status=500, headers={"Retry-After": "0"}),
+            _FakeResponse({"data": [], "pagination": {"has_more": False}}),
+        ])
+        with patch("bot.engine.asyncio.sleep", new=AsyncMock()) as sleep:
+            payload = asyncio.run(engine._wallet_api_page("https://example.test", {}, "test feed"))
+        self.assertEqual(payload["data"], [])
+        sleep.assert_awaited_once()
 
 
 class TapeReplayTests(unittest.TestCase):
