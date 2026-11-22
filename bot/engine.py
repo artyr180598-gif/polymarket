@@ -697,9 +697,15 @@ class TradingEngine:
             if end is not None and now > end + 30:
                 await self._skip_copy(job, "window unknown", now)
             return
+        if job.kind == "TRADE" and window is not None and (window.resolved or window.seconds_to_end <= 0):
+            await self._skip_copy(job, "market closed", now)
+            return
         scale = await self._copy_scale(now)
         if scale is None or scale <= 0:
             await self._skip_copy(job, "scale unknown", now)
+            return
+        if job.kind == "TRADE" and window is not None and (window.resolved or window.seconds_to_end <= 0):
+            await self._skip_copy(job, "market closed", now, scale=scale)
             return
         if job.kind == "REDEEM":
             if job.payout > 0:
@@ -729,10 +735,23 @@ class TradingEngine:
             )
             job.done = True
             return
-        held = self._held_shares(job.slug, job.outcome)
+        if not job.token_id:
+            await self._skip_copy(job, "missing token", now, scale=scale)
+            return
+        bids, asks = await self._book(job.token_id)
+        if window.resolved or window.seconds_to_end <= 0:
+            await self._skip_copy(job, "market closed", now, scale=scale)
+            return
+        if not bids and not asks:
+            end = _window_end(job.slug)
+            if end is not None and time.time() > end + 30:
+                await self._skip_copy(job, "empty book", now, scale=scale)
+            return
+        # Re-read inventory after the network await. The trade loop may have
+        # merged this window while the order book was being fetched.
         want = desired
         if job.side == "SELL":
-            want = min(desired, held)
+            want = min(desired, self._held_shares(job.slug, job.outcome))
             if want <= 0:
                 await self._record_copy(
                     job, now, scale, status="SKIPPED", reason="no inventory",
@@ -740,15 +759,6 @@ class TradingEngine:
                 )
                 job.done = True
                 return
-        if not job.token_id:
-            await self._skip_copy(job, "missing token", now, scale=scale)
-            return
-        bids, asks = await self._book(job.token_id)
-        if not bids and not asks:
-            end = _window_end(job.slug)
-            if end is not None and now > end + 30:
-                await self._skip_copy(job, "empty book", now, scale=scale)
-            return
         taken, why = walk_book(
             job.side, bids, asks, want, job.wallet_price, D(str(self.cfg.copy_max_slip)),
         )
@@ -892,8 +902,12 @@ class TradingEngine:
             )
         else:
             cost = usdc(desired)
-            if cost > self.portfolio.cash:
-                await self._record_copy(job, now, scale, status="SKIPPED", reason="not enough cash", scaled=desired, carry=carry)
+            blocked = self._copy_block_reason(job.slug, cost, cost)
+            if blocked:
+                await self._record_copy(
+                    job, now, scale, status="SKIPPED", reason=blocked,
+                    scaled=desired, carry=carry,
+                )
                 job.done = True
                 return
             try:
