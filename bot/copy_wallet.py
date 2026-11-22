@@ -49,6 +49,11 @@ def event_key(row: dict) -> str:
     fields = {
         "tx": tx,
         "id": str(row.get("id") or row.get("trade_id") or row.get("tradeId") or ""),
+        # Chain log identity is transaction + contract + log index. Multiple
+        # OrderFilled logs in one tx must remain separate events.
+        "log_index": str(row.get("log_index") or row.get("logIndex") or ""),
+        "contract": str(row.get("contract") or row.get("address") or row.get("exchange") or "").lower(),
+        "source": str(row.get("source") or "").lower(),
         "wallet": wallet_of(row),
         "slug": str(row.get("slug") or ""),
         "asset": str(row.get("asset") or row.get("token_id") or row.get("tokenId") or ""),
