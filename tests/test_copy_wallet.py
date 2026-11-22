@@ -496,6 +496,17 @@ class WalletApiTests(unittest.TestCase):
         self.assertEqual([row["transaction_hash"] for row in rows], ["0xfresh", "0xolder"])
         self.assertEqual(len(engine._session.calls), 2)
 
+    def test_order_book_http_failure_is_not_reported_as_empty_book(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([_FakeResponse({}, status=503)])
+        with self.assertRaisesRegex(RuntimeError, "order book HTTP 503"):
+            asyncio.run(engine._book("token-1"))
+
+    def test_order_book_valid_empty_response_remains_distinct(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([_FakeResponse({"bids": [], "asks": []})])
+        self.assertEqual(asyncio.run(engine._book("token-1")), ([], []))
+
     def test_wallet_api_retries_transient_server_errors(self) -> None:
         from unittest.mock import AsyncMock, patch
 
