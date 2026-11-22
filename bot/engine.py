@@ -261,6 +261,7 @@ class TradingEngine:
         self._session: aiohttp.ClientSession | None = None
         self._notify: Notify | None = None
         self._last_equity_ts = 0.0
+        self._last_activity_poll = 0.0
         self._live_prices: dict[str, Decimal] = {}
         self._live_left: dict[str, Decimal] = {}
         self._live_original: dict[str, Decimal] = {}
@@ -390,6 +391,8 @@ class TradingEngine:
             asyncio.create_task(self._trade_loop(), name="trade"),
             asyncio.create_task(self._housekeep_loop(), name="housekeep"),
         ]
+        if self.cfg.strategy == "copy_wallet":
+            self._tasks.append(asyncio.create_task(self._copy_wallet_loop(), name="copy-wallet"))
 
     async def stop(self) -> None:
         self.running = False
@@ -623,8 +626,6 @@ class TradingEngine:
                     if window.resolved:
                         continue
                     await self._on_window(window)
-                if self.cfg.strategy == "copy_wallet" and self.mode == "paper":
-                    await self._copy_wallet_tick()
                 if self.mode == "paper":
                     # No per-window tape here. Only the 60s cap can fire,
                     # which is what unblocks a window whose tape has gone quiet.
@@ -649,13 +650,31 @@ class TradingEngine:
             # The daily reset clears the halt only. A manual pause stays.
             self.halt_reason = ""
 
+    async def _copy_wallet_loop(self) -> None:
+        """Poll the target wallet independently of slower market-management work."""
+        while self.running:
+            try:
+                await self._copy_wallet_tick()
+            except Exception as exc:  # noqa: BLE001
+                self._note("ERROR", f"Копирование кошелька: {exc}")
+            await asyncio.sleep(1.0)
+
     async def _copy_wallet_tick(self) -> None:
         """Copy the target wallet's BTC 5m trades, merges and redeems."""
         if not is_valid_wallet_address(self.cfg.copy_wallet):
             return
+        # Trade fills are the latency-critical path. Fetch activity less often
+        # to avoid doubling public API load on every one-second poll.
+        rows_task = asyncio.create_task(self._fetch_wallet_trades())
+        activity = None
+        monotonic_now = time.monotonic()
+        if monotonic_now - self._last_activity_poll >= 5.0:
+            activity_task = asyncio.create_task(self._fetch_wallet_activity())
+            rows, activity = await asyncio.gather(rows_task, activity_task)
+            self._last_activity_poll = time.monotonic()
+        else:
+            rows = await rows_task
         now = time.time()
-        rows = await self._fetch_wallet_trades()
-        activity = await self._fetch_wallet_activity()
         incoming = list(rows or []) + [row for row in (activity or []) if str(row.get("type") or "").upper() != "TRADE"]
         if incoming:
             for row in reversed(incoming):
