@@ -275,6 +275,45 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(Decimal(recorded["our_size"]), Decimal("0.5"))
         self.assertEqual(recorded["event_id"], job.event_id)
 
+    def test_sell_rechecks_inventory_after_book_fetch_races_with_merge(self) -> None:
+        cfg = _cfg(copy_scale=0.1, min_merge_shares=0.1)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        for outcome in ("Up", "Down"):
+            engine.portfolio.buy_fill(
+                slug=window.slug, condition_id=window.condition_id, asset="BTC", timeframe="5m",
+                outcome=outcome, shares=Decimal("10"), price=Decimal("0.40"), fee=Decimal("0"),
+            )
+        job = engine.copy.observe(
+            _buy("0xsell-race", side="SELL", size="100"), now=1_000_051, cfg=cfg,
+        )
+
+        async def book(_token: str):
+            # Simulate the market loop merging the inventory while the copy
+            # worker is awaiting the network book response.
+            engine.portfolio.merge(window.slug, Decimal("10"))
+            return [{"price": "0.70", "size": "10"}], []
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "no inventory")
+        self.assertEqual(engine.portfolio.markets[window.slug].open_shares(), Decimal("0"))
+
+    def test_split_obeys_total_exposure_cap(self) -> None:
+        cfg = _cfg(copy_scale=1, max_total_exposure_usd=1, max_window_risk_usd=1000)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        row = _buy("0xsplit-cap", size="10")
+        row["type"] = "SPLIT"
+        job = engine.copy.observe(row, now=1_000_051, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        recorded = engine.ledger.copies("paper")[0]
+        self.assertEqual(recorded["status"], "SKIPPED")
+        self.assertEqual(recorded["reason"], "exposure cap")
+        self.assertEqual(engine.portfolio.exposure_cost(), Decimal("0"))
+
     def test_a_worse_book_is_skipped_and_recorded(self) -> None:
         cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000)
         engine = TradingEngine(cfg)
