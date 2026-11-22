@@ -1,11 +1,9 @@
-"""Exact paper copy of one wallet on BTC 5-minute markets. Never live.
+"""PAPER approximation of one wallet's public BTC 5-minute executions.
 
-Only a row whose own wallet field equals the target is a signal. The user
-query is not trusted by itself: a cached or shared page can contain other
-people. Size is the wallet's size times COPY_SCALE, with the fractional
-remainder carried per token so we never round up. Buys lift asks at or
-below the wallet's price. Sells hit bids at or above it. A worse book is
-skipped, not filled at an invented price.
+This observes completed public fills; it cannot see the wallet's resting
+orders or reproduce its maker queue. Our copy therefore crosses the book
+as a TAKER after the wallet has already filled. Only rows whose own wallet
+field matches the configured target are considered.
 """
 
 from __future__ import annotations
