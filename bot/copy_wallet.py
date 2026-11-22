@@ -294,7 +294,9 @@ class CopyBook:
             return None
         if kind == "TRADE" and (price <= 0 or price >= 1):
             return None
-        delay = float(cfg.copy_delay_s)
+        # A confirmed public fill should be acted on immediately; artificial
+        # COPY_DELAY_S only increases price divergence and is no longer applied.
+        delay = 0.0
         payout = D(row.get("usdc_size") or 0) if kind == "REDEEM" else _ZERO
         job = CopyJob(
             tx=tx,
