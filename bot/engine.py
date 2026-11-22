@@ -756,8 +756,16 @@ class TradingEngine:
             job.done = True
             return
         bids, asks = await self._book(job.token_id)
-        if window.resolved or now >= window.end_ts:
-            await self._skip_copy(job, "market closed", now, scale=scale)
+        # Network book retrieval can cross the market boundary. Use a fresh
+        # wall-clock timestamp after the await, not the tick's stale timestamp.
+        execution_now = time.time()
+        self._refresh_halt()
+        if self.paused or self.halt_reason:
+            reason = "paused" if self.paused else self.halt_reason
+            await self._skip_copy(job, reason, execution_now, scale=scale)
+            return
+        if window.resolved or execution_now >= window.end_ts:
+            await self._skip_copy(job, "market closed", execution_now, scale=scale)
             return
         if not bids and not asks:
             end = _window_end(job.slug)
