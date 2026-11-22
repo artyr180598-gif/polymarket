@@ -28,6 +28,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "pnl": "TEXT NOT NULL DEFAULT '0'",
         "payout": "TEXT NOT NULL DEFAULT '0'",
     },
+    "copies": {"event_id": "TEXT NOT NULL DEFAULT ''"},
     "equity_points": {"realized": "TEXT NOT NULL DEFAULT '0'"},
 }
 
@@ -111,6 +112,7 @@ class Ledger:
                     mode TEXT NOT NULL,
                     slug TEXT NOT NULL,
                     tx TEXT NOT NULL,
+                    event_id TEXT NOT NULL DEFAULT '',
                     wallet_ts REAL NOT NULL,
                     detected_at REAL NOT NULL,
                     lag_s REAL NOT NULL,
@@ -287,6 +289,7 @@ class Ledger:
                     "mode": row["mode"],
                     "slug": row["slug"],
                     "tx": row.get("tx", ""),
+                    "event_id": row.get("event_id", ""),
                     "wallet_ts": row.get("wallet_ts", 0),
                     "detected_at": row.get("detected_at", 0),
                     "lag_s": row.get("lag_s", 0),

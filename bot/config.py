@@ -74,7 +74,8 @@ class BotConfig:
     # 0.07 unless COPY_SCALE is a number. COPY_SCALE=auto uses equity / value.
     copy_scale: float = 0.07
     copy_scale_auto: bool = False
-    copy_delay_s: float = 1.0
+    # Legacy setting; wallet-copy fills are no longer artificially delayed.
+    copy_delay_s: float = 0.0
     copy_max_slip: float = 0.03
     enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
@@ -165,7 +166,7 @@ class BotConfig:
             strategy=strategy,
             copy_wallet=os.getenv(
                 "COPY_WALLET", "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
-            ).strip() or "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
+            ).strip().lower() or "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
             copy_min_price=_bounded("COPY_MIN_PRICE", "0.50", 0.01, 0.99),
             copy_max_price=_bounded("COPY_MAX_PRICE", "0.95", 0.01, 0.99),
             copy_min_t=max(0.0, float(os.getenv("COPY_MIN_T", "0"))),
@@ -174,7 +175,7 @@ class BotConfig:
             copy_max_per_window=max(1, int(os.getenv("COPY_MAX_PER_WINDOW", "3"))),
             copy_scale=scale,
             copy_scale_auto=scale_auto,
-            copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "1"))),
+            copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "0"))),
             copy_max_slip=max(0.0, float(os.getenv("COPY_MAX_SLIP", "0.03"))),
             enabled_assets=assets,
             enabled_timeframes=frames,

@@ -19,6 +19,8 @@ from bot.copy_wallet import (
     ShadowBook,
     fee_for_lifts,
     is_target_wallet,
+    event_key,
+    is_valid_wallet_address,
     scale_size,
     walk_book,
 )
@@ -79,6 +81,39 @@ class WalletFilterTests(unittest.TestCase):
         self.assertIsNone(book.observe(real, now=1_000_052, cfg=cfg))
         self.assertEqual(len(book.jobs), 1)
 
+    def test_distinct_fills_in_one_transaction_are_not_collapsed(self) -> None:
+        book = CopyBook()
+        cfg = _cfg()
+        first = _buy("0xmulti", size="10", price="0.40", ts=1_000_101)
+        second = _buy("0xmulti", size="20", price="0.41", ts=1_000_102)
+        one = book.observe(first, now=1_000_110, cfg=cfg)
+        two = book.observe(second, now=1_000_111, cfg=cfg)
+        self.assertIsNotNone(one)
+        self.assertIsNotNone(two)
+        self.assertNotEqual(one.event_id, two.event_id)
+        self.assertEqual(len(book.jobs), 2)
+        restored = CopyBook.from_dict(book.to_dict())
+        self.assertIsNone(restored.observe(first, now=1_000_120, cfg=cfg))
+        self.assertIsNone(restored.observe(second, now=1_000_121, cfg=cfg))
+
+    def test_chain_logs_in_same_transaction_have_distinct_event_keys(self) -> None:
+        base = _buy("0xonchain")
+        first = {**base, "source": "polygon", "contract": "0xexchange", "logIndex": 7}
+        second = {**base, "source": "polygon", "contract": "0xexchange", "logIndex": 8}
+        other_contract = {**first, "contract": "0xneg-risk"}
+        self.assertNotEqual(event_key(first), event_key(second))
+        self.assertNotEqual(event_key(first), event_key(other_contract))
+        self.assertEqual(event_key(first), event_key({**first, "log_index": "7"}))
+
+    def test_legacy_tx_only_seen_state_is_still_honored(self) -> None:
+        book = CopyBook.from_dict({"seen_tx": ["0xlegacy"]})
+        self.assertIsNone(book.observe(_buy("0xlegacy"), now=1_000_120, cfg=_cfg()))
+
+    def test_wallet_address_validation(self) -> None:
+        self.assertTrue(is_valid_wallet_address(DEFAULT_WALLET))
+        self.assertFalse(is_valid_wallet_address("0x1234"))
+        self.assertFalse(is_valid_wallet_address("not-an-address"))
+
     def test_every_side_and_price_is_eligible(self) -> None:
         book = CopyBook()
         cfg = _cfg()
@@ -89,13 +124,12 @@ class WalletFilterTests(unittest.TestCase):
         self.assertTrue(all(job is not None for job in (cheap, other, sell, fourth)))
         self.assertEqual(len(book.jobs), 4)
 
-    def test_the_copy_waits_for_the_delay(self) -> None:
+    def test_detected_fill_is_due_immediately_even_with_legacy_delay_setting(self) -> None:
         book = CopyBook()
         cfg = _cfg(copy_delay_s=1)
         job = book.observe(_buy("0xabc"), now=5_000, cfg=cfg)
-        self.assertEqual(job.execute_at, 5_001)
-        self.assertEqual(book.due(5_000.9), [])
-        self.assertEqual(book.due(5_001), [job])
+        self.assertEqual(job.execute_at, 5_000)
+        self.assertEqual(book.due(5_000), [job])
 
 
 class ScaleAndBookTests(unittest.TestCase):
@@ -214,6 +248,140 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(report["slip"], "0.03")
         self.assertEqual(report["copies"][0]["wallet_tx"], "0xfill")
 
+    def test_missing_token_does_not_consume_size_carry_or_shadow(self) -> None:
+        cfg = _cfg(copy_scale=0.1)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        row = _buy("0xmissing-token", size="100")
+        row.pop("token_id")
+        job = engine.copy.observe(row, now=1_000_050, cfg=cfg)
+        self.assertIsNotNone(job)
+        job.token_id = ""
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        self.assertTrue(job.done)
+        self.assertEqual(engine.copy.carry, {})
+        self.assertEqual(engine.copy.sized, {})
+        self.assertEqual(engine.copy.shadow.cumulative(), Decimal("0"))
+        recorded = engine.ledger.copies("paper")[0]
+        self.assertEqual(recorded["status"], "SKIPPED")
+        self.assertEqual(recorded["reason"], "missing token")
+
+    def test_copy_fee_uses_the_market_fee_schedule(self) -> None:
+        cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        window.fee_rate = Decimal("0.01")
+        job = engine.copy.observe(_buy("0xmarketfee", size="100", price="0.70"), now=1_000_050, cfg=cfg)
+
+        async def book(_token: str):
+            return [], [{"price": "0.70", "size": "10"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        lot = engine.portfolio.markets[window.slug].lot("Up")
+        self.assertEqual(lot.fees, taker_fee_usdc(Decimal("10"), Decimal("0.70"), Decimal("0.01"), 1))
+
+    def test_partial_merge_is_not_reported_as_fully_filled(self) -> None:
+        cfg = _cfg(copy_scale=0.1, min_merge_shares=0.1)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        for outcome, shares in (("Up", "1"), ("Down", "0.5")):
+            engine.portfolio.buy_fill(
+                slug=window.slug, condition_id=window.condition_id, asset="BTC", timeframe="5m",
+                outcome=outcome, shares=Decimal(shares), price=Decimal("0.40"), fee=Decimal("0"),
+            )
+        row = {
+            "transaction_hash": "0xpartialmerge", "proxy_wallet": DEFAULT_WALLET,
+            "type": "MERGE", "slug": window.slug, "size": "10",
+            "timestamp": 1_000_100, "condition_id": window.condition_id,
+        }
+        job = engine.copy.observe(row, now=1_000_110, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_111))
+        recorded = engine.ledger.copies("paper")[0]
+        self.assertEqual(recorded["status"], "PARTIAL")
+        self.assertEqual(Decimal(recorded["our_size"]), Decimal("0.5"))
+        self.assertEqual(recorded["event_id"], job.event_id)
+
+    def test_sell_rechecks_inventory_after_book_fetch_races_with_merge(self) -> None:
+        cfg = _cfg(copy_scale=0.1, min_merge_shares=0.1)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        for outcome in ("Up", "Down"):
+            engine.portfolio.buy_fill(
+                slug=window.slug, condition_id=window.condition_id, asset="BTC", timeframe="5m",
+                outcome=outcome, shares=Decimal("10"), price=Decimal("0.40"), fee=Decimal("0"),
+            )
+        job = engine.copy.observe(
+            _buy("0xsell-race", side="SELL", size="100"), now=1_000_051, cfg=cfg,
+        )
+
+        async def book(_token: str):
+            # Simulate the market loop merging the inventory while the copy
+            # worker is awaiting the network book response.
+            engine.portfolio.merge(window.slug, Decimal("10"))
+            return [{"price": "0.70", "size": "10"}], []
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "no inventory")
+        self.assertEqual(engine.portfolio.markets[window.slug].open_shares(), Decimal("0"))
+
+    def test_auto_scale_value_lookup_uses_backoff_after_failure(self) -> None:
+        from unittest.mock import AsyncMock
+
+        engine = TradingEngine(_cfg(copy_scale_auto=True))
+        lookup = AsyncMock(return_value=None)
+        engine._wallet_portfolio_value = lookup  # type: ignore[method-assign]
+        now = time.time()
+        self.assertIsNone(asyncio.run(engine._copy_scale(now)))
+        self.assertIsNone(asyncio.run(engine._copy_scale(now)))
+        lookup.assert_awaited_once()
+
+    def test_auto_scale_api_failure_keeps_copy_event_pending(self) -> None:
+        from unittest.mock import AsyncMock
+
+        cfg = _cfg(copy_scale_auto=True)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xscale-outage"), now=1_000_051, cfg=cfg)
+        engine._copy_scale = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        self.assertFalse(job.done)
+        self.assertEqual(engine.ledger.copies("paper"), [])
+
+    def test_split_obeys_total_exposure_cap(self) -> None:
+        cfg = _cfg(copy_scale=1, max_total_exposure_usd=1, max_window_risk_usd=1000)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        row = _buy("0xsplit-cap", size="10")
+        row["type"] = "SPLIT"
+        job = engine.copy.observe(row, now=1_000_051, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        recorded = engine.ledger.copies("paper")[0]
+        self.assertEqual(recorded["status"], "SKIPPED")
+        self.assertEqual(recorded["reason"], "exposure cap")
+        self.assertEqual(engine.portfolio.exposure_cost(), Decimal("0"))
+
+    def test_copy_is_rejected_if_market_closes_during_book_request(self) -> None:
+        cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        job = engine.copy.observe(_buy("0xclose-during-book", size="100"), now=1_000_050, cfg=cfg)
+
+        async def book(_token: str):
+            # Simulate a slow book request returning after the market closes.
+            window.end_ts = time.time() - 1
+            return [], [{"price": "0.70", "size": "10"}]
+
+        engine._book = book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        self.assertEqual(engine.portfolio.exposure_cost(), Decimal("0"))
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "market closed")
+
     def test_a_worse_book_is_skipped_and_recorded(self) -> None:
         cfg = _cfg(copy_scale=1, max_window_risk_usd=10000, max_total_exposure_usd=10000)
         engine = TradingEngine(cfg)
@@ -259,6 +427,16 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(engine.snapshot()["copy_scale"], "0.07")
         self.assertEqual(engine.snapshot()["copy_max_slip"], 0.03)
 
+    def test_resume_cannot_override_an_active_daily_loss_halt(self) -> None:
+        cfg = _cfg(strategy="maker_ladder", auto_start=True, max_daily_loss_usd=100)
+        engine = TradingEngine(cfg)
+        engine.portfolio.cash -= Decimal("150")
+        engine.pause()
+        engine.resume()
+        self.assertTrue(engine.paused)
+        self.assertTrue(engine.manual_pause)
+        self.assertIn("дневной лимит", engine.halt_reason)
+
     def test_manual_pause_survives_restart_and_the_daily_reset(self) -> None:
         cfg = _cfg(strategy="maker_ladder", auto_start=True, copy_scale=None)
         engine = TradingEngine(cfg)
@@ -275,6 +453,78 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(restarted.halt_reason, "")
         self.assertTrue(restarted.paused)
         self.assertTrue(restarted.manual_pause)
+
+
+class _FakeResponse:
+    def __init__(self, payload, status=200, headers=None):
+        self.payload = payload
+        self.status = status
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def json(self, content_type=None):
+        return self.payload
+
+
+class _FakeSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, params=None):
+        self.calls.append((url, dict(params or {})))
+        return self.responses.pop(0)
+
+
+class WalletApiTests(unittest.TestCase):
+    def test_wallet_trade_pagination_does_not_stop_on_one_known_row(self) -> None:
+        engine = TradingEngine(_cfg())
+        known = _buy("0xknown", size="10", ts=1_000_100)
+        fresh = _buy("0xfresh", size="11", ts=1_000_101)
+        older = _buy("0xolder", size="12", ts=1_000_099)
+        engine.copy._remember(event_key(known))
+        engine._session = _FakeSession([
+            _FakeResponse({"data": [known, fresh], "pagination": {"has_more": True, "next_cursor": "next"}}),
+            _FakeResponse({"data": [older], "pagination": {"has_more": False, "next_cursor": None}}),
+        ])
+        rows = asyncio.run(engine._fetch_wallet_trades())
+        self.assertEqual([row["transaction_hash"] for row in rows], ["0xfresh", "0xolder"])
+        self.assertEqual(len(engine._session.calls), 2)
+
+    def test_order_book_http_failure_is_not_reported_as_empty_book(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([_FakeResponse({}, status=503)])
+        with self.assertRaisesRegex(RuntimeError, "order book HTTP 503"):
+            asyncio.run(engine._book("token-1"))
+
+    def test_order_book_valid_empty_response_remains_distinct(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([_FakeResponse({"bids": [], "asks": []})])
+        self.assertEqual(asyncio.run(engine._book("token-1")), ([], []))
+
+    def test_order_book_malformed_payload_is_not_treated_as_empty(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([_FakeResponse({"data": []})])
+        with self.assertRaisesRegex(ValueError, "invalid shape"):
+            asyncio.run(engine._book("token-1"))
+
+    def test_wallet_api_retries_transient_server_errors(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([
+            _FakeResponse({}, status=500, headers={"Retry-After": "0"}),
+            _FakeResponse({"data": [], "pagination": {"has_more": False}}),
+        ])
+        with patch("bot.engine.asyncio.sleep", new=AsyncMock()) as sleep:
+            payload = asyncio.run(engine._wallet_api_page("https://example.test", {}, "test feed"))
+        self.assertEqual(payload["data"], [])
+        sleep.assert_awaited_once()
 
 
 class TapeReplayTests(unittest.TestCase):

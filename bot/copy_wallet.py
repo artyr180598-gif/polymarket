@@ -1,17 +1,17 @@
-"""Exact paper copy of one wallet on BTC 5-minute markets. Never live.
+"""PAPER approximation of one wallet's public BTC 5-minute executions.
 
-Only a row whose own wallet field equals the target is a signal. The user
-query is not trusted by itself: a cached or shared page can contain other
-people. Size is the wallet's size times COPY_SCALE, with the fractional
-remainder carried per token so we never round up. Buys lift asks at or
-below the wallet's price. Sells hit bids at or above it. A worse book is
-skipped, not filled at an invented price.
+This observes completed public fills; it cannot see the wallet's resting
+orders or reproduce its maker queue. Our copy therefore crosses the book
+as a TAKER after the wallet has already filled. Only rows whose own wallet
+field matches the configured target are considered.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+import hashlib
+import json
 
 from .accounting import D, floor_to_step, usdc
 from .books import parse_levels
@@ -32,6 +32,44 @@ def is_target_wallet(row: dict, target: str) -> bool:
     return bool(found) and found == str(target or "").strip().lower()
 
 
+def is_valid_wallet_address(value: str) -> bool:
+    address = str(value or "").strip()
+    return (
+        len(address) == 42
+        and address[:2].lower() == "0x"
+        and all(char in "0123456789abcdefABCDEF" for char in address[2:])
+    )
+
+
+def event_key(row: dict) -> str:
+    """Stable identity for one wallet fill/activity, not merely its tx hash."""
+    tx = str(row.get("transaction_hash") or row.get("transactionHash") or "").strip().lower()
+    if not tx:
+        return ""
+    fields = {
+        "tx": tx,
+        "id": str(row.get("id") or row.get("trade_id") or row.get("tradeId") or ""),
+        # Chain log identity is transaction + contract + log index. Multiple
+        # OrderFilled logs in one tx must remain separate events.
+        "log_index": str(row.get("log_index") or row.get("logIndex") or ""),
+        "contract": str(row.get("contract") or row.get("address") or row.get("exchange") or "").lower(),
+        "source": str(row.get("source") or "").lower(),
+        "wallet": wallet_of(row),
+        "slug": str(row.get("slug") or ""),
+        "asset": str(row.get("asset") or row.get("token_id") or row.get("tokenId") or ""),
+        "condition": str(row.get("condition_id") or row.get("conditionId") or ""),
+        "type": str(row.get("type") or "TRADE").upper(),
+        "side": str(row.get("side") or "").upper(),
+        "outcome": str(row.get("outcome") or ""),
+        "price": str(row.get("price") or ""),
+        "size": str(row.get("size") or ""),
+        "timestamp": str(row.get("timestamp") or ""),
+        "usdc_size": str(row.get("usdc_size") or row.get("usdcSize") or ""),
+    }
+    encoded = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "evt:" + hashlib.sha256(encoded).hexdigest()
+
+
 @dataclass
 class CopyJob:
     tx: str
@@ -48,10 +86,12 @@ class CopyJob:
     execute_at: float
     done: bool = False
     payout: Decimal = _ZERO
+    event_id: str = ""
 
     def to_dict(self) -> dict:
         return {
             "tx": self.tx,
+            "event_id": self.event_id,
             "slug": self.slug,
             "outcome": self.outcome,
             "token_id": self.token_id,
@@ -71,6 +111,7 @@ class CopyJob:
     def from_dict(cls, raw: dict) -> "CopyJob":
         return cls(
             tx=str(raw.get("tx") or ""),
+            event_id=str(raw.get("event_id") or ""),
             slug=str(raw.get("slug") or ""),
             outcome=str(raw.get("outcome") or ""),
             token_id=str(raw.get("token_id") or ""),
@@ -222,9 +263,12 @@ class CopyBook:
         """
         if not is_target_wallet(row, cfg.copy_wallet):
             return None
-        tx = str(row.get("transaction_hash") or "")
-        if not tx or tx in self._seen:
+        tx = str(row.get("transaction_hash") or row.get("transactionHash") or "").strip()
+        event_id = event_key(row)
+        # Legacy snapshots stored transaction hashes only; honor them during migration.
+        if not tx or not event_id or event_id in self._seen or tx in self._seen:
             return None
+        self._remember(event_id)
         kind = str(row.get("type") or "TRADE").upper()
         if kind == "TRADE":
             kind = "TRADE"
@@ -255,11 +299,13 @@ class CopyBook:
             return None
         if kind == "TRADE" and (price <= 0 or price >= 1):
             return None
-        self._remember(tx)
-        delay = float(cfg.copy_delay_s)
+        # A confirmed public fill should be acted on immediately; artificial
+        # COPY_DELAY_S only increases price divergence and is no longer applied.
+        delay = 0.0
         payout = D(row.get("usdc_size") or 0) if kind == "REDEEM" else _ZERO
         job = CopyJob(
             tx=tx,
+            event_id=event_id,
             slug=slug,
             outcome=outcome,
             token_id=str(row.get("token_id") or row.get("asset") or ""),
