@@ -156,6 +156,32 @@ function money(v){
   return sign + "$" + n.toFixed(2);
 }
 function cls(v){ return Number(v) >= 0 ? "pos" : "neg"; }
+function outcomeName(v){
+  if (v === "Up") return "Вверх";
+  if (v === "Down") return "Вниз";
+  if (v === "Yes") return "Да";
+  if (v === "No") return "Нет";
+  return v || "—";
+}
+function copyCard(s){
+  const c = s.copy;
+  if (!c) return "";
+  const n = c.counters || {};
+  const bits = [
+    ["Кошелёк", String(c.target_wallet || "").slice(0, 10) + "…"],
+    ["Размер", c.size_mode === "exact" ? "1:1" : (c.size_mode === "fixed" ? ("фикс " + s.copy_scale) : ("×" + s.copy_scale))],
+    ["Опрос", c.poll_s + " с"],
+    ["Старт", c.seeded ? (c.activity_seeded ? "идёт" : "сделки идут, активность нет") : "ждёт первую ленту"],
+    ["Сделок скопировано", (n.filled || 0) + " · частично " + (n.partial || 0)],
+    ["MERGE / SPLIT / REDEEM", (n.merged || 0) + " / " + (n.split || 0) + " / " + (n.redeemed || 0)],
+    ["Пропущено", String(n.skipped || 0)],
+    ["Не копируется", (n.unsupported || 0) + " тип · " + (n.filtered || 0) + " вне фильтра"],
+    ["Ошибки ленты", String(n.feed_errors || 0)],
+    ["В очереди", String(c.pending || 0)],
+    ["Задержка", (c.last_lag_s || 0) + " с"],
+  ].map(function (pair) { return '<div class="row"><span>'+pair[0]+'</span><span>'+pair[1]+'</span></div>'; }).join("");
+  return card("Копирование кошелька", bits);
+}
 async function api(path, opts){
   const headers = Object.assign({"Content-Type":"application/json"}, (opts&&opts.headers)||{});
   if (pin) headers["X-Bot-Pin"] = pin;
@@ -203,27 +229,28 @@ function render(){
       metric("Всё время", money(s.pnl_all), cls(s.pnl_all)) +
       metric("В позициях", "$"+Number(s.exposure).toFixed(2), "") +
       '</div>' +
+      copyCard(s) +
       card("Как заработано", '<div class="row"><span>Реализовано</span><b class="'+cls(s.realized)+'">'+money(s.realized)+'</b></div><div class="row"><span>Оценка открытого</span><b class="'+cls(s.unrealized)+'">'+money(s.unrealized)+'</b></div>'+(s.shadow_pnl!=null?'<div class="row"><span>Тень кошелька × масштаб</span><b class="'+cls(s.shadow_pnl)+'">'+money(s.shadow_pnl)+'</b></div><div class="row"><span>Масштаб</span><span>'+s.copy_scale+'</span></div><div class="row"><span>Допуск цены</span><span>'+s.copy_max_slip+'</span></div>':'')+'<div class="row"><span>Комиссия тейкера</span><span>$'+Number(s.fees_paid||0).toFixed(2)+'</span></div><div class="row"><span>Ребейт мейкера</span><span>'+money(s.maker_rebates||0)+'</span></div><div class="row"><span>Ребейт тейкера</span><span>'+money(s.taker_rebates||0)+'</span></div><div class="row"><span>Награды</span><span>'+money(s.liquidity_rewards||0)+'</span></div><div class="row"><span>В заявках</span><span>$'+Number(s.reserved).toFixed(2)+'</span></div>');
   } else if (tab === "positions") {
     const rows = s.positions || [];
-    el.innerHTML = rows.length ? '<p><small>Открыто позиций: '+rows.length+'</small></p>' + rows.map(p => card(p.asset+" "+p.timeframe+" · "+(p.outcome==="Up"?"Вверх":"Вниз"),
+    el.innerHTML = rows.length ? '<p><small>Открыто позиций: '+rows.length+'</small></p>' + rows.map(p => card(p.asset+" "+p.timeframe+" · "+outcomeName(p.outcome),
       '<div class="row"><span>Штук</span><span>'+p.shares+'</span></div><div class="row"><span>Вход</span><span>'+p.avg_price+'</span></div><div class="row"><span>Сейчас</span><span>'+p.mark+'</span></div><div class="row"><span>Результат</span><b class="'+cls(p.unrealized)+'">'+money(p.unrealized)+'</b></div>')).join("")
       : card("Позиции", "<p>Открытых позиций нет.</p>");
   } else if (tab === "trades") {
     const fills = s.fills || [];
     el.innerHTML = fills.length ? card("Последние сделки", fills.slice(0,20).map(f =>
-      '<div class="row"><span>'+(f.outcome==="Up"?"Вверх":"Вниз")+' '+f.asset+' '+Number(f.shares).toFixed(2)+' @ '+f.price+'</span><span>комиссия '+f.fee+'</span></div>').join(""))
+      '<div class="row"><span>'+outcomeName(f.outcome)+' '+f.asset+' '+Number(f.shares).toFixed(2)+' @ '+f.price+'</span><span>комиссия '+f.fee+'</span></div>').join(""))
       : card("Сделки", "<p>Пока пусто.</p>");
     const merges = s.merges || [];
     if (merges.length) el.innerHTML += card("MERGE", merges.slice(0,10).map(m => '<div class="row"><span>'+m.slug+'</span><b class="'+cls(m.pnl)+'">'+money(m.pnl)+'</b></div>').join(""));
     const ress = s.resolutions || [];
     if (ress.length) el.innerHTML += card("Итоги окон", ress.slice(0,10).map(r => {
-      const who = r.winner === "Up" ? "Вверх" : (r.winner === "Down" ? "Вниз" : r.winner);
+      const who = outcomeName(r.winner);
       return '<div class="row"><span>'+who+' · выплата $'+Number(r.payout||0).toFixed(2)+'</span><b class="'+cls(r.pnl)+'">'+money(r.pnl)+'</b></div>';
     }).join(""));
     const copies = s.copies || [];
     if (copies.length) el.innerHTML += card("Копии кошелька", copies.slice().reverse().slice(0, 20).map(function (c) {
-      const who = c.outcome === "Up" ? "Вверх" : (c.outcome === "Down" ? "Вниз" : c.side);
+      const who = outcomeName(c.outcome) || c.side;
       const tail = c.status === "FILLED"
         ? (c.our_size + " @ " + c.our_price)
         : (c.status + " " + (c.reason || "") + (c.our_size ? (" · " + c.our_size + " @ " + c.our_price) : ""));
@@ -234,7 +261,7 @@ function render(){
     const rows = s.breakdown || [];
     el.innerHTML = rows.length ? card("Закрытые окна", rows.map(r => '<div class="row"><span>'+r.bucket+' · '+r.markets+' окон</span><b class="'+cls(r.pnl)+'">$'+Number(r.pnl).toFixed(2)+'</b></div>').join(""))
       : card("Рынки", "<p>Закрытых окон ещё нет.</p>");
-    const wins = (s.windows||[]).map(w => '<div class="row"><span>'+w.asset+' '+w.timeframe+'</span><span>'+Math.max(0, Math.round(w.seconds_to_end))+' с'+(w.quoting?" · котирует":"")+'</span></div>').join("");
+    const wins = (s.windows||[]).map(w => '<div class="row"><span>'+w.asset+' '+w.timeframe+'<br><small>'+(w.slug||"")+'</small></span><span>'+(w.seconds_to_end == null ? "?" : Math.max(0, Math.round(w.seconds_to_end))+" с")+(w.quoting?" · котирует":(w.copying?" · копируется":""))+'</span></div>').join("");
     el.innerHTML += card("Сейчас открыты", wins || "<p>Нет активных окон.</p>");
   } else if (tab === "stats") {
     const st = s.stats || {};
@@ -266,7 +293,8 @@ function render(){
     el.innerHTML = card("Управление", '<div class="actions"><button id="resume">Старт</button><button id="pause" class="ghost">Пауза</button><button id="kill" class="ghost">Стоп</button></div><p><small>Стоп снимает заявки и сливает уже набранные пары в доллары. Открытый остаток ждёт итога окна.</small></p>');
     document.getElementById("resume").onclick = () => act("/api/action/resume");
     document.getElementById("pause").onclick = () => act("/api/action/pause");
-    document.getElementById("kill").onclick = () => { if (confirm("Снять заявки и слить пары?")) act("/api/action/kill"); };
+    const killText = s.copy ? "Остановить копирование? Открытые позиции останутся до итога рынка." : "Снять заявки и слить пары?";
+    document.getElementById("kill").onclick = () => { if (confirm(killText)) act("/api/action/kill"); };
   }
 }
 function edgeCard(s){

@@ -168,6 +168,19 @@ class TelegramController:
             f"Ребейт тейкера: ${_money(snap.get('taker_rebates'))}",
             f"Награды ликвидности: ${_money(snap.get('liquidity_rewards'))}",
         ]
+        copy = snap.get("copy") or {}
+        if copy:
+            counters = copy.get("counters") or {}
+            lines += [
+                "",
+                f"Копия кошелька: {str(copy.get('target_wallet') or '')[:10]}…",
+                f"Размер: {copy.get('size_mode')} · опрос {copy.get('poll_s')} с",
+                f"Скопировано: {counters.get('filled', 0)}"
+                f" · частично {counters.get('partial', 0)}"
+                f" · пропущено {counters.get('skipped', 0)}",
+                f"В очереди: {copy.get('pending', 0)}"
+                f" · задержка {copy.get('last_lag_s', 0)} с",
+            ]
         if snap.get("halt_reason"):
             lines.append(f"Причина стопа: {snap.get('halt_reason')}")
         windows = snap.get("windows") or []

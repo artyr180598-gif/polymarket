@@ -1,71 +1,125 @@
 # PolyBot
 
-Бумажный, по желанию боевой бот для крипто-окон Polymarket Up/Down.
-Стратегия снята с кошелька [mo-money](https://polymarket.com/profile/0x32ed2e546b187ca15e2841edc82b22c713cf8ec3).
-Разбор с цифрами: [docs/STRATEGY_ANALYSIS.md](docs/STRATEGY_ANALYSIS.md).
+Бумажный бот для Polymarket. По умолчанию он **копирует один кошелёк 1:1**:
+[0x32ed…8ec3](https://polymarket.com/profile/0x32ed2e546b187ca15e2841edc82b22c713cf8ec3).
+Каждая публичная сделка, MERGE, SPLIT и REDEEM этого кошелька повторяется на
+демо-счёте тем же числом штук, в том же рынке и в ту же сторону. Реальные деньги
+не используются: стратегия `copy_wallet` работает только в paper.
 
-Бот ставит лестницу пост-онли заявок на покупку от 1¢ до 98¢, обе стороны вместе не дороже 99¢,
-пары дешевле $1 меняет на $1, остаток забирает после официального итога. Продаж нет.
-По умолчанию только BTC, окна 5 и 15 минут.
+Разбор исходной мейкер-стратегии с цифрами:
+[docs/STRATEGY_ANALYSIS.md](docs/STRATEGY_ANALYSIS.md). Она осталась как
+`STRATEGY=maker_ladder`.
 
-Старт всегда в бумажном режиме. Боевой режим не включается без ключей и проверки геоблока.
+## Как работает копирование
+
+1. Каждые `COPY_POLL_S` секунд (по умолчанию 0.5 с) читаются две ленты Data API:
+   сделки и активность кошелька (MERGE / SPLIT / REDEEM). Обе стороны — maker и
+   taker — запрашиваются отдельно, иначе часть истории теряется.
+2. Первый успешный опрос — это точка отсчёта: старая история не копируется
+   (`COPY_SEED_ON_START=true`). Дальше каждое новое событие ставится в очередь
+   сразу, без искусственной задержки.
+3. Размер в режиме `exact` — ровно столько штук, сколько купил кошелёк, с шагом
+   0.01. Остаток меньше шага переносится на следующую сделку того же
+   `token|side`, а филл меньше рыночного минимума накапливается, пока не станет
+   исполнимым. `COPY_SIZE_MODE=scale` (штуки × `COPY_SCALE`) и `fixed`
+   (`COPY_SHARES`) остались как альтернативы.
+4. Покупка идёт тейкером по стакану CLOB, но не дороже
+   `цена кошелька + COPY_MAX_SLIP`. Если стакан хуже, событие записывается как
+   `SKIPPED` с причиной, а не как фиктивная сделка.
+5. MERGE/SPLIT/REDEEM повторяются с тем же числом пар. REDEEM кошелька закрывает
+   нашу позицию по тому же победителю.
+6. Идентичность события — хеш транзакции + контракт + log index + поля строки.
+   Повторный опрос, рестарт и две ленты не могут применить одно событие дважды:
+   применённые id лежат в SQLite, очередь незавершённых событий пишется каждую
+   секунду, а `was_applied` проверяется прямо перед филлом.
+7. Учёт двойной записи: `equity = cash + reserved + mark-to-market`,
+   `unrealized = equity − initial − realized`. Комиссии тейкера списываются один
+   раз на филле, MERGE возвращает $1 за пару, REDEEM платит $1 за выигрышную
+   штуку. Ничего не округляется в свою пользу.
+
+Панель показывает карточку «Копирование кошелька»: цель, режим размера, опрос,
+очередь, задержку и счётчики filled/partial/skipped. Каждая копия видна в
+«Сделки → Копии кошелька».
+
+### Банк
+
+`BANKROLL_USD` по умолчанию 2750. Новая база стартует ровно с этой суммой, а
+уже созданная база хранит свою стартовую сумму — менять переменную на лету она
+не будет. Кошелёк держит несколько окон одновременно, поэтому при 1:1 банк
+должен покрывать все; если строки получают `SKIPPED / not enough cash`,
+увеличьте `BANKROLL_USD` — это учебные деньги. Чтобы начать новый демо-счёт,
+удалите файл `DB_PATH`.
+
+### Стопы
+
+Для 1:1 по умолчанию выключены дневной лимит убытка и серия убытков
+(`COPY_USE_RISK_LIMITS=false`): копия не должна вставать из-за плохого дня демо.
+Свободные деньги проверяются всегда. Дополнительные потолки —
+`COPY_WINDOW_CAP_USD` и `COPY_EXPOSURE_CAP_USD` (0 = без потолка).
 
 ## Переменные
 
-Имена прежние. Новые не обязательны.
+Полный список с комментариями: [.env.example](.env.example). Главное:
 
 ```
-TRADING_MODE=paper          # paper | live
-DRY_RUN=false               # true принудительно оставляет бумажный режим
+TRADING_MODE=paper          # paper | live, copy_wallet всегда paper
 BANKROLL_USD=2750           # стартовый бумажный банк
-STRATEGY_PRESET=mo_money    # lockin и hybrid больше не отдельные стратегии
-ENABLED_ASSETS=BTC
-ENABLED_TIMEFRAMES=5m,15m
-ORDER_CLIP_USD=16
-MAX_WINDOW_RISK_USD=140
-MAX_TOTAL_EXPOSURE_USD=420
-MAX_DAILY_LOSS_USD=160
-MAX_CONSECUTIVE_LOSSES=10
-MIN_MERGE_SHARES=1
-ONCHAIN_GAS_USD=0           # вычитается на live merge/redeem, если нет релеера
+STRATEGY=copy_wallet        # copy_wallet | maker_ladder
+COPY_WALLET=0x32ed2e546b187ca15e2841edc82b22c713cf8ec3
+COPY_SIZE_MODE=exact        # exact (1:1) | scale | fixed
+COPY_SCALE=0.07             # только для scale
+COPY_SLUG_PREFIXES=         # пусто = все рынки кошелька
+COPY_MAX_SLIP=0.03
+COPY_POLL_S=0.5
+COPY_ACTIVITY_POLL_S=5
+COPY_SEED_ON_START=true
+COPY_LATE_GRACE_S=5         # сделки последних секунд окна
+COPY_MAX_ATTEMPTS=5
+COPY_SEEN_LIMIT=20000
+COPY_USE_RISK_LIMITS=false
 DB_PATH=/data/polybot.db
 DASHBOARD_PIN=
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ```
 
-Боевые ключи те же: `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`,
-ключи релеера и билдера. Без релеера газ задаётся `ONCHAIN_GAS_USD`, иначе в учёте он 0.
+Другие кошельки: `COPY_WALLET=<адрес>`. Сузить рынки:
+`COPY_SLUG_PREFIXES=btc-updown-5m,eth-updown`.
 
 `STRATEGY_PRESET=lockin` или `hybrid` больше не переключает логику: оба значения
-пишут предупреждение и работают как mo-money. Отдельных движков под ними не было.
-
-Бумажный капитал и позиции пишутся в SQLite и поднимаются после рестарта.
-Чистый старт — удалить файл базы.
+пишут предупреждение и работают как mo-money.
 
 ## Запуск
 
-Railway: Dockerfile, healthcheck `/api/health`, том на `/data`.
-Регион `eu-west1`. Процесс слушает `PORT`.
+Railway: Dockerfile, healthcheck `/api/health`, том на `/data`, регион `eu-west1`.
+Процесс слушает `PORT`.
 
 Локально:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m unittest discover -s tests
+python -m unittest discover -s tests   # 142 теста, сеть не нужна
 python main.py
 ```
 
+Веб-панель — на `http://localhost:8080`, PIN — `DASHBOARD_PIN`.
 Панель на телефоне: Safari → URL сервиса → PIN → «На экран Домой».
 Инструкция: [GUIDE_IPHONE_RU.md](GUIDE_IPHONE_RU.md).
 
-## Учёт
+## Мейкер-лестница
 
-Капитал = свободный USDC + залог в заявках + оценка позиций по лучшему биду.
-Реализованный PnL включает комиссию и газ один раз. Нереализованный — остаток
-до капитала. Мейкерская комиссия 0. Тейкерская, если понадобится:
+`STRATEGY=maker_ladder` возвращает прежнего бота: пост-онли биды от 1¢ до 98¢,
+обе стороны вместе не дороже `PAIR_SUM_HEDGE`, пары дешевле $1 меняются на $1,
+остаток забирается после официального итога, продаж нет. Переменные
+`ENABLED_ASSETS`, `ENABLED_TIMEFRAMES`, `ORDER_CLIP_USD`, `MAX_WINDOW_RISK_USD`,
+`MAX_TOTAL_EXPOSURE_USD`, `MAX_DAILY_LOSS_USD`, `MAX_CONSECUTIVE_LOSSES`,
+`MIN_MERGE_SHARES`, `LADDER_*`, `RUNG_SHARES`, `TAPE_SETTLE_S` относятся только к
+ней.
 
-`shares × feeRate × price × (1 − price)`, округление half-up до 5 знаков.
-До 20.11.2026 23:59 UTC ставка крипты 0.07, затем BTC 5m/15m — 0.05, остальная крипта — 0.01.
-Если Gamma отдала ставку рынка, берётся она.
+## Боевой режим
+
+`copy_wallet` в live не включается. Для `maker_ladder` нужны
+`POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`, а без релеера газ задаётся
+`ONCHAIN_GAS_USD`, иначе в учёте он 0. Перед live проверьте геоблок
+`https://polymarket.com/api/geoblock` и начните с маленького банка.
