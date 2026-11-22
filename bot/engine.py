@@ -675,6 +675,7 @@ class TradingEngine:
         else:
             rows = await rows_task
         now = time.time()
+        self._refresh_halt()
         incoming = list(rows or []) + [row for row in (activity or []) if str(row.get("type") or "").upper() != "TRADE"]
         if incoming:
             for row in reversed(incoming):
