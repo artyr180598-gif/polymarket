@@ -707,7 +707,15 @@ class TradingEngine:
             await self._skip_copy(job, "market closed", now)
             return
         scale = await self._copy_scale(now)
-        if scale is None or scale <= 0:
+        if scale is None:
+            # Auto-scale depends on a public portfolio-value request. A
+            # transient API failure must not permanently consume this event.
+            # Keep it pending; expired trades are rejected by the window guard.
+            if self.cfg.copy_scale_auto:
+                return
+            await self._skip_copy(job, "scale unknown", now)
+            return
+        if scale <= 0:
             await self._skip_copy(job, "scale unknown", now)
             return
         if job.kind == "TRADE" and window is not None and (window.resolved or now >= window.end_ts):
