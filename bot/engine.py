@@ -1070,7 +1070,12 @@ class TradingEngine:
             )
             if page_known:
                 break
-            collected.extend(page)
+            new_rows = [
+                row for row in page
+                if event_key(row) not in seen
+                and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
+            ]
+            collected.extend(new_rows)
             seen.update(key for row in page if (key := event_key(row)))
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
@@ -1111,7 +1116,12 @@ class TradingEngine:
             )
             if page_known:
                 break
-            collected.extend(page)
+            new_rows = [
+                row for row in page
+                if event_key(row) not in seen
+                and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
+            ]
+            collected.extend(new_rows)
             seen.update(key for row in page if (key := event_key(row)))
             pagination = payload.get("pagination") if isinstance(payload, dict) else None
             has_more = bool(pagination and pagination.get("has_more"))
