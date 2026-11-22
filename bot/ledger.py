@@ -209,7 +209,56 @@ class Ledger:
             row = self.conn.execute("SELECT v FROM kv WHERE k = ?", (f"portfolio:{mode}",)).fetchone()
         if not row:
             return None
-        return json.loads(row["v"])
+        try:
+            return json.loads(row["v"])
+        except (TypeError, ValueError):
+            return None
+
+    def save_copy(self, mode: str, blob: dict) -> None:
+        """Seen wallet events live apart from the portfolio: they are large."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (f"copy:{mode}", json.dumps(blob)),
+            )
+            self.conn.commit()
+
+    def save_copy_pending(self, mode: str, rows: list[dict]) -> None:
+        """Pending wallet events are tiny and are written much more often.
+
+        Losing them in a crash would lose a fill the wallet really made, so
+        they get their own key and a short cadence instead of riding along
+        with the multi-megabyte seen-id list.
+        """
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (f"copy_pending:{mode}", json.dumps(rows, ensure_ascii=False)),
+            )
+            self.conn.commit()
+
+    def load_copy_pending(self, mode: str) -> list[dict]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT v FROM kv WHERE k = ?", (f"copy_pending:{mode}",)
+            ).fetchone()
+        if not row:
+            return []
+        try:
+            rows = json.loads(row["v"])
+        except (TypeError, ValueError):
+            return []
+        return [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+
+    def load_copy(self, mode: str) -> dict | None:
+        with self._lock:
+            row = self.conn.execute("SELECT v FROM kv WHERE k = ?", (f"copy:{mode}",)).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["v"])
+        except (TypeError, ValueError):
+            return None
 
     def record_fill(self, **row: Any) -> None:
         with self._lock:
@@ -251,25 +300,49 @@ class Ledger:
             )
             self.conn.commit()
 
-    def record_resolution(self, **row: Any) -> None:
+    def record_resolution(self, *, overwrite: bool = False, **row: Any) -> None:
+        """One row per market. ``overwrite`` replaces a provisional result.
+
+        A flat book can be reported with winner "MERGE" before the wallet
+        redeems. The later official redeem has the real winner and the same
+        money, so it must be able to replace the placeholder instead of being
+        dropped by the unique constraint.
+        """
+        suffix = (
+            """
+            ON CONFLICT(mode, slug) DO UPDATE SET
+                ts = excluded.ts,
+                winner = excluded.winner,
+                pnl = excluded.pnl,
+                payout = excluded.payout,
+                condition_id = excluded.condition_id
+            """
+            if overwrite
+            else """
+            ON CONFLICT(mode, slug) DO NOTHING
+            """
+        )
+        values = {
+            "ts": time.time(),
+            "mode": row["mode"],
+            "slug": row["slug"],
+            "condition_id": row["condition_id"],
+            "asset": row["asset"],
+            "timeframe": row["timeframe"],
+            "winner": row["winner"],
+            "pnl": str(row["pnl"]),
+            "payout": str(row["payout"]),
+        }
         with self._lock:
-            self._insert(
-                "resolutions",
-                {
-                    "ts": time.time(),
-                    "mode": row["mode"],
-                    "slug": row["slug"],
-                    "condition_id": row["condition_id"],
-                    "asset": row["asset"],
-                    "timeframe": row["timeframe"],
-                    "winner": row["winner"],
-                    "pnl": str(row["pnl"]),
-                    "payout": str(row["payout"]),
-                },
-                """
-                ON CONFLICT(mode, slug) DO NOTHING
-                """,
-            )
+            try:
+                self._insert("resolutions", values, suffix)
+            except sqlite3.OperationalError:
+                # A very old file can lack UNIQUE(mode, slug). Then ON CONFLICT
+                # is rejected; a plain insert is the best that file allows.
+                try:
+                    self._insert("resolutions", values, "")
+                except sqlite3.IntegrityError:
+                    pass
             self.conn.commit()
 
     def record_equity(self, *, mode: str, equity: str, cash: str, realized: str) -> None:
@@ -311,15 +384,44 @@ class Ledger:
             )
             self.conn.commit()
 
+    def applied_events(self, mode: str, limit: int = 4000) -> list[str]:
+        """Wallet events that already produced a copied fill.
+
+        Returning these at startup closes the crash window between applying a
+        fill and the throttled copy-state flush: the ledger row is committed
+        with the fill, so the event can never be applied twice.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT event_id FROM (
+                    SELECT event_id, id FROM copies
+                    WHERE mode = ? AND event_id != '' AND status IN ('FILLED', 'PARTIAL')
+                    ORDER BY id DESC LIMIT ?
+                ) ORDER BY id ASC
+                """,
+                (mode, int(limit)),
+            ).fetchall()
+        return [str(row["event_id"]) for row in rows if row["event_id"]]
+
     def copies(self, mode: str, since: float | None = None, limit: int | None = None) -> list[dict]:
-        sql = "SELECT * FROM copies WHERE mode = ?"
+        """Copy rows, oldest first. ``limit`` takes the newest N, not the first N."""
+        where = " WHERE mode = ?"
         args: list[Any] = [mode]
         if since is not None:
-            sql += " AND wallet_ts >= ?"
+            where += " AND wallet_ts >= ?"
             args.append(since)
-        sql += " ORDER BY id ASC"
-        if limit is not None:
-            sql += " LIMIT ?"
+        if limit is None:
+            sql = f"SELECT * FROM copies{where} ORDER BY id ASC"
+        else:
+            # A plain LIMIT on an ASC query returned the oldest rows forever,
+            # so a busy wallet's panel froze on its first day. Take the newest
+            # rows, then present them oldest first.
+            sql = (
+                "SELECT * FROM ("
+                f"SELECT * FROM copies{where} ORDER BY id DESC LIMIT ?"
+                ") ORDER BY id ASC"
+            )
             args.append(int(limit))
         with self._lock:
             rows = self.conn.execute(sql, args).fetchall()

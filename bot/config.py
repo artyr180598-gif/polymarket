@@ -1,5 +1,10 @@
 """Environment configuration. Existing variable names keep working.
 
+The default strategy copies the target wallet: every public fill, merge and
+split it makes is mirrored in the paper account. ``STRATEGY=maker_ladder``
+still selects the measured maker ladder described in
+docs/STRATEGY_ANALYSIS.md.
+
 Removed behaviour, not removed variables:
     STRATEGY_PRESET=lockin and hybrid were fictional overlays. They now log
     a warning and run the measured mo_money rules. See docs/STRATEGY_ANALYSIS.md.
@@ -15,10 +20,44 @@ from dotenv import load_dotenv
 
 ASSETS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB")
 TIMEFRAMES = ("5m", "15m", "1h", "4h", "1d")
+COPY_SIZE_MODES = ("exact", "scale", "fixed")
+STRATEGIES = ("copy_wallet", "maker_ladder")
 
 
 def _flag(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _float(name: str, default: float, low: float | None = None, high: float | None = None) -> float:
+    """Parse a float without ever crashing startup on a typo.
+
+    A bad value falls back to ``default``; the result is clamped when bounds
+    are given. Railway variables are edited by hand, so a stray comma must not
+    take the process down before the dashboard can show what is wrong.
+    """
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    if low is not None:
+        value = max(low, value)
+    if high is not None:
+        value = min(high, value)
+    return value
+
+
+def _int(name: str, default: int, low: int | None = None, high: int | None = None) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(float(raw)) if raw else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    if low is not None:
+        value = max(low, value)
+    if high is not None:
+        value = min(high, value)
+    return value
 
 
 def _optional_float(name: str) -> float:
@@ -45,11 +84,7 @@ def _scale_setting(name: str) -> tuple[float, bool]:
 
 
 def _bounded(name: str, default: str, low: float, high: float) -> float:
-    try:
-        value = float(os.getenv(name, default))
-    except ValueError:
-        value = float(default)
-    return min(high, max(low, value))
+    return _float(name, float(default), low, high)
 
 
 def _list(name: str, default: str) -> list[str]:
@@ -62,21 +97,47 @@ class BotConfig:
     dry_run: bool = False
     bankroll_usd: float = 2750.0
     strategy_preset: str = "mo_money"
-    # maker_ladder is the resting-bid strategy. copy_wallet is paper-only.
-    strategy: str = "maker_ladder"
+    # copy_wallet mirrors the target account. maker_ladder is the old bot.
+    strategy: str = "copy_wallet"
     copy_wallet: str = "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3"
-    copy_min_price: float = 0.50
-    copy_max_price: float = 0.95
+    # Every price is eligible by default. Set a band to be selective.
+    copy_min_price: float = 0.01
+    copy_max_price: float = 0.99
+    # Seconds after the window opens / before it closes. 0 = no bound.
     copy_min_t: float = 0.0
-    copy_max_t: float = 240.0
+    copy_max_t: float = 0.0
     copy_shares: float = 10.0
-    copy_max_per_window: int = 3
+    # 0 = no limit. Positive values cap copied events per window.
+    copy_max_per_window: int = 0
+    # exact = same share count as the wallet (1:1), scale = wallet × COPY_SCALE,
+    # fixed = COPY_SHARES per event. See docs/STRATEGY_ANALYSIS.md.
+    copy_size_mode: str = "exact"
     # 0.07 unless COPY_SCALE is a number. COPY_SCALE=auto uses equity / value.
     copy_scale: float = 0.07
     copy_scale_auto: bool = False
     # Legacy setting; wallet-copy fills are no longer artificially delayed.
     copy_delay_s: float = 0.0
     copy_max_slip: float = 0.03
+    # Slug prefixes such as "btc-updown-5m,eth-updown". Empty = all markets.
+    copy_slug_prefixes: list[str] = field(default_factory=list)
+    # Seconds between wallet-feed polls. 0.5 keeps our lag near the data API.
+    copy_poll_s: float = 0.5
+    copy_activity_poll_s: float = 5.0
+    # A job whose market metadata never arrives is dropped after this long.
+    copy_pending_timeout_s: float = 120.0
+    # Bootstrap: the first successful poll is history, never a trade signal.
+    copy_seed_on_start: bool = True
+    # Demo copying is 1:1, so the daily-loss / loss-streak stops default off.
+    copy_use_risk_limits: bool = False
+    # 0 = no cap in copy mode. Cash on hand is always enforced.
+    copy_window_cap_usd: float = 0.0
+    copy_exposure_cap_usd: float = 0.0
+    copy_max_attempts: int = 5
+    copy_seen_limit: int = 20000
+    # A wallet fill from the last seconds of a window reaches the data API
+    # after the market closed. Allow this much lateness while the book is
+    # still answerable, otherwise those trades would always be skipped.
+    copy_late_grace_s: float = 5.0
     enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
     auto_start: bool = True
@@ -141,6 +202,16 @@ class BotConfig:
             or (self.builder_api_key and self.builder_secret and self.builder_passphrase)
         )
 
+    @property
+    def copy_window_cap(self) -> float:
+        """Per-window cap used by the copier. 0 disables the cap."""
+        return self.copy_window_cap_usd
+
+    @property
+    def copy_exposure_cap(self) -> float:
+        """Account-wide cap used by the copier. 0 disables the cap."""
+        return self.copy_exposure_cap_usd
+
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "BotConfig":
         load_dotenv(env_file or ".env", override=False)
@@ -148,9 +219,9 @@ class BotConfig:
         if mode not in ("paper", "live"):
             mode = "paper"
         preset = os.getenv("STRATEGY_PRESET", "mo_money").strip().lower() or "mo_money"
-        strategy = os.getenv("STRATEGY", "maker_ladder").strip().lower() or "maker_ladder"
-        if strategy not in ("maker_ladder", "copy_wallet"):
-            strategy = "maker_ladder"
+        strategy = os.getenv("STRATEGY", "copy_wallet").strip().lower() or "copy_wallet"
+        if strategy not in STRATEGIES:
+            strategy = "copy_wallet"
         assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL,XRP") if a.upper() in ASSETS]
         if not assets:
             assets = ["BTC", "ETH", "SOL", "XRP"]
@@ -158,40 +229,64 @@ class BotConfig:
         if not frames:
             frames = ["5m", "15m", "1h", "4h"]
         scale, scale_auto = _scale_setting("COPY_SCALE")
+        size_mode = os.getenv("COPY_SIZE_MODE", "exact").strip().lower() or "exact"
+        if size_mode not in COPY_SIZE_MODES:
+            size_mode = "exact"
+        prefixes = [
+            part.lower()
+            for part in _list("COPY_SLUG_PREFIXES", "") + _list("COPY_MARKETS", "")
+        ]
+        # The demo bank is $2750 unless the operator sets BANKROLL_USD. A
+        # fresh copy account runs on exactly that balance; an existing ledger
+        # keeps the initial cash it was created with, so this default never
+        # rewrites a running account.
+        bankroll_default = "2750"
         return cls(
             trading_mode=mode,
             dry_run=_flag("DRY_RUN", "false"),
-            bankroll_usd=max(50.0, float(os.getenv("BANKROLL_USD", "2750"))),
+            bankroll_usd=_float("BANKROLL_USD", float(bankroll_default), 50.0),
             strategy_preset=preset,
             strategy=strategy,
             copy_wallet=os.getenv(
                 "COPY_WALLET", "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
             ).strip().lower() or "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
-            copy_min_price=_bounded("COPY_MIN_PRICE", "0.50", 0.01, 0.99),
-            copy_max_price=_bounded("COPY_MAX_PRICE", "0.95", 0.01, 0.99),
-            copy_min_t=max(0.0, float(os.getenv("COPY_MIN_T", "0"))),
-            copy_max_t=max(0.0, float(os.getenv("COPY_MAX_T", "240"))),
-            copy_shares=max(1.0, float(os.getenv("COPY_SHARES", "10"))),
-            copy_max_per_window=max(1, int(os.getenv("COPY_MAX_PER_WINDOW", "3"))),
+            copy_min_price=_bounded("COPY_MIN_PRICE", "0.01", 0.01, 0.99),
+            copy_max_price=_bounded("COPY_MAX_PRICE", "0.99", 0.01, 0.99),
+            copy_min_t=_float("COPY_MIN_T", 0.0, 0.0),
+            copy_max_t=_float("COPY_MAX_T", 0.0, 0.0),
+            copy_shares=_float("COPY_SHARES", 10.0, 1.0),
+            copy_max_per_window=_int("COPY_MAX_PER_WINDOW", 0, 0),
+            copy_size_mode=size_mode,
             copy_scale=scale,
             copy_scale_auto=scale_auto,
-            copy_delay_s=max(0.0, float(os.getenv("COPY_DELAY_S", "0"))),
-            copy_max_slip=max(0.0, float(os.getenv("COPY_MAX_SLIP", "0.03"))),
+            copy_delay_s=_float("COPY_DELAY_S", 0.0, 0.0),
+            copy_max_slip=_float("COPY_MAX_SLIP", 0.03, 0.0, 0.50),
+            copy_slug_prefixes=prefixes,
+            copy_poll_s=_float("COPY_POLL_S", 0.5, 0.2, 10.0),
+            copy_activity_poll_s=_float("COPY_ACTIVITY_POLL_S", 5.0, 1.0, 120.0),
+            copy_pending_timeout_s=_float("COPY_PENDING_TIMEOUT_S", 120.0, 10.0, 3600.0),
+            copy_seed_on_start=_flag("COPY_SEED_ON_START", "true"),
+            copy_use_risk_limits=_flag("COPY_USE_RISK_LIMITS", "false"),
+            copy_window_cap_usd=_float("COPY_WINDOW_CAP_USD", 0.0, 0.0),
+            copy_exposure_cap_usd=_float("COPY_EXPOSURE_CAP_USD", 0.0, 0.0),
+            copy_max_attempts=_int("COPY_MAX_ATTEMPTS", 5, 1, 50),
+            copy_seen_limit=_int("COPY_SEEN_LIMIT", 20000, 1000, 500000),
+            copy_late_grace_s=_float("COPY_LATE_GRACE_S", 5.0, 0.0, 120.0),
             enabled_assets=assets,
             enabled_timeframes=frames,
             auto_start=_flag("AUTO_START", "true"),
-            order_clip_usd=max(1.0, float(os.getenv("ORDER_CLIP_USD", "16"))),
-            max_window_risk_usd=max(5.0, float(os.getenv("MAX_WINDOW_RISK_USD", "80"))),
-            max_total_exposure_usd=max(10.0, float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "640"))),
-            max_daily_loss_usd=max(5.0, float(os.getenv("MAX_DAILY_LOSS_USD", "160"))),
-            max_consecutive_losses=max(0, int(os.getenv("MAX_CONSECUTIVE_LOSSES", "10"))),
-            min_merge_shares=max(0.01, float(os.getenv("MIN_MERGE_SHARES", "1"))),
-            pair_sum_hedge=min(1.20, max(0.90, float(os.getenv("PAIR_SUM_HEDGE", "1")))),
-            ladder_rungs=max(1, int(os.getenv("LADDER_RUNGS", "6"))),
-            ladder_step=max(0.001, float(os.getenv("LADDER_STEP", "0.01"))),
-            rung_shares=max(1.0, float(os.getenv("RUNG_SHARES", "10"))),
-            tape_settle_s=max(0.0, float(os.getenv("TAPE_SETTLE_S", "6"))),
-            onchain_gas_usd=max(0.0, float(os.getenv("ONCHAIN_GAS_USD", "0"))),
+            order_clip_usd=_float("ORDER_CLIP_USD", 16.0, 1.0),
+            max_window_risk_usd=_float("MAX_WINDOW_RISK_USD", 80.0, 5.0),
+            max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 640.0, 10.0),
+            max_daily_loss_usd=_float("MAX_DAILY_LOSS_USD", 160.0, 5.0),
+            max_consecutive_losses=_int("MAX_CONSECUTIVE_LOSSES", 10, 0),
+            min_merge_shares=_float("MIN_MERGE_SHARES", 1.0, 0.01),
+            pair_sum_hedge=_float("PAIR_SUM_HEDGE", 1.0, 0.90, 1.20),
+            ladder_rungs=_int("LADDER_RUNGS", 6, 1),
+            ladder_step=_float("LADDER_STEP", 0.01, 0.001),
+            rung_shares=_float("RUNG_SHARES", 10.0, 1.0),
+            tape_settle_s=_float("TAPE_SETTLE_S", 6.0, 0.0),
+            onchain_gas_usd=_float("ONCHAIN_GAS_USD", 0.0, 0.0),
             paper_reset_once=_flag("PAPER_RESET_ONCE", "false"),
             paper_reset_id=os.getenv("PAPER_RESET_ID", "").strip(),
             paper_stats_since_ts=_optional_float("PAPER_STATS_SINCE_TS"),
@@ -204,7 +299,7 @@ class BotConfig:
             builder_secret=os.getenv("POLYMARKET_BUILDER_SECRET", "").strip(),
             builder_passphrase=os.getenv("POLYMARKET_BUILDER_PASSPHRASE", "").strip(),
             dashboard_host=os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0",
-            dashboard_port=int(os.getenv("PORT") or os.getenv("DASHBOARD_PORT", "8080")),
+            dashboard_port=_int("PORT", _int("DASHBOARD_PORT", 8080, 1, 65535), 1, 65535),
             dashboard_pin=os.getenv("DASHBOARD_PIN", "").strip(),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=str(os.getenv("TELEGRAM_CHAT_ID", "")).strip(),

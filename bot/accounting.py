@@ -16,6 +16,7 @@ Marks are caller-supplied (best bid). There is no hidden spot model here.
 
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
@@ -73,6 +74,7 @@ class MarketBook:
     resolved: bool = False
     winner: str = ""
     closed: bool = False
+    closed_ts: float = 0.0
 
     def lot(self, outcome: str) -> Lot:
         lot = self.outcomes.get(outcome)
@@ -197,23 +199,27 @@ class Portfolio:
         return spend
 
     def merge(self, slug: str, pairs: Decimal, gas: Decimal = _ZERO) -> Decimal:
-        """Burn ``pairs`` of Up+Down, return $1 each. Returns realized PnL of this merge."""
+        """Burn ``pairs`` of a complete set, return $1 each.
+
+        Polymarket complete sets are binary (Up/Down, Yes/No). The lots are
+        taken by name from the book instead of hardcoding Up/Down, which is
+        what lets the copier mirror non up/down markets without a second
+        accounting path.
+        """
         book = self.markets.get(slug)
         if book is None:
             return _ZERO
         qty = shares_q(D(pairs))
-        up = book.lot("Up")
-        down = book.lot("Down")
-        if qty <= 0 or up.shares < qty or down.shares < qty:
-            raise ValueError("not enough of both outcomes to merge")
-        up_cost, up_fee = _take(up, qty)
-        dn_cost, dn_fee = _take(down, qty)
+        lots = [lot for lot in book.outcomes.values() if lot.shares > 0]
+        if qty <= 0 or len(lots) < 2 or any(lot.shares < qty for lot in lots):
+            raise ValueError("not enough of every outcome to merge")
+        taken = [_take(lot, qty) for lot in lots]
         gas_usdc = usdc(D(gas))
-        if gas_usdc > self.cash:
+        if gas_usdc > usdc(self.cash + qty):
             raise ValueError("not enough cash for gas")
-        self.cash = usdc(self.cash + qty - gas_usdc)  # qty shares × $1
+        self.cash = usdc(self.cash + qty - gas_usdc)  # qty complete sets × $1
         self.gas_paid = usdc(self.gas_paid + gas_usdc)
-        pnl = usdc(qty - up_cost - dn_cost - up_fee - dn_fee - gas_usdc)
+        pnl = usdc(qty - sum((cost + fee for cost, fee in taken), _ZERO) - gas_usdc)
         self.realized = usdc(self.realized + pnl)
         book.realized = usdc(book.realized + pnl)
         return pnl
@@ -260,19 +266,33 @@ class Portfolio:
         asset: str,
         timeframe: str,
         pairs: Decimal,
+        outcomes: tuple[str, str] | list[str] | None = None,
     ) -> Decimal:
-        """Mint ``pairs`` of Up+Down for $1 each. No fee."""
+        """Mint ``pairs`` of the complete set for $1 each. No fee.
+
+        The two outcome names come from the market itself (``Yes``/``No`` is
+        as valid as ``Up``/``Down``). Guessing them would create two lots the
+        later redeem could not match.
+        """
         qty = shares_q(D(pairs))
         if qty <= 0:
             raise ValueError("split needs a positive size")
         cost = usdc(qty)
         if cost > self.cash + Decimal("0.0000005"):
             raise ValueError("not enough cash to split")
+        book = self.market(slug, condition_id, asset, timeframe)
+        names = [str(name) for name in (outcomes or []) if str(name)]
+        if len(names) < 2:
+            names = [name for name, lot in book.outcomes.items() if lot.shares > 0]
+        if len(names) < 2:
+            names = ["Up", "Down"]
+        first, second = names[0], names[1]
         self.cash = usdc(self.cash - cost)
         half = usdc(cost / 2)
-        book = self.market(slug, condition_id, asset, timeframe)
-        up = book.lot("Up")
-        down = book.lot("Down")
+        if book.closed and not book.resolved:
+            book.closed = False
+        up = book.lot(first)
+        down = book.lot(second)
         up.shares = shares_q(up.shares + qty)
         down.shares = shares_q(down.shares + qty)
         up.cost = usdc(up.cost + half)
@@ -309,6 +329,7 @@ class Portfolio:
         book.resolved = True
         book.winner = winner
         book.closed = True
+        book.closed_ts = _time.time()
         return pnl
 
     def mark_value(self, marks: dict[tuple[str, str], Decimal]) -> Decimal:
@@ -376,6 +397,7 @@ class Portfolio:
                 "resolved": book.resolved,
                 "winner": book.winner,
                 "closed": book.closed,
+                "closed_ts": book.closed_ts,
                 "outcomes": {
                     name: {"shares": str(lot.shares), "cost": str(lot.cost), "fees": str(lot.fees)}
                     for name, lot in book.outcomes.items()
@@ -424,11 +446,45 @@ class Portfolio:
                 resolved=bool(blob.get("resolved")),
                 winner=blob.get("winner") or "",
                 closed=bool(blob.get("closed")),
+                closed_ts=float(blob.get("closed_ts") or 0),
             )
             for name, lot in (blob.get("outcomes") or {}).items():
-                book.outcomes[name] = Lot(shares=D(lot["shares"]), cost=D(lot["cost"]), fees=D(lot["fees"]))
+                if not isinstance(lot, dict):
+                    continue
+                book.outcomes[name] = Lot(
+                    shares=D(lot.get("shares") or 0),
+                    cost=D(lot.get("cost") or 0),
+                    fees=D(lot.get("fees") or 0),
+                )
             port.markets[slug] = book
         return port
+
+    def prune_closed(self, max_age_s: float = 3 * 86400, now: float | None = None) -> int:
+        """Drop old finished markets from the snapshot.
+
+        Realized PnL lives on the portfolio and in the ledger, so a closed
+        market is only dead weight here. Without this the JSON snapshot grows
+        by every market the bot ever saw, and each save gets slower.
+        """
+        if max_age_s <= 0:
+            return 0
+        cutoff = (now if now is not None else _time.time()) - float(max_age_s)
+        dropped = 0
+        for slug, book in list(self.markets.items()):
+            if not book.resolved or not book.closed:
+                continue
+            if book.open_shares() > 0:
+                continue
+            stamp = book.closed_ts or 0.0
+            if stamp <= 0:
+                # Older snapshots have no stamp. Give them one now instead of
+                # dropping history blindly.
+                book.closed_ts = _time.time()
+                continue
+            if stamp < cutoff:
+                self.markets.pop(slug, None)
+                dropped += 1
+        return dropped
 
     def close_if_finished(self, slug: str, *, ended: bool) -> None:
         """Close only after the window has ended, or once it is resolved.
@@ -441,6 +497,8 @@ class Portfolio:
             return
         if book.resolved or (ended and book.open_shares() <= SHARE and book.cost_basis() <= USDC):
             book.closed = True
+            if not book.closed_ts:
+                book.closed_ts = _time.time()
 
 
 def _take(lot: Lot, qty: Decimal) -> tuple[Decimal, Decimal]:

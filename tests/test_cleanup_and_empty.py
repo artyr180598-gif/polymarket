@@ -83,6 +83,9 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
             bankroll_usd=2750,
             trading_mode="paper",
             dashboard_pin="",
+            # These tests exercise the maker surface. The product default is
+            # the wallet copier; say which one is under test explicitly.
+            strategy="maker_ladder",
         )
         return TradingEngine(cfg)
 
@@ -284,6 +287,7 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         engine._discover_loop = idle  # type: ignore[method-assign]
         engine._trade_loop = idle  # type: ignore[method-assign]
         engine._housekeep_loop = idle  # type: ignore[method-assign]
+        engine._copy_wallet_loop = idle  # type: ignore[method-assign]
 
         async def boot() -> None:
             await engine.start()
@@ -301,7 +305,7 @@ class EmptyPaperSurfaceTests(unittest.TestCase):
         engine = self._engine()
         engine._session = object()
 
-        async def gamma(_slug: str) -> dict:
+        async def gamma(_slug: str, condition_id: str = "") -> dict:
             return {
                 "condition_id": "cond",
                 "tokens": {"Up": "u", "Down": "d"},

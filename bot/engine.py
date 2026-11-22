@@ -18,18 +18,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 
 import aiohttp
 
-from .accounting import D, Portfolio, usdc
+from .accounting import D, Portfolio, floor_to_step, usdc
 from .books import maker_buy_rows, parse_levels, touch
 from .config import BotConfig
 from .copy_wallet import (
-    DEFAULT_WALLET,
     CopyBook,
     event_key,
     fee_for_lifts,
@@ -38,6 +39,7 @@ from .copy_wallet import (
     scale_size,
     slippage,
     walk_book,
+    wallet_of,
 )
 from .execution import Fill, LiveBroker, PaperBroker, Resting
 from .fees import fallback_taker_fee_rate, fee_regime_label
@@ -51,6 +53,13 @@ _ZERO = Decimal(0)
 WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 COPY_API_MAX_PAGES = 20
 COPY_API_ATTEMPTS = 3
+# The public Data API has appeared under both a versioned and an unversioned
+# path, with cursor and with offset pagination. Guessing one and being wrong
+# means the copier never sees a single trade, so every shape is tried once and
+# the working one is remembered.
+DATA_API = "https://data-api.polymarket.com"
+TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades", f"{DATA_API}/trades")
+ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity", f"{DATA_API}/activity")
 
 
 def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
@@ -74,19 +83,38 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
 
 def _strategy_title(strategy: str) -> str:
     if strategy == "copy_wallet":
-        return "copy-wallet: тейкер после исполнения кошелька"
+        return "copy-wallet: все сделки кошелька, бумага"
     return "mo-money: лестница мейкер-бидов"
+
+
+def _size_mode_text(cfg) -> str:
+    mode = getattr(cfg, "copy_size_mode", "exact")
+    if mode == "fixed":
+        return f"фиксированный размер {cfg.copy_shares:g} шар"
+    if mode == "scale":
+        if getattr(cfg, "copy_scale_auto", False):
+            return "размер = размер кошелька × (наш капитал / стоимость кошелька)"
+        return f"размер = размер кошелька × {cfg.copy_scale:g}"
+    return "размер 1:1, как у кошелька (шаг 0.01, остаток переносится)"
+
+
+def _scope_text(cfg) -> str:
+    prefixes = list(getattr(cfg, "copy_slug_prefixes", []) or [])
+    if not prefixes:
+        return "все рынки кошелька, включая BTC/ETH/SOL/XRP и любые окна"
+    return "рынки: " + ", ".join(prefixes)
 
 
 def _strategy_lines(cfg) -> list[str]:
     if cfg.strategy == "copy_wallet":
         return [
             "Только бумага. LIVE для этого режима не включается.",
-            f"Кошелёк {cfg.copy_wallet} · только BTC 5м.",
-            f"Размер = размер кошелька × {cfg.copy_scale:g}. Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск.",
-            "Это PAPER-копия после публичного исполнения кошелька: наши сделки проходят как TAKER. Maker-очередь кошелька из ленты исполнений воспроизвести нельзя.",
-            "Недобранный остаток пишется как PARTIAL или SKIPPED и не переносится на следующую сделку.",
-            "Рядом с нашим результатом виден теневой PnL: сделки кошелька × масштаб по его ценам, без ребейтов.",
+            f"Кошелёк {cfg.copy_wallet}.",
+            f"{_size_mode_text(cfg)}. {_scope_text(cfg)}.",
+            f"Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск; тейкерская комиссия списывается.",
+            "Это PAPER-копия после публичного исполнения: наши сделки проходят как TAKER. Maker-очередь кошелька из публичной ленты не видна.",
+            "MERGE, SPLIT и REDEEM кошелька повторяются отдельно; остаток гасится только по официальному итогу рынка.",
+            "Недобранный остаток пишется как PARTIAL или SKIPPED. Рядом виден теневой PnL кошелька без комиссий.",
         ]
     return [
         "Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль. Продаж нет.",
@@ -118,6 +146,32 @@ def _slug_bounds(slug: str) -> tuple[str, str, float, float] | None:
     except ValueError:
         return None
     return parts[0].upper(), timeframe, float(start), float(start + sec)
+
+
+def _asset_timeframe(slug: str) -> tuple[str, str]:
+    """Asset and window label from a slug, without assuming an up/down market."""
+    parts = str(slug or "").split("-")
+    asset = parts[0].upper() if parts and parts[0] else "?"
+    timeframe = "other"
+    if len(parts) >= 3 and parts[1].lower() == "updown":
+        timeframe = parts[2].lower()
+    return asset, timeframe
+
+
+def _iso_ts(value: Any) -> float:
+    """ISO-8601 from Gamma/CLOB to a unix timestamp. 0 when unparsable."""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _row_timestamp(row: dict) -> float | None:
@@ -200,7 +254,7 @@ class Window:
     condition_id: str
     tokens: dict[str, str]
     start_ts: float
-    end_ts: float
+    end_ts: float  # 0 = unknown (non up/down event without a published close)
     tick: Decimal
     min_shares: Decimal
     fee_rate: Decimal
@@ -214,13 +268,21 @@ class Window:
     prints_seeded: bool = False
     resolved: bool = False
     reported: bool = False
+    # Copy-mode bookkeeping: marks are only cosmetic, so they refresh slower
+    # than the trade loop; resolution checks are rate limited too.
+    marks_at: float = 0.0
+    resolve_at: float = 0.0
 
     @property
     def seconds_from_start(self) -> float:
+        if self.start_ts <= 0:
+            return 0.0
         return time.time() - self.start_ts
 
     @property
     def seconds_to_end(self) -> float:
+        if self.end_ts <= 0:
+            return math.inf
         return self.end_ts - time.time()
 
 
@@ -245,6 +307,17 @@ class TradingEngine:
         else:
             bank = D(str(cfg.bankroll_usd))
             self.portfolio = Portfolio(initial_cash=bank, cash=bank)
+        # Copy state lives in its own key now: seen ids are large and should
+        # not be rewritten on every fill. Fall back to the legacy combined blob.
+        stored_copy = self.ledger.load_copy(self.mode)
+        if stored_copy is not None:
+            self.copy = CopyBook.from_dict(stored_copy)
+        for event_id in self.ledger.applied_events(self.mode):
+            self.copy.mark_applied(event_id)
+        self._restored_pending = self.copy.restore_pending(
+            self.ledger.load_copy_pending(self.mode)
+        )
+        self._copy_dirty = False
         self.paper = PaperBroker(self.portfolio)
         self.live = LiveBroker(cfg)
         self.windows: dict[str, Window] = {}
@@ -262,13 +335,29 @@ class TradingEngine:
         self._notify: Notify | None = None
         self._last_equity_ts = 0.0
         self._last_activity_poll = 0.0
+        self._last_copy_persist = 0.0
+        self._last_pending_persist = 0.0
         self._copy_scale_retry_at = 0.0
+        self._feed_endpoint: dict[str, str] = {}
         self._live_prices: dict[str, Decimal] = {}
         self._live_left: dict[str, Decimal] = {}
         self._live_original: dict[str, Decimal] = {}
         self._stuck_noted: set[str] = set()
         self._resolution_conflict: set[str] = set()
         self._stale_tape: set[str] = set()
+        # Short-lived caches keep a burst of wallet fills from re-fetching the
+        # same book several times and from hammering Gamma when a market is
+        # not published yet.
+        self._book_cache: dict[str, tuple[list, list, float]] = {}
+        self._book_tasks: dict[str, asyncio.Task] = {}
+        self._meta_retry_at: dict[str, float] = {}
+        self._note_last: dict[str, float] = {}
+        self._copy_last_lag = 0.0
+        self._copy_last_seen_at = 0.0
+        self._copy_backoff_until = 0.0
+        # One clock for the latency-critical copy path. Tests freeze it; in
+        # production it is wall time.
+        self._clock: Callable[[], float] = time.time
         self._preset_note = ""
         if cfg.strategy_preset not in ("mo_money",):
             self._preset_note = (
@@ -302,7 +391,22 @@ class TradingEngine:
             except Exception:  # noqa: BLE001
                 log.exception("notify failed")
 
-    def _persist(self) -> None:
+    def _note_once(self, key: str, level: str, msg: str, every: float = 30.0) -> None:
+        """Log a recurring condition without flooding the event feed."""
+        now = time.monotonic()
+        if every > 0 and now - self._note_last.get(key, 0.0) < every:
+            return
+        self._note_last[key] = now
+        self._note(level, msg)
+
+    def _persist(self, *, copy: bool = True) -> None:
+        """Save the portfolio. Copy history is saved on its own slower cadence.
+
+        ``copy.seen_tx`` holds thousands of ids. Rewriting it on every fill
+        would make each tick a multi-megabyte SQLite write and slow the
+        latency-critical path down. The portfolio snapshot is small and is
+        written immediately; ``copy`` state is flushed a few times a minute.
+        """
         try:
             self.ledger.save_portfolio(
                 self.mode,
@@ -310,11 +414,32 @@ class TradingEngine:
                     "portfolio": self.portfolio.to_dict(),
                     "consecutive_losses": self.consecutive_losses,
                     "manual_pause": self.manual_pause,
-                    "copy": self.copy.to_dict(),
                 },
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("persist: %s", exc)
+        if copy:
+            self._persist_copy()
+
+    def _persist_copy(self, *, force: bool = False) -> None:
+        if self.cfg.strategy != "copy_wallet":
+            return
+        now = time.monotonic()
+        if not force and now - self._last_copy_persist < 20.0:
+            self._copy_dirty = True
+            return
+        try:
+            if force or now - self._last_pending_persist >= 1.0:
+                self.ledger.save_copy_pending(self.mode, self.copy.pending_rows())
+                self._last_pending_persist = now
+        except Exception as exc:  # noqa: BLE001
+            log.warning("persist copy pending: %s", exc)
+        try:
+            self.ledger.save_copy(self.mode, self.copy.to_dict())
+            self._last_copy_persist = now
+            self._copy_dirty = False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("persist copy: %s", exc)
 
     def _delete_legacy_files(self) -> None:
         paths = list(self.cfg.legacy_db_delete or [])
@@ -332,16 +457,40 @@ class TradingEngine:
 
     async def start(self) -> None:
         self._delete_legacy_files()
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+        # Many short, parallel API calls: keep connections warm instead of a
+        # new TLS handshake per poll. Latency here is the copy lag.
+        connector = aiohttp.TCPConnector(
+            limit=32,
+            limit_per_host=16,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=12, connect=5),
+            connector=connector,
+            headers={"User-Agent": "PolyBot/2 copy-wallet"},
+        )
         if self.cfg.strategy == "copy_wallet":
             if not is_valid_wallet_address(self.cfg.copy_wallet):
                 self.paused = True
                 self._note("ERROR", "COPY_WALLET имеет неверный формат адреса. Копирование остановлено.", notify=True)
-            elif "BTC" not in self.cfg.enabled_assets or "5m" not in self.cfg.enabled_timeframes:
-                self.paused = True
-                self._note("ERROR", "Для copy_wallet обязательны BTC и 5m в ENABLED_ASSETS / ENABLED_TIMEFRAMES. Копирование остановлено.", notify=True)
             else:
                 self._note("INFO", f"COPY_WALLET target: {self.cfg.copy_wallet.lower()}")
+                self._note(
+                    "INFO",
+                    f"Копирование: {_size_mode_text(self.cfg)} · {_scope_text(self.cfg)} · "
+                    f"опрос {self.cfg.copy_poll_s:g} с · допуск {self.cfg.copy_max_slip:g}",
+                )
+                if self._restored_pending:
+                    self._note(
+                        "INFO",
+                        f"В очереди восстановлено событий кошелька: {self._restored_pending}.",
+                    )
+                if not self.copy.seeded and self.cfg.copy_seed_on_start:
+                    self._note(
+                        "INFO",
+                        "Первый опрос ленты станет точкой отсчёта: старые сделки не копируются.",
+                    )
         if self._preset_note:
             self._note("INFO", self._preset_note, notify=True)
         if self.cfg.live_requested and self.cfg.strategy != "copy_wallet":
@@ -373,17 +522,15 @@ class TradingEngine:
                 )
             why = "DRY_RUN" if self.cfg.dry_run else "paper"
             name = "copy-wallet" if self.cfg.strategy == "copy_wallet" else "мейкер"
-            if self.cfg.strategy == "copy_wallet":
-                if self.cfg.copy_scale_auto:
-                    scale_text = "COPY_SCALE=auto (капитал / стоимость кошелька, раз в сутки)"
-                else:
-                    scale_text = f"COPY_SCALE={self.cfg.copy_scale:g} · допуск {self.cfg.copy_max_slip:g}"
-                self._note("INFO", scale_text)
             self._note(
                 "INFO",
-                f"{why}: банк ${self.portfolio.cash} · {name} "
-                f"{','.join(self.cfg.enabled_assets)} "
-                f"{','.join(self.cfg.enabled_timeframes)} · без SELL",
+                f"{why}: банк ${self.portfolio.cash} · {name} · "
+                + (
+                    _scope_text(self.cfg)
+                    if self.cfg.strategy == "copy_wallet"
+                    else f"{','.join(self.cfg.enabled_assets)} {','.join(self.cfg.enabled_timeframes)}"
+                )
+                + (" · без SELL" if self.cfg.strategy != "copy_wallet" else ""),
                 notify=True,
             )
         self.running = True
@@ -404,6 +551,7 @@ class TradingEngine:
         self._tasks.clear()
         self._cancel_all()
         self._persist()
+        self._persist_copy(force=True)
         if self.mode == "live":
             await self.live.close()
         if self._session is not None:
@@ -421,8 +569,9 @@ class TradingEngine:
         if self.cfg.strategy != "copy_wallet" and self.cfg.live_requested and not self.live.ready:
             self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
             return
-        # Re-evaluate the risk stop before clearing a manual pause. Resume is
-        # not an override for a daily-loss or consecutive-loss halt.
+        # Resume clears the loss streak (that is what the button says), but it
+        # is not an override for the daily-loss stop.
+        self.consecutive_losses = 0
         self._refresh_halt()
         if self.halt_reason:
             self.paused = True
@@ -460,6 +609,18 @@ class TradingEngine:
     async def emergency_kill(self) -> dict[str, Any]:
         self.paused = True
         self._cancel_all()
+        if self.cfg.strategy == "copy_wallet":
+            # The copier mirrors the wallet's own merges. Merging pairs here
+            # would invent a cash flow the wallet never made, so the stop only
+            # ends copying; open positions settle with the market.
+            self._note(
+                "ERROR",
+                "Аварийный стоп: копирование остановлено. Открытые позиции "
+                "остаются до итога рынка.",
+                notify=True,
+            )
+            self._persist()
+            return {"merged_pnl": 0.0}
         merged = _ZERO
         for window in list(self.windows.values()):
             pnl = await self._merge(window)
@@ -504,6 +665,12 @@ class TradingEngine:
 
     async def _discover(self) -> None:
         await self._recover_open_books()
+        if self.cfg.strategy == "copy_wallet":
+            # The copier does not need a market calendar. Every market is
+            # created on demand from the wallet row (Gamma, then CLOB). This
+            # is what makes ETH/SOL/XRP/DOGE, 15m, 1h and non up/down markets
+            # copyable without touching ENABLED_ASSETS.
+            return
         now = time.time()
         for asset in self.cfg.enabled_assets:
             for tf in self.cfg.enabled_timeframes:
@@ -526,19 +693,25 @@ class TradingEngine:
                         meta = await self._gamma(slug)
                         if not meta:
                             continue
-                        self.windows[slug] = Window(
-                            slug=slug,
-                            asset=asset,
-                            timeframe=tf,
-                            condition_id=meta["condition_id"],
-                            tokens=meta["tokens"],
-                            start_ts=float(start),
-                            end_ts=float(end),
-                            tick=meta["tick"],
-                            min_shares=meta["min_shares"],
-                            fee_rate=meta["fee_rate"],
-                            fee_exponent=meta["fee_exponent"],
-                        )
+                        self.windows[slug] = self._window_from_meta(slug, meta, start, end)
+
+    def _window_from_meta(
+        self, slug: str, meta: dict, start: float | None = None, end: float | None = None,
+    ) -> Window:
+        asset, timeframe = _asset_timeframe(slug)
+        return Window(
+            slug=slug,
+            asset=str(meta.get("asset") or asset),
+            timeframe=str(meta.get("timeframe") or timeframe),
+            condition_id=str(meta.get("condition_id") or ""),
+            tokens=dict(meta.get("tokens") or {}),
+            start_ts=float(start if start is not None else meta.get("start_ts") or 0),
+            end_ts=float(end if end is not None else meta.get("end_ts") or 0),
+            tick=D(meta.get("tick") or "0.01"),
+            min_shares=D(meta.get("min_shares") or "5"),
+            fee_rate=D(meta.get("fee_rate") or "0"),
+            fee_exponent=D(meta.get("fee_exponent") or "1"),
+        )
 
     async def _recover_open_books(self) -> None:
         """Put every unresolved book back on the loop, even if its window ended."""
@@ -546,89 +719,304 @@ class TradingEngine:
             if book.resolved or book.closed or slug in self.windows:
                 continue
             bounds = _slug_bounds(slug)
-            if bounds is None:
-                continue
-            asset, timeframe, start, end = bounds
-            meta = await self._gamma(slug)
+            asset, timeframe, start, end = bounds if bounds else (*_asset_timeframe(slug), 0.0, 0.0)
+            meta = await self._market_meta(slug, book.condition_id)
             if not meta:
-                continue
-            self.windows[slug] = Window(
-                slug=slug,
-                asset=asset,
-                timeframe=timeframe,
-                condition_id=meta["condition_id"],
-                tokens=meta["tokens"],
-                start_ts=start,
-                end_ts=end,
-                tick=meta["tick"],
-                min_shares=meta["min_shares"],
-                fee_rate=meta["fee_rate"],
-                fee_exponent=meta["fee_exponent"],
-            )
+                # Even without metadata the outcome names are in the ledger.
+                # A window built from them lets the official winner be matched
+                # later instead of leaving the position open forever.
+                meta = {
+                    "tokens": {name: "" for name in book.outcomes},
+                    "condition_id": book.condition_id,
+                    "asset": book.asset or asset,
+                    "timeframe": book.timeframe or timeframe,
+                    "fee_rate": 0,
+                }
+            self.windows[slug] = self._window_from_meta(slug, meta, start, end)
 
-    async def _gamma(self, slug: str) -> dict | None:
+    async def _market_meta(self, slug: str, condition_id: str = "") -> dict | None:
+        """Gamma first, then CLOB. Both publish outcome names and token ids."""
+        meta = await self._gamma(slug, condition_id)
+        if meta:
+            return meta
+        if condition_id:
+            return await self._clob_meta(condition_id, slug)
+        return None
+
+    async def _gamma(self, slug: str, condition_id: str = "") -> dict | None:
         if self._session is None:
             return None
         try:
-            async with self._session.get(f"https://gamma-api.polymarket.com/events?slug={slug}") as response:
+            async with self._session.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"slug": slug, "_": str(int(time.time() * 1000))},
+            ) as response:
                 if response.status != 200:
+                    self._note_once("gamma-status", "ERROR", f"Gamma HTTP {response.status} {slug}", 60)
                     return None
                 payload = await response.json(content_type=None)
         except Exception as exc:  # noqa: BLE001
-            self._note("ERROR", f"Gamma {slug}: {exc}")
+            self._note_once("gamma-net", "ERROR", f"Gamma {slug}: {exc}", 60)
             return None
         if not payload:
             return None
         event = payload[0] if isinstance(payload, list) else payload
-        markets = event.get("markets") or []
+        if not isinstance(event, dict):
+            return None
+        markets = [item for item in (event.get("markets") or []) if isinstance(item, dict)]
         if not markets:
             return None
         market = markets[0]
-        outcomes = market.get("outcomes")
-        token_ids = market.get("clobTokenIds")
-        if isinstance(outcomes, str):
-            outcomes = json.loads(outcomes)
-        if isinstance(token_ids, str):
-            token_ids = json.loads(token_ids)
+        if condition_id:
+            for item in markets:
+                if str(item.get("conditionId") or "").lower() == condition_id.lower():
+                    market = item
+                    break
+        else:
+            for item in markets:
+                names = _json_list(item.get("outcomes"))
+                if len(names) == 2:
+                    market = item
+                    break
+        outcomes = _json_list(market.get("outcomes"))
+        token_ids = _json_list(market.get("clobTokenIds"))
         if not outcomes or not token_ids or len(outcomes) != len(token_ids):
             return None
-        tokens = {str(name): str(token) for name, token in zip(outcomes, token_ids)}
-        if "Up" not in tokens or "Down" not in tokens:
+        tokens = {str(name): str(token) for name, token in zip(outcomes, token_ids) if str(name)}
+        if len(tokens) < 2:
             return None
+        asset, timeframe = _asset_timeframe(slug)
         schedule = market.get("feeSchedule") or {}
-        asset = slug.split("-")[0].upper()
-        tf = slug.split("-")[2] if slug.count("-") >= 3 else "5m"
+        if isinstance(schedule, str):
+            try:
+                schedule = json.loads(schedule)
+            except (TypeError, ValueError):
+                schedule = {}
+        if not isinstance(schedule, dict):
+            schedule = {}
         if schedule.get("rate") is not None:
             fee_rate = D(schedule.get("rate"))
         else:
-            fee_rate = fallback_taker_fee_rate(asset, tf)
+            fee_rate = fallback_taker_fee_rate(asset, timeframe)
         fee_exp = D(schedule.get("exponent") or 1)
+        start_ts = _iso_ts(market.get("startDate") or event.get("startDate") or market.get("eventStartTime"))
+        end_ts = _iso_ts(market.get("endDate") or event.get("endDate") or market.get("endDateIso"))
+        bounds = _slug_bounds(slug)
+        if bounds is not None:
+            start_ts, end_ts = bounds[2], bounds[3]
+        tick = market.get("orderPriceMinTickSize") or market.get("minimum_tick_size") or "0.01"
+        min_shares = market.get("orderMinSize") or market.get("min_order_size") or "5"
         return {
-            "condition_id": str(market.get("conditionId") or ""),
+            "condition_id": str(market.get("conditionId") or condition_id or ""),
             "tokens": tokens,
-            "tick": D(market.get("orderPriceMinTickSize") or "0.01"),
-            "min_shares": D(market.get("orderMinSize") or "5"),
+            "tick": D(tick),
+            "min_shares": D(min_shares),
             "fee_rate": fee_rate,
             "fee_exponent": fee_exp,
+            "start_ts": float(start_ts or 0),
+            "end_ts": float(end_ts or 0),
+            "asset": asset,
+            "timeframe": timeframe,
         }
+
+    async def _clob_meta(self, condition_id: str, slug: str = "") -> dict | None:
+        payload = await self._get_json(f"https://clob.polymarket.com/markets/{condition_id}")
+        if not isinstance(payload, dict):
+            return None
+        tokens: dict[str, str] = {}
+        for entry in payload.get("tokens") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("outcome") or entry.get("name") or "").strip()
+            token = str(entry.get("token_id") or entry.get("tokenId") or "").strip()
+            if name and token:
+                tokens[name] = token
+        if len(tokens) < 2:
+            return None
+        asset, timeframe = _asset_timeframe(slug)
+        bounds = _slug_bounds(slug)
+        start_ts = _iso_ts(payload.get("start_date") or payload.get("startDate"))
+        end_ts = _iso_ts(payload.get("end_date_iso") or payload.get("endDate"))
+        if bounds is not None:
+            start_ts, end_ts = bounds[2], bounds[3]
+        return {
+            "condition_id": str(payload.get("condition_id") or condition_id),
+            "tokens": tokens,
+            "tick": D(payload.get("minimum_tick_size") or payload.get("tick_size") or "0.01"),
+            "min_shares": D(payload.get("min_order_size") or "5"),
+            "fee_rate": fallback_taker_fee_rate(asset, timeframe),
+            "fee_exponent": Decimal(1),
+            "start_ts": float(start_ts or 0),
+            "end_ts": float(end_ts or 0),
+            "asset": asset,
+            "timeframe": timeframe,
+        }
+
+    async def _ensure_window(
+        self,
+        slug: str,
+        *,
+        condition_id: str = "",
+        token_id: str = "",
+        outcome: str = "",
+    ) -> Window | None:
+        """Create a window for any market the wallet touches, not a fixed list."""
+        existing = self.windows.get(slug)
+        if existing is not None and len(existing.tokens) >= 2:
+            return existing
+        now = self._clock()
+        retry_at = self._meta_retry_at.get(slug, 0.0)
+        if retry_at > now:
+            return existing
+        meta = await self._market_meta(slug, condition_id)
+        if meta and existing is not None:
+            # A fallback window had one token. Fill in the real outcome map
+            # so the official winner can still be determined later.
+            existing.tokens = dict(meta.get("tokens") or existing.tokens)
+            existing.condition_id = str(meta.get("condition_id") or existing.condition_id)
+            existing.fee_rate = D(meta.get("fee_rate") or existing.fee_rate)
+            existing.fee_exponent = D(meta.get("fee_exponent") or existing.fee_exponent)
+            existing.min_shares = D(meta.get("min_shares") or existing.min_shares)
+            existing.tick = D(meta.get("tick") or existing.tick)
+            if not existing.start_ts:
+                existing.start_ts = float(meta.get("start_ts") or 0)
+            if not existing.end_ts:
+                existing.end_ts = float(meta.get("end_ts") or 0)
+            return existing
+        if not meta:
+            self._meta_retry_at[slug] = now + 3.0
+            return None
+        tokens = dict(meta.get("tokens") or {})
+        if token_id and token_id not in tokens.values():
+            # The row knows the token even if Gamma returned a stale market.
+            if outcome and outcome not in tokens:
+                tokens[outcome] = token_id
+        if outcome and outcome not in tokens:
+            self._meta_retry_at[slug] = now + 3.0
+            return None
+        window = self._window_from_meta(slug, meta)
+        self.windows[slug] = window
+        self._note(
+            "INFO",
+            f"Новый рынок в копировании: {slug} · {', '.join(window.tokens)}",
+        )
+        return window
+
+    def _fallback_window(self, job) -> Window:
+        """Last-resort metadata from the wallet row and the slug.
+
+        Used only when Gamma and CLOB both stayed silent for several ticks.
+        Token ids come from the row itself, so the copy can still be priced.
+        """
+        slug = job.slug
+        asset, timeframe = _asset_timeframe(slug)
+        bounds = _slug_bounds(slug)
+        tokens = {}
+        if job.outcome and job.token_id:
+            tokens[job.outcome] = job.token_id
+        return Window(
+            slug=slug,
+            asset=asset,
+            timeframe=timeframe,
+            condition_id=job.condition_id,
+            tokens=tokens,
+            start_ts=bounds[2] if bounds else 0.0,
+            end_ts=bounds[3] if bounds else 0.0,
+            tick=Decimal("0.01"),
+            min_shares=Decimal("5"),
+            fee_rate=fallback_taker_fee_rate(asset, timeframe),
+            fee_exponent=Decimal(1),
+        )
 
     async def _book(self, token_id: str) -> tuple[list, list]:
         if self._session is None:
             raise RuntimeError("book session is not initialized")
         if not token_id:
             raise ValueError("book token_id is empty")
-        try:
-            async with self._session.get("https://clob.polymarket.com/book", params={"token_id": token_id}) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"order book HTTP {response.status}")
-                payload = await response.json(content_type=None)
-            if not isinstance(payload, dict) or not isinstance(payload.get("bids"), list) or not isinstance(payload.get("asks"), list):
-                raise ValueError("order book response has an invalid shape")
-            # A valid empty book is [], []; transport/API failures are raised.
-            return payload["bids"], payload["asks"]
-        except Exception as exc:  # noqa: BLE001
-            self._note("ERROR", f"Стакан недоступен: {exc}")
-            raise
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                async with self._session.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": token_id, "_": str(int(time.time() * 1000))},
+                ) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"order book HTTP {response.status}")
+                    payload = await response.json(content_type=None)
+                if (
+                    not isinstance(payload, dict)
+                    or not isinstance(payload.get("bids"), list)
+                    or not isinstance(payload.get("asks"), list)
+                ):
+                    # A schema error will not heal in 120 ms; fail fast.
+                    raise ValueError("order book response has an invalid shape")
+                # A valid empty book is [], []; transport/API failures are raised.
+                return payload["bids"], payload["asks"]
+            except ValueError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(0.12)
+        assert last_error is not None
+        self._note_once("book-error", "ERROR", f"Стакан недоступен: {last_error}", 20)
+        raise last_error
+
+    def _book_task(self, token_id: str) -> asyncio.Task:
+        """One in-flight book request per token, shared by every caller."""
+        task = self._book_tasks.get(token_id)
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(self._book(token_id))
+        self._book_tasks[token_id] = task
+
+        def _finished(done: asyncio.Task) -> None:
+            self._book_tasks.pop(token_id, None)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is None:
+                bids, asks = done.result()
+                self._book_cache[token_id] = (bids, asks, time.monotonic())
+            else:
+                # Read the exception so a background failure is not reported
+                # as "never retrieved"; the caller that awaits gets it too.
+                log.debug("book %s: %s", token_id, error)
+
+        task.add_done_callback(_finished)
+        return task
+
+    async def _book_for(self, token_id: str) -> tuple[list, list]:
+        """Cached book if fresh, otherwise the shared in-flight request."""
+        cached = self._cached_book(token_id)
+        if cached is not None:
+            return cached
+        bids, asks = await self._book_task(token_id)
+        return bids, asks
+
+    def _cached_book(self, token_id: str) -> tuple[list, list] | None:
+        item = self._book_cache.get(token_id)
+        if item is None:
+            return None
+        bids, asks, stored = item
+        if time.monotonic() - stored > 1.5:
+            return None
+        return bids, asks
+
+    async def _prefetch_books(self, token_ids: set[str]) -> None:
+        """One book request per token for a burst of wallet fills.
+
+        The copy loop applies events one at a time, so fetching all books in
+        parallel first removes the serial network wait from the queue.
+        """
+        wanted = [token for token in token_ids if token and self._cached_book(token) is None]
+        if not wanted or self._session is None:
+            return
+        # Shared tasks: an event that starts while these are in flight joins
+        # the same request instead of opening a second one.
+        await asyncio.gather(
+            *(self._book_task(token) for token in wanted), return_exceptions=True,
+        )
 
     async def _trade_loop(self) -> None:
         while self.running:
@@ -637,16 +1025,30 @@ class TradingEngine:
                 for window in list(self.windows.values()):
                     if window.resolved:
                         continue
-                    await self._on_window(window)
-                if self.mode == "paper":
+                    try:
+                        await self._on_window(window)
+                    except Exception as exc:  # noqa: BLE001
+                        # One bad market must not stop the other windows.
+                        self._note_once(
+                            f"window:{window.slug}", "ERROR",
+                            f"Окно {window.slug}: {exc}", 30,
+                        )
+                if self.mode == "paper" and self.cfg.strategy != "copy_wallet":
                     # No per-window tape here. Only the 60s cap can fire,
                     # which is what unblocks a window whose tape has gone quiet.
                     self.paper.release_expired_ghosts(time.time(), self.cfg.tape_settle_s)
             except Exception as exc:  # noqa: BLE001
-                self._note("ERROR", f"Торговля: {exc}")
-            await asyncio.sleep(2)
+                self._note_once("trade-loop", "ERROR", f"Торговля: {exc}", 10)
+            await asyncio.sleep(2.0)
 
     def _refresh_halt(self) -> None:
+        if self.cfg.strategy == "copy_wallet" and not self.cfg.copy_use_risk_limits:
+            # A 1:1 copier must not stop because the demo account had a bad
+            # day; cash on hand is still enforced per event. The day baseline
+            # is still rolled so the panel resets at midnight UTC.
+            self.portfolio.roll_day(self.portfolio.equity(self.marks))
+            self.halt_reason = ""
+            return
         equity = self.portfolio.equity(self.marks)
         self.portfolio.roll_day(equity)
         reason = ""
@@ -656,7 +1058,8 @@ class TradingEngine:
             reason = f"{self.consecutive_losses} убыточных окон подряд"
         if reason and reason != self.halt_reason:
             self.halt_reason = reason
-            self._cancel_all()
+            if self.cfg.strategy != "copy_wallet":
+                self._cancel_all()
             self._note("ERROR", f"Стоп риска: {reason}", notify=True)
         elif not reason:
             # The daily reset clears the halt only. A manual pause stays.
@@ -665,89 +1068,256 @@ class TradingEngine:
     async def _copy_wallet_loop(self) -> None:
         """Poll the target wallet independently of slower market-management work."""
         while self.running:
+            started = time.monotonic()
             try:
                 await self._copy_wallet_tick()
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
-                self._note("ERROR", f"Копирование кошелька: {exc}")
-            await asyncio.sleep(1.0)
+                self._note_once("copy-loop", "ERROR", f"Копирование кошелька: {exc}", 15)
+            delay = max(0.05, float(self.cfg.copy_poll_s) - (time.monotonic() - started))
+            if time.monotonic() < self._copy_backoff_until:
+                delay = max(delay, self._copy_backoff_until - time.monotonic())
+            await asyncio.sleep(delay)
 
     async def _copy_wallet_tick(self) -> None:
-        """Copy the target wallet's BTC 5m trades, merges and redeems."""
-        if not is_valid_wallet_address(self.cfg.copy_wallet):
+        """Copy every new wallet event: trades, merges, splits and redeems."""
+        if not is_valid_wallet_address(self.cfg.copy_wallet) or self._session is None:
             return
-        # Trade fills are the latency-critical path. Fetch activity less often
-        # to avoid doubling public API load on every one-second poll.
-        rows_task = asyncio.create_task(self._fetch_wallet_trades())
-        activity = None
+        now = self._clock()
         monotonic_now = time.monotonic()
-        if monotonic_now - self._last_activity_poll >= 5.0:
-            activity_task = asyncio.create_task(self._fetch_wallet_activity())
-            rows, activity = await asyncio.gather(rows_task, activity_task)
+        # Both trade views are requested: Polymarket returns the maker side
+        # for takerOnly=false and the taker side for takerOnly=true. A
+        # one-sided poll silently misses part of the wallet's activity.
+        want_activity = monotonic_now - self._last_activity_poll >= float(self.cfg.copy_activity_poll_s)
+        tasks = [asyncio.create_task(self._fetch_wallet_trades())]
+        if want_activity:
+            tasks.append(asyncio.create_task(self._fetch_wallet_activity()))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        trades = None if isinstance(results[0], BaseException) else results[0]
+        activity = None
+        if want_activity:
             self._last_activity_poll = time.monotonic()
-        else:
-            rows = await rows_task
-        now = time.time()
-        self._refresh_halt()
-        incoming = list(rows or []) + [row for row in (activity or []) if str(row.get("type") or "").upper() != "TRADE"]
-        if incoming:
-            for row in reversed(incoming):
-                self.copy.observe(row, now=now, cfg=self.cfg)
+            if len(results) > 1 and not isinstance(results[1], BaseException):
+                activity = results[1]
+        for outcome in results:
+            if isinstance(outcome, BaseException):
+                self._note_once(
+                    "copy-feed-task", "ERROR", f"Лента кошелька: {outcome}", 20,
+                )
+        if trades is None and activity is None:
+            self.copy.bump("feed_errors")
+            self._copy_backoff_until = time.monotonic() + 2.0
+            return
+
+        incoming: list[dict] = []
+        if trades is not None:
+            if not self.copy.seeded:
+                if self.cfg.copy_seed_on_start:
+                    added = self.copy.seed(trades, cfg=self.cfg, stream="trades")
+                    self._note(
+                        "INFO",
+                        f"Точка отсчёта ленты: {added} старых исполнений не копируются.",
+                    )
+                else:
+                    # Explicit backfill: the newest page is copied once.
+                    self.copy.seeded = True
+                    incoming.extend(trades)
+            else:
+                incoming.extend(trades)
+        if activity is not None:
+            if not self.copy.seeded_activity:
+                if self.cfg.copy_seed_on_start:
+                    added = self.copy.seed(activity, cfg=self.cfg, stream="activity")
+                    self._note(
+                        "INFO",
+                        f"Точка отсчёта активности: {added} старых записей не копируются.",
+                    )
+                else:
+                    self.copy.seeded_activity = True
+                    incoming.extend(
+                        row for row in activity
+                        if str(row.get("type") or "").upper() not in ("TRADE", "REWARD", "MAKER_REBATE", "TAKER_REBATE")
+                    )
+            else:
+                incoming.extend(
+                    row for row in activity
+                    if str(row.get("type") or "").upper() not in ("TRADE", "REWARD", "MAKER_REBATE", "TAKER_REBATE")
+                )
+
+        # Chronological order matters: the wallet's later fill may sell what
+        # its earlier fill bought, and the carry must follow the same order.
+        incoming.sort(key=lambda row: (
+            float(row.get("timestamp") or 0),
+            str(row.get("transaction_hash") or row.get("transactionHash") or ""),
+        ))
+        queued = 0
+        for row in incoming:
+            job = self.copy.observe(row, now=now, cfg=self.cfg)
+            if job is not None:
+                self._copy_last_seen_at = now
+                self.copy.bump("observed")
+                queued += 1
+        if queued:
+            # The queue survives a crash; a wallet fill must never be lost
+            # because the process died between seeing and executing it.
+            self._persist_copy()
+
+        # A market that never publishes metadata must not sit in the queue forever.
+        for job in list(self.copy.jobs):
+            if job.done:
+                continue
+            if now - job.detected_at > float(self.cfg.copy_pending_timeout_s):
+                await self._skip_copy(job, "metadata timeout", now)
+
         if self.paused or self.halt_reason:
             reason = "paused" if self.paused else (self.halt_reason or "halt")
             for job in self.copy.due(now):
                 await self._skip_copy(job, reason, now)
-            self._persist()
+            self._persist(copy=True)
             return
-        for job in self.copy.due(now):
-            await self._execute_copy(job, now)
-        self._persist()
+
+        due = self.copy.due(now)
+        if due:
+            await self._prefetch_books({
+                job.token_id for job in due if job.kind == "TRADE" and job.token_id
+            })
+        for job in due:
+            if job.done:
+                continue
+            started = time.monotonic()
+            try:
+                await self._execute_copy(job, self._clock())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                job.attempts += 1
+                self._note_once(
+                    f"copy:{job.event_id[:16]}", "ERROR",
+                    f"Копирование {job.slug} {job.side}: {exc}", 15,
+                )
+                if job.attempts >= int(self.cfg.copy_max_attempts):
+                    await self._skip_copy(job, f"error: {exc}", self._clock())
+            if job.done:
+                self._copy_last_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+                self._copy_dirty = True
+                # Portfolio state is small and must survive a crash between
+                # events. Seen-id history is flushed less often.
+                self._persist(copy=False)
+            if time.monotonic() - started > 5.0:
+                self._note_once(
+                    "copy-slow", "ERROR",
+                    f"Медленное исполнение копии {job.slug}: {time.monotonic() - started:.1f} с",
+                    30,
+                )
+        self.copy.prune()
+        self._book_cache = {
+            token: item for token, item in self._book_cache.items()
+            if time.monotonic() - item[2] <= 5.0
+        }
+        self._persist(copy=True)
 
     async def _execute_copy(self, job, now: float) -> None:
-        window = self.windows.get(job.slug)
-        if window is None and job.kind == "TRADE":
-            end = _window_end(job.slug)
-            if end is not None and now > end + 30:
-                await self._skip_copy(job, "window unknown", now)
+        if job.done:
             return
-        if job.kind == "TRADE" and window is not None and (window.resolved or now >= window.end_ts):
-            await self._skip_copy(job, "market closed", now)
+        if self.copy.was_applied(job.event_id):
+            # The fill landed before a restart but the job row survived. Never
+            # apply the same wallet event twice.
+            job.done = True
             return
-        scale = await self._copy_scale(now)
+        # Ask the book and the metadata at the same time. Two sequential
+        # round trips would put the fill a full RTT behind the wallet for no
+        # reason: the token id is already in the wallet row.
+        if job.kind == "TRADE" and job.token_id and self._cached_book(job.token_id) is None:
+            self._book_task(job.token_id)
+        window = await self._ensure_window(
+            job.slug,
+            condition_id=job.condition_id,
+            token_id=job.token_id,
+            outcome=job.outcome,
+        )
+        if window is None:
+            job.attempts += 1
+            if job.attempts < int(self.cfg.copy_max_attempts):
+                return
+            # Both metadata sources are silent. The wallet row still has the
+            # token id, so a degraded window keeps the copy moving.
+            window = self._fallback_window(job)
+            self.windows.setdefault(job.slug, window)
+            self._note(
+                "ERROR",
+                f"Нет метаданных {job.slug}; копирую по строке кошелька.",
+            )
+        if window is not None and job.outcome:
+            # The wallet row and Gamma can spell the same outcome differently
+            # ("YES" vs "Yes"). The window's spelling is canonical: a position
+            # stored under a different key would not be found at settlement.
+            name = ""
+            if job.token_id:
+                for candidate, token in window.tokens.items():
+                    if token and token == job.token_id:
+                        name = candidate
+                        break
+            if not name:
+                for candidate in window.tokens:
+                    if candidate.lower() == job.outcome.lower():
+                        name = candidate
+                        break
+            if name:
+                job.outcome = name
+        scale = await self._copy_scale(self._clock())
         if scale is None:
             # Auto-scale depends on a public portfolio-value request. A
-            # transient API failure must not permanently consume this event.
-            # Keep it pending; expired trades are rejected by the window guard.
-            if self.cfg.copy_scale_auto:
+            # transient failure must not consume the event.
+            if self.cfg.copy_scale_auto and self.cfg.copy_size_mode == "scale":
                 return
             await self._skip_copy(job, "scale unknown", now)
             return
-        if scale <= 0:
-            await self._skip_copy(job, "scale unknown", now)
-            return
-        if job.kind == "TRADE" and window is not None and (window.resolved or now >= window.end_ts):
-            await self._skip_copy(job, "market closed", now, scale=scale)
-            return
         if job.kind == "REDEEM":
-            if job.payout > 0:
-                self.copy.shadow.redeem(job.slug, job.outcome)
-            else:
-                self.copy.shadow.drop(job.slug, job.outcome)
-            await self._skip_copy(job, "redeem waits for official resolution", now, scale=scale)
+            await self._mirror_redeem(job, now, scale, window)
             return
         if job.kind in ("MERGE", "SPLIT"):
             await self._mirror_inventory(job, now, scale, window)
             return
+        if job.kind != "TRADE":
+            await self._skip_copy(job, f"unsupported {job.kind}", now, scale=scale)
+            return
         await self._mirror_trade(job, now, scale, window)
+        if job.done:
+            # The position must survive a crash between the fill and the end
+            # of the tick. The portfolio blob is small; the seen-id list is
+            # what gets the slower cadence.
+            self._persist(copy=False)
+
+    def _within_copy_band(self, job, window: Window | None) -> str:
+        """Empty when this event may be copied; otherwise the skip reason."""
+        if job.kind == "TRADE":
+            low = D(str(self.cfg.copy_min_price))
+            high = D(str(self.cfg.copy_max_price))
+            if job.wallet_price < low or job.wallet_price > high:
+                return "price band"
+        if job.kind == "TRADE" and window is not None and window.start_ts > 0:
+            elapsed = self._clock() - window.start_ts
+            if self.cfg.copy_min_t and elapsed < float(self.cfg.copy_min_t):
+                return "window not open"
+            if self.cfg.copy_max_t and elapsed > float(self.cfg.copy_max_t):
+                return "window time passed"
+        if job.kind == "TRADE" and int(self.cfg.copy_max_per_window or 0) > 0:
+            if self.copy.per_window.get(job.slug, 0) >= int(self.cfg.copy_max_per_window):
+                return "window event limit"
+        return ""
 
     async def _mirror_trade(self, job, now: float, scale: Decimal, window: Window | None) -> None:
         if window is None:
             await self._skip_copy(job, "window unknown", now, scale=scale)
             return
+        reason = self._within_copy_band(job, window)
+        if reason:
+            await self._skip_copy(job, reason, now, scale=scale)
+            return
         min_shares = window.min_shares
         fee_rate = window.fee_rate
         fee_exp = window.fee_exponent
-        # Validate all required market identifiers before consuming the event's
-        # sizing carry or mutating the wallet shadow book.
         if not job.token_id:
             await self._skip_copy(job, "missing token", now, scale=scale)
             return
@@ -760,28 +1330,41 @@ class TradingEngine:
             )
             job.done = True
             return
-        bids, asks = await self._book(job.token_id)
-        # Network book retrieval can cross the market boundary. Use a fresh
-        # wall-clock timestamp after the await, not the tick's stale timestamp.
-        execution_now = time.time()
+        if job.side == "SELL":
+            held = self._held_shares(job.slug, job.outcome)
+            if held <= 0:
+                await self._record_copy(
+                    job, now, scale, status="SKIPPED", reason="no inventory",
+                    scaled=desired, carry=carry,
+                )
+                job.done = True
+                return
+            want = min(desired, held)
+        else:
+            want = desired
+        bids, asks = await self._book_for(job.token_id)
+        execution_now = self._clock()
         self._refresh_halt()
         if self.paused or self.halt_reason:
             reason = "paused" if self.paused else self.halt_reason
             await self._skip_copy(job, reason, execution_now, scale=scale)
             return
-        if window.resolved or execution_now >= window.end_ts:
+        if (
+            window.end_ts > 0
+            and execution_now >= window.end_ts + float(self.cfg.copy_late_grace_s)
+        ):
             await self._skip_copy(job, "market closed", execution_now, scale=scale)
             return
         if not bids and not asks:
-            end = _window_end(job.slug)
-            if end is not None and time.time() > end + 30:
-                await self._skip_copy(job, "empty book", now, scale=scale)
+            end = window.end_ts or _window_end(job.slug)
+            if end and execution_now > end + 30:
+                await self._skip_copy(job, "empty book", execution_now, scale=scale)
             return
-        # Re-read inventory after the network await. The trade loop may have
-        # merged this window while the order book was being fetched.
-        want = desired
+        # Re-read inventory after the network await. A concurrent resolution
+        # may have settled this window meanwhile.
         if job.side == "SELL":
-            want = min(desired, self._held_shares(job.slug, job.outcome))
+            held = self._held_shares(job.slug, job.outcome)
+            want = min(want, held)
             if want <= 0:
                 await self._record_copy(
                     job, now, scale, status="SKIPPED", reason="no inventory",
@@ -810,107 +1393,137 @@ class TradingEngine:
             )
             job.done = True
             return
-        if window is None:
-            await self._skip_copy(job, "window unknown", now, scale=scale)
-            return
+        # Only the top of the book is kept with the fill. The full ladder can
+        # be hundreds of levels and would grow the database for no benefit.
+        top_bids = sorted(parse_levels(bids), key=lambda item: item[0], reverse=True)[:20]
+        top_asks = sorted(parse_levels(asks), key=lambda item: item[0])[:20]
         snapshot = json.dumps(
             {
-                "bids": [{"price": str(px), "size": str(sz)} for px, sz in parse_levels(bids)],
-                "asks": [{"price": str(px), "size": str(sz)} for px, sz in parse_levels(asks)],
+                "bids": [{"price": str(px), "size": str(sz)} for px, sz in top_bids],
+                "asks": [{"price": str(px), "size": str(sz)} for px, sz in top_asks],
                 "taken": [{"price": str(px), "size": str(sz)} for px, sz in taken],
                 "wallet_price": str(job.wallet_price),
                 "wallet_size": str(job.wallet_size),
                 "scale": str(scale),
+                "size_mode": self.cfg.copy_size_mode,
                 "tx": job.tx,
                 "event_id": job.event_id,
                 "detected_at": job.detected_at,
             },
             ensure_ascii=False,
         )
+        applied: list[tuple[Decimal, Decimal]] = []
+        applied_fee = _ZERO
+        fill_error = ""
         for index, (px, sz) in enumerate(taken):
             level_fee = fee_for_lifts([(px, sz)], fee_rate, fee_exp)
-            if job.side == "SELL":
-                try:
+            order_id = f"copy-{(job.event_id or job.tx)[:16]}-{index}"
+            try:
+                if job.side == "SELL":
                     self.portfolio.sell_fill(
                         slug=window.slug, condition_id=window.condition_id,
                         asset=window.asset, timeframe=window.timeframe,
                         outcome=job.outcome, shares=sz, price=px, fee=level_fee,
                     )
-                except ValueError as exc:
-                    await self._record_copy(
-                        job, now, scale, status="SKIPPED", reason=str(exc),
-                        scaled=desired, carry=carry,
+                    self.ledger.record_fill(
+                        mode=self.mode, slug=window.slug, condition_id=window.condition_id,
+                        asset=window.asset, timeframe=window.timeframe, outcome=job.outcome,
+                        role="TAKER", shares=sz, price=px, notional=usdc(sz * px),
+                        fee=level_fee, order_id=order_id,
+                        placed_at=job.detected_at, book=snapshot,
                     )
-                    job.done = True
-                    return
-                self.ledger.record_fill(
-                    mode=self.mode, slug=window.slug, condition_id=window.condition_id,
-                    asset=window.asset, timeframe=window.timeframe, outcome=job.outcome,
-                    role="TAKER", shares=sz, price=px, notional=usdc(sz * px),
-                    fee=level_fee, order_id=f"copy-{(job.event_id or job.tx)[:16]}-{index}",
-                    placed_at=job.detected_at, book=snapshot,
+                else:
+                    self._apply_fill(
+                        window,
+                        Fill(
+                            order_id=order_id,
+                            outcome=job.outcome,
+                            shares=sz,
+                            price=px,
+                            fee=level_fee,
+                            role="TAKER",
+                            placed_at=job.detected_at,
+                            book=snapshot,
+                        ),
+                        persist=False,
+                        raise_on_error=True,
+                    )
+            except ValueError as exc:
+                fill_error = str(exc)
+                self._note_once(
+                    f"copy-fill:{job.event_id[:12]}", "ERROR",
+                    f"Филл не записан ({job.slug} {job.side}): {exc}", 30,
                 )
-            else:
-                self._apply_fill(
-                    window,
-                    Fill(
-                        order_id=f"copy-{(job.event_id or job.tx)[:16]}-{index}",
-                        outcome=job.outcome,
-                        shares=sz,
-                        price=px,
-                        fee=level_fee,
-                        role="TAKER",
-                        placed_at=job.detected_at,
-                        book=snapshot,
-                    ),
-                )
-        got = sum((sz for _px, sz in taken), _ZERO)
+                break
+            applied.append((px, sz))
+            applied_fee += level_fee
+        if not applied:
+            await self._record_copy(
+                job, now, scale, status="SKIPPED",
+                reason=fill_error or "fill rejected",
+                scaled=desired, carry=carry,
+            )
+            job.done = True
+            return
+        got = sum((sz for _px, sz in applied), _ZERO)
+        cost = sum((usdc(px * sz) for px, sz in applied), _ZERO)
         avg = (cost / got) if got else _ZERO
         status = "FILLED"
         notes: list[str] = []
+        if fill_error:
+            status = "PARTIAL"
+            notes.append(f"fill rejected: {fill_error}")
         if job.side == "SELL" and want + Decimal("0.000001") < desired:
             status = "PARTIAL"
             notes.append("capped at holdings")
         if got + Decimal("0.000001") < want:
             status = "PARTIAL"
             notes.append("book shorter than the scaled size")
+        best_bid = max((px for px, _sz in parse_levels(bids)), default=None)
+        if best_bid is not None:
+            self.marks[(job.slug, job.outcome)] = best_bid
+        if job.wallet_size > 0 and got < desired - Decimal("0.000001"):
+            self.copy.bump("partial")
+        else:
+            self.copy.bump("filled")
+        self.copy.add_window_count(job.slug)
+        self.copy.mark_applied(job.event_id)
         await self._record_copy(
             job, now, scale, status=status, reason="; ".join(notes),
-            scaled=desired, carry=carry, our_size=got, our_price=avg, fee=fee,
-            slip=slippage(job.side, avg, job.wallet_price), levels=taken,
+            scaled=desired, carry=carry, our_size=got, our_price=avg, fee=applied_fee,
+            slip=slippage(job.side, avg, job.wallet_price), levels=applied,
         )
         job.done = True
 
     async def _mirror_inventory(self, job, now: float, scale: Decimal, window: Window | None) -> None:
-        key = f"{job.slug}|{job.kind}"
-        min_shares = D(str(self.cfg.min_merge_shares))
-        desired, carry = self._size_once(job, scale, key, min_shares, shadow=False)
-        event_id = job.event_id or job.tx
-        if event_id not in self.copy.sized or len(self.copy.sized[event_id]) < 3:
-            exact = job.wallet_size * scale
-            if job.kind == "MERGE":
-                self.copy.shadow.merge(job.slug, exact)
-            else:
-                self.copy.shadow.split(job.slug, exact)
-            self.copy.sized[event_id] = [str(desired), str(carry), "1"]
-        if desired <= 0:
+        """Mirror the wallet's own MERGE/SPLIT with the same number of pairs."""
+        mode = self.cfg.copy_size_mode
+        if mode == "fixed":
+            desired = usdc(D(str(self.cfg.copy_shares)))
+            carry = _ZERO
+        elif mode == "exact":
+            desired = usdc(job.wallet_size)
+            carry = _ZERO
+        else:
+            desired, carry = scale_size(
+                job.wallet_size, scale, _ZERO, D(str(self.cfg.min_merge_shares)),
+            )
+        if desired < D("0.01"):
             await self._record_copy(
-                job, now, scale, status="SKIPPED", reason="below minimum, carried",
+                job, now, scale, status="SKIPPED", reason="below minimum",
                 scaled=job.wallet_size * scale, carry=carry,
             )
             job.done = True
             return
-        if window is None:
-            end = _window_end(job.slug)
-            if end is not None and now > end + 30:
-                await self._skip_copy(job, "window unknown", now, scale=scale)
-            return
+        had = job.event_id in self.copy.sized
+        if not had:
+            self.copy.sized[job.event_id] = [str(desired), str(carry)]
+            self._shadow_trade(job, job.wallet_size * (D("1") if mode != "scale" else scale))
         if job.kind == "MERGE":
             book = self.portfolio.markets.get(job.slug)
-            up = book.lot("Up").shares if book else _ZERO
-            down = book.lot("Down").shares if book else _ZERO
-            pairs = min(desired, up, down)
-            if pairs < min_shares:
+            lots = [lot.shares for lot in (book.outcomes.values() if book else []) if lot.shares > 0]
+            pairs = min([desired, *lots]) if lots else _ZERO
+            if pairs < D(str(self.cfg.min_merge_shares)):
                 await self._record_copy(
                     job, now, scale, status="SKIPPED", reason="not enough to merge",
                     scaled=desired, carry=carry,
@@ -920,39 +1533,130 @@ class TradingEngine:
             try:
                 pnl = self.portfolio.merge(job.slug, pairs)
             except ValueError as exc:
-                await self._record_copy(job, now, scale, status="SKIPPED", reason=str(exc), scaled=desired, carry=carry)
-                job.done = True
-                return
-            self.ledger.record_merge(mode=self.mode, slug=job.slug, pairs=pairs, pnl=pnl, tx=job.tx)
-            partial = pairs + Decimal("0.000001") < desired
-            await self._record_copy(
-                job, now, scale, status="PARTIAL" if partial else "FILLED",
-                reason="inventory shorter than scaled merge" if partial else "",
-                scaled=desired, carry=carry, our_size=pairs, our_price=Decimal("1"),
-            )
-        else:
-            cost = usdc(desired)
-            blocked = self._copy_block_reason(job.slug, cost, cost)
-            if blocked:
                 await self._record_copy(
-                    job, now, scale, status="SKIPPED", reason=blocked,
+                    job, now, scale, status="SKIPPED", reason=str(exc),
                     scaled=desired, carry=carry,
                 )
                 job.done = True
                 return
-            try:
-                self.portfolio.split(
-                    slug=window.slug, condition_id=window.condition_id,
-                    asset=window.asset, timeframe=window.timeframe, pairs=desired,
-                )
-            except ValueError as exc:
-                await self._record_copy(job, now, scale, status="SKIPPED", reason=str(exc), scaled=desired, carry=carry)
-                job.done = True
-                return
+            self.ledger.record_merge(mode=self.mode, slug=job.slug, pairs=pairs, pnl=pnl, tx=job.tx)
+            partial = pairs + Decimal("0.000001") < desired
+            self.copy.bump("merged")
+            self.copy.mark_applied(job.event_id)
             await self._record_copy(
-                job, now, scale, status="FILLED", reason="",
-                scaled=desired, carry=carry, our_size=desired, our_price=Decimal("1"),
+                job, now, scale, status="PARTIAL" if partial else "FILLED",
+                reason="inventory shorter than wallet merge" if partial else "",
+                scaled=desired, carry=carry, our_size=pairs, our_price=D("1"),
             )
+            job.done = True
+            return
+        # SPLIT mints one Up and one Down per pair for $1.
+        cost = usdc(desired)
+        blocked = self._copy_block_reason(job.slug, cost, cost)
+        if blocked:
+            await self._record_copy(
+                job, now, scale, status="SKIPPED", reason=blocked,
+                scaled=desired, carry=carry,
+            )
+            job.done = True
+            return
+        try:
+            self.portfolio.split(
+                slug=window.slug if window else job.slug,
+                condition_id=window.condition_id if window else job.condition_id,
+                asset=window.asset if window else _asset_timeframe(job.slug)[0],
+                timeframe=window.timeframe if window else _asset_timeframe(job.slug)[1],
+                pairs=desired,
+                outcomes=tuple(window.tokens) if window is not None and len(window.tokens) == 2 else None,
+            )
+        except ValueError as exc:
+            await self._record_copy(
+                job, now, scale, status="SKIPPED", reason=str(exc),
+                scaled=desired, carry=carry,
+            )
+            job.done = True
+            return
+        self.copy.bump("split")
+        self.copy.mark_applied(job.event_id)
+        await self._record_copy(
+            job, now, scale, status="FILLED", reason="",
+            scaled=desired, carry=carry, our_size=desired, our_price=D("1"),
+        )
+        job.done = True
+
+    async def _mirror_redeem(self, job, now: float, scale: Decimal, window: Window | None) -> None:
+        """Settle our paper position when the wallet redeems an outcome."""
+        tokens = dict(window.tokens) if window else {}
+        winner = job.outcome
+        if job.payout <= 0:
+            if len(tokens) == 2 and job.outcome in tokens:
+                winner = next(name for name in tokens if name != job.outcome)
+            else:
+                winner = ""
+        had = job.event_id in self.copy.sized
+        if not had:
+            self.copy.sized[job.event_id] = ["0", "0"]
+            if job.payout > 0 and winner:
+                self.copy.shadow.redeem(job.slug, winner)
+            else:
+                self.copy.shadow.drop(job.slug, job.outcome)
+        book = self.portfolio.markets.get(job.slug)
+        if not winner or book is None or book.resolved:
+            self.copy.bump("redeem_ignored")
+            self.copy.mark_applied(job.event_id)
+            await self._record_copy(
+                job, now, scale, status="SKIPPED",
+                reason="nothing to settle" if book is None or book.resolved else "winner unknown",
+                scaled=job.wallet_size * scale, carry=_ZERO,
+            )
+            job.done = True
+            return
+        shares = book.open_shares()
+        winning_lot = book.outcomes.get(winner)
+        payout_shares = winning_lot.shares if winning_lot is not None else _ZERO
+        try:
+            self.portfolio.redeem(job.slug, winner, gas=self._gas())
+        except ValueError as exc:
+            await self._record_copy(
+                job, now, scale, status="SKIPPED", reason=str(exc),
+                scaled=job.wallet_size * scale, carry=_ZERO,
+            )
+            job.done = True
+            return
+        book.closed = True
+        book.closed_ts = time.time()
+        if window is not None:
+            window.resolved = True
+            window.reported = True
+        # ``resolutions.pnl`` is the window's whole realized result (merges,
+        # sells and the redeem itself), exactly like the official resolution
+        # path writes it. Storing only the redeem leg would double count the
+        # merge leg once the window also has a merge row.
+        total = book.realized
+        if total < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+        self.ledger.record_resolution(
+            mode=self.mode, slug=job.slug, condition_id=window.condition_id if window else job.condition_id,
+            asset=window.asset if window else _asset_timeframe(job.slug)[0],
+            timeframe=window.timeframe if window else _asset_timeframe(job.slug)[1],
+            winner=winner, pnl=total, payout=str(usdc(payout_shares)),
+            overwrite=True,
+        )
+        self.copy.bump("redeemed")
+        self.copy.mark_applied(job.event_id)
+        await self._record_copy(
+            job, now, scale, status="FILLED", reason="wallet redeem",
+            scaled=job.wallet_size * scale, carry=_ZERO,
+            our_size=shares, our_price=D("1"),
+        )
+        word = "Вверх" if winner == "Up" else ("Вниз" if winner == "Down" else winner)
+        self._note(
+            "INFO",
+            f"REDEEM кошелька · {job.slug} · победил {word} · итог ${total}",
+            notify=True,
+        )
         job.done = True
 
     def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal, *, shadow: bool) -> tuple[Decimal, Decimal]:
@@ -960,20 +1664,41 @@ class TradingEngine:
         saved = self.copy.sized.get(event_id)
         if saved:
             return D(saved[0]), D(saved[1])
-        desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
-        self.copy.set_carry(key, carry)
+        mode = getattr(self.cfg, "copy_size_mode", "scale")
+        if mode == "fixed":
+            desired = floor_to_step(D(str(self.cfg.copy_shares)), D("0.01"))
+            carry = _ZERO
+            if desired < min_shares:
+                desired = _ZERO
+        elif mode == "exact":
+            desired, carry = scale_size(job.wallet_size, D("1"), self.copy.carry_of(key), min_shares)
+            self.copy.set_carry(key, carry)
+        else:
+            desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
+            self.copy.set_carry(key, carry)
         self.copy.sized[event_id] = [str(desired), str(carry)]
         if shadow:
-            self._shadow_trade(job, job.wallet_size * scale)
+            shadow_scale = D("1") if mode != "scale" else scale
+            self._shadow_trade(job, job.wallet_size * shadow_scale)
         return desired, carry
 
     def _shadow_trade(self, job, exact: Decimal) -> None:
-        if job.side == "SELL":
+        kind = str(getattr(job, "kind", "TRADE") or "TRADE").upper()
+        if kind == "MERGE":
+            self.copy.shadow.merge(job.slug, exact)
+        elif kind == "SPLIT":
+            self.copy.shadow.split(job.slug, exact)
+        elif str(getattr(job, "side", "")).upper() == "SELL":
             self.copy.shadow.sell(job.slug, job.outcome, exact, job.wallet_price)
-        else:
+        elif kind == "TRADE":
             self.copy.shadow.buy(job.slug, job.outcome, exact, job.wallet_price)
 
     def _scale_label(self) -> str:
+        mode = getattr(self.cfg, "copy_size_mode", "scale")
+        if mode == "exact":
+            return "1"
+        if mode == "fixed":
+            return f"fixed:{self.cfg.copy_shares:g}"
         if self.cfg.copy_scale_auto:
             cached = getattr(self, "_copy_scale_value", None)
             return "auto" if cached is None else str(cached)
@@ -994,18 +1719,26 @@ class TradingEngine:
             return "not enough cash"
         book = self.portfolio.markets.get(slug)
         spent = book.cost_basis() if book else _ZERO
-        if spent + added_cost > D(str(self.cfg.max_window_risk_usd)):
+        if self.cfg.strategy == "copy_wallet":
+            window_cap = D(str(self.cfg.copy_window_cap_usd or 0))
+            exposure_cap = D(str(self.cfg.copy_exposure_cap_usd or 0))
+        else:
+            window_cap = D(str(self.cfg.max_window_risk_usd))
+            exposure_cap = D(str(self.cfg.max_total_exposure_usd))
+        if window_cap > 0 and spent + added_cost > window_cap:
             return "window cap"
         exposure = self.portfolio.exposure_cost() + self.portfolio.reserved
-        if exposure + added_cost > D(str(self.cfg.max_total_exposure_usd)):
+        if exposure_cap > 0 and exposure + added_cost > exposure_cap:
             return "exposure cap"
         return ""
 
     async def _skip_copy(self, job, reason: str, now: float, scale: Decimal | None = None) -> None:
         job.done = True
+        self.copy.bump("skipped")
         await self._record_copy(
             job, now, scale if scale is not None else _ZERO,
-            status="SKIPPED", reason=reason, scaled=_ZERO, carry=self.copy.carry_of(f"{job.token_id}|{job.side}"),
+            status="SKIPPED", reason=reason, scaled=_ZERO,
+            carry=self.copy.carry_of(f"{job.token_id}|{job.side}"),
         )
 
     async def _record_copy(
@@ -1015,7 +1748,7 @@ class TradingEngine:
         fee: Decimal = _ZERO, slip: Decimal = _ZERO,
         levels: list | None = None,
     ) -> None:
-        lag = job.detected_at - job.trade_ts if job.trade_ts else 0
+        lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0
         self.ledger.record_copy(
             mode=self.mode, slug=job.slug, tx=job.tx, event_id=job.event_id,
             wallet_ts=job.trade_ts, detected_at=job.detected_at, lag_s=lag,
@@ -1027,9 +1760,14 @@ class TradingEngine:
             levels=json.dumps([[str(px), str(sz)] for px, sz in (levels or [])]),
         )
         if status == "SKIPPED":
-            self._note("INFO", f"SKIPPED {job.slug} {job.side} {job.outcome}: {reason}")
+            self._note_once(
+                f"skip:{job.event_id[:16]}:{reason}", "INFO",
+                f"SKIPPED {job.slug} {job.side} {job.outcome}: {reason}", 10,
+            )
 
     async def _copy_scale(self, now: float) -> Decimal | None:
+        if getattr(self.cfg, "copy_size_mode", "scale") in ("exact", "fixed"):
+            return D("1")
         if not self.cfg.copy_scale_auto:
             raw = self.cfg.copy_scale if self.cfg.copy_scale is not None else 0.07
             return D(str(raw))
@@ -1063,11 +1801,11 @@ class TradingEngine:
                 params={"user": self.cfg.copy_wallet, "_": str(int(time.time() * 1000))},
             ) as response:
                 if response.status != 200:
-                    self._note("ERROR", f"Стоимость кошелька HTTP {response.status}")
+                    self._note_once("value-status", "ERROR", f"Стоимость кошелька HTTP {response.status}", 60)
                     return None
                 payload = await response.json(content_type=None)
         except Exception as exc:  # noqa: BLE001
-            self._note("ERROR", f"Стоимость кошелька: {exc}")
+            self._note_once("value-net", "ERROR", f"Стоимость кошелька: {exc}", 60)
             return None
         data = payload.get("data") if isinstance(payload, dict) else None
         raw = data.get("value") if isinstance(data, dict) else None
@@ -1096,109 +1834,184 @@ class TradingEngine:
                             pass
                     message = f"{label} HTTP {response.status}"
                     if not retryable or attempt + 1 >= COPY_API_ATTEMPTS:
-                        self._note("ERROR", message)
+                        self._note_once(f"{label}-{response.status}", "ERROR", message, 20)
+                        if response.status == 429:
+                            self._copy_backoff_until = time.monotonic() + max(1.0, retry_delay)
                         return None
-                    self._note("INFO", f"{message}; повтор {attempt + 1}/{COPY_API_ATTEMPTS - 1}")
+                    self._note_once(f"{label}-retry", "INFO", f"{message}; повтор", 15)
             except Exception as exc:  # noqa: BLE001
                 if attempt + 1 >= COPY_API_ATTEMPTS:
-                    self._note("ERROR", f"{label}: {exc}")
+                    self._note_once(f"{label}-net", "ERROR", f"{label}: {exc}", 20)
                     return None
-                self._note("INFO", f"{label}: {exc}; повтор {attempt + 1}/{COPY_API_ATTEMPTS - 1}")
+                self._note_once(f"{label}-retry", "INFO", f"{label}: {exc}; повтор", 15)
             await asyncio.sleep(retry_delay)
         return None
 
-    async def _fetch_wallet_trades(self) -> list[dict] | None:
+    @staticmethod
+    def _unique_rows(rows: list[dict]) -> list[dict]:
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for row in rows:
+            key = event_key(row)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            unique.append(row)
+        return unique
+
+    @staticmethod
+    def _page_rows(payload) -> list[dict]:
+        rows = payload.get("data") if isinstance(payload, dict) else payload
+        return [row for row in (rows or []) if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    @staticmethod
+    def _page_cursor(payload) -> tuple[str, bool]:
+        """``(next_cursor, has_more)`` for cursor endpoints, else ``("", False)``."""
+        if not isinstance(payload, dict):
+            return "", False
+        for blob in (payload.get("pagination"), payload):
+            if not isinstance(blob, dict):
+                continue
+            cursor = blob.get("next_cursor") or blob.get("nextCursor") or ""
+            more = blob.get("has_more", blob.get("hasMore"))
+            if cursor:
+                return str(cursor), (True if more is None else bool(more))
+        return "", False
+
+    async def _wallet_pages(
+        self,
+        kind: str,
+        *,
+        seeded: bool,
+        seen: set[str],
+        taker_only: bool | None = None,
+    ) -> list[dict] | None:
+        """Read new rows from one wallet feed, tolerant of API shape changes.
+
+        Returns ``None`` only when the first page could not be read at all.
+        A failure on page two or later returns the rows already collected:
+        losing a whole poll because a deep page timed out would leave a gap
+        in the wallet's history.
+        """
+        if self._session is None:
+            return []
+        label = "Лента кошелька" if kind == "trades" else "Активность кошелька"
+        endpoints = TRADE_ENDPOINTS if kind == "trades" else ACTIVITY_ENDPOINTS
+        chosen = self._feed_endpoint.get(kind, "")
+        ordered = ((chosen,) if chosen else ()) + tuple(url for url in endpoints if url != chosen)
+        pages = 1 if not seeded else COPY_API_MAX_PAGES
+        collected: list[dict] = []
+        for base in ordered:
+            page_rows: list[dict] = []
+            cursor = ""
+            offset = 0
+            style = ""
+            first_ok = False
+            for page_number in range(pages):
+                params = {
+                    "user": self.cfg.copy_wallet.lower(),
+                    "limit": "200",
+                }
+                if kind == "trades":
+                    params["takerOnly"] = "true" if taker_only else "false"
+                if style == "cursor" and cursor:
+                    params["cursor"] = cursor
+                elif style != "cursor" and offset:
+                    params["offset"] = str(offset)
+                payload = await self._wallet_api_page(base, params, label)
+                if payload is None:
+                    if not first_ok:
+                        break
+                    # Keep the rows already read; the next poll resumes.
+                    self._note_once(
+                        f"{kind}-deep-page", "ERROR",
+                        f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
+                        60,
+                    )
+                    return page_rows
+                first_ok = True
+                if not style:
+                    style = "cursor" if self._page_cursor(payload)[0] else "offset"
+                page = self._page_rows(payload)
+                if not page:
+                    break
+                known = all(
+                    (event_key(row) in seen)
+                    or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
+                    for row in page
+                )
+                if known:
+                    break
+                fresh = [
+                    row for row in page
+                    if event_key(row) not in seen
+                    and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
+                ]
+                page_rows.extend(fresh)
+                seen.update(key for row in page if (key := event_key(row)))
+                cursor, has_more = self._page_cursor(payload)
+                if style == "cursor":
+                    if not has_more or not cursor:
+                        break
+                else:
+                    offset += len(page)
+                    explicit = None
+                    if isinstance(payload, dict):
+                        for blob in (payload.get("pagination"), payload):
+                            if isinstance(blob, dict) and blob.get("has_more") is not None:
+                                explicit = bool(blob.get("has_more"))
+                                break
+                    if explicit is False:
+                        break
+                    # The endpoint may cap ``limit`` below what was asked for.
+                    # A short page means the end; a full one may still have a
+                    # tail, so it is followed up to the page cap.
+                    if explicit is None and len(page) < 100:
+                        break
+            if first_ok:
+                if self._feed_endpoint.get(kind) != base:
+                    self._feed_endpoint[kind] = base
+                    self._note("INFO", f"{label}: используется {base}")
+                collected = page_rows
+                break
+        else:
+            return None
+        named = [row for row in collected if wallet_of(row)]
+        if collected and not named:
+            # The endpoint answered but the rows carry no wallet field, so the
+            # anti-counterparty filter would drop everything and the copier
+            # would look idle with no explanation.
+            self._note_once(
+                f"{kind}-no-wallet", "ERROR",
+                f"{label}: в строках нет поля кошелька; копирование невозможно",
+                60,
+            )
+        return [row for row in collected if is_target_wallet(row, self.cfg.copy_wallet)]
+
+    async def _fetch_wallet_trades(self, taker_only: bool | None = None) -> list[dict] | None:
+        """New target-wallet trade rows from both the maker and taker view."""
         if self._session is None or not is_valid_wallet_address(self.cfg.copy_wallet):
             return []
-        collected: list[dict] = []
-        cursor = None
-        seen = set(self.copy.seen_tx)
-        for page_number in range(COPY_API_MAX_PAGES):
-            params = {
-                "user": self.cfg.copy_wallet.lower(),
-                "limit": "200",
-                "takerOnly": "false",
-                "_": str(int(time.time() * 1000)),
-            }
-            if cursor:
-                params["cursor"] = cursor
-            payload = await self._wallet_api_page(
-                "https://data-api.polymarket.com/v2/trades", params, "Лента кошелька",
+        if taker_only is None:
+            maker, taker = await asyncio.gather(
+                self._fetch_wallet_trades(False),
+                self._fetch_wallet_trades(True),
             )
-            if payload is None:
+            if maker is None and taker is None:
                 return None
-            rows = payload.get("data") if isinstance(payload, dict) else payload
-            page = list(rows or [])
-            if not page:
-                break
-            page_known = all(
-                (event_key(row) in seen) or
-                (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
-                for row in page
-            )
-            if page_known:
-                break
-            new_rows = [
-                row for row in page
-                if event_key(row) not in seen
-                and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
-            ]
-            collected.extend(new_rows)
-            seen.update(key for row in page if (key := event_key(row)))
-            pagination = payload.get("pagination") if isinstance(payload, dict) else None
-            has_more = bool(pagination and pagination.get("has_more"))
-            cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
-            if not has_more or not cursor:
-                break
-            if page_number + 1 == COPY_API_MAX_PAGES:
-                self._note("ERROR", f"Лента кошелька: достигнут предел пагинации {COPY_API_MAX_PAGES} страниц; хвост ещё не прочитан")
-        return [row for row in collected if is_target_wallet(row, self.cfg.copy_wallet)]
+            return self._unique_rows(list(maker or []) + list(taker or []))
+        return await self._wallet_pages(
+            "trades", seeded=self.copy.seeded, seen=set(self.copy._seen),
+            taker_only=taker_only,
+        )
 
     async def _fetch_wallet_activity(self) -> list[dict] | None:
         if self._session is None or not is_valid_wallet_address(self.cfg.copy_wallet):
             return []
-        collected: list[dict] = []
-        cursor = None
-        seen = set(self.copy.seen_tx)
-        for page_number in range(COPY_API_MAX_PAGES):
-            params = {
-                "user": self.cfg.copy_wallet.lower(),
-                "limit": "200",
-                "_": str(int(time.time() * 1000)),
-            }
-            if cursor:
-                params["cursor"] = cursor
-            payload = await self._wallet_api_page(
-                "https://data-api.polymarket.com/v2/activity", params, "Активность кошелька",
-            )
-            if payload is None:
-                return None
-            rows = payload.get("data") if isinstance(payload, dict) else payload
-            page = list(rows or [])
-            if not page:
-                break
-            page_known = all(
-                (event_key(row) in seen) or
-                (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
-                for row in page
-            )
-            if page_known:
-                break
-            new_rows = [
-                row for row in page
-                if event_key(row) not in seen
-                and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
-            ]
-            collected.extend(new_rows)
-            seen.update(key for row in page if (key := event_key(row)))
-            pagination = payload.get("pagination") if isinstance(payload, dict) else None
-            has_more = bool(pagination and pagination.get("has_more"))
-            cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
-            if not has_more or not cursor:
-                break
-            if page_number + 1 == COPY_API_MAX_PAGES:
-                self._note("ERROR", f"Активность кошелька: достигнут предел пагинации {COPY_API_MAX_PAGES} страниц; хвост ещё не прочитан")
-        return [row for row in collected if is_target_wallet(row, self.cfg.copy_wallet)]
+        return await self._wallet_pages(
+            "activity", seeded=self.copy.seeded_activity, seen=set(self.copy._seen),
+        )
 
     def copies_report(self, since: float | None = None, limit: int | None = None) -> dict:
         rows = self.ledger.copies(self.mode, since=since, limit=limit)
@@ -1221,19 +2034,77 @@ class TradingEngine:
         for row in rows:
             row["wallet_tx"] = row.get("tx") or ""
         scale = self._scale_label()
+        counters = dict(self.copy.counters)
         return {
             "scale": scale,
-            "scale_mode": "auto" if self.cfg.copy_scale_auto else "fixed",
+            "scale_mode": (
+                "exact" if self.cfg.copy_size_mode == "exact"
+                else ("fixed" if self.cfg.copy_size_mode == "fixed"
+                      else ("auto" if self.cfg.copy_scale_auto else "fixed_scale"))
+            ),
+            "size_mode": self.cfg.copy_size_mode,
             "slip": str(self.cfg.copy_max_slip),
             "target_wallet": self.cfg.copy_wallet.lower(),
+            "scope": list(self.cfg.copy_slug_prefixes),
+            "poll_s": self.cfg.copy_poll_s,
             "execution_model": "taker_after_wallet_fill",
+            "seeded": bool(self.copy.seeded),
+            "activity_seeded": bool(self.copy.seeded_activity),
+            "counters": counters,
+            "last_lag_s": round(self._copy_last_lag, 3),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
             "copies": rows,
         }
 
+    async def _copy_window_maintenance(self, window: Window) -> None:
+        """Only what a copier needs: marks for the equity line and settlement.
+
+        There are no resting orders to fill and no ladder to place, so the
+        maker tape, queue and merge logic is skipped entirely. On a busy
+        wallet that is the difference between two and a dozen API calls per
+        second.
+        """
+        now = self._clock()
+        book = self.portfolio.markets.get(window.slug)
+        held = book.open_shares() if book is not None else _ZERO
+        # Marks only matter for the equity line of an open position. A window
+        # the copier skipped entirely needs no book request at all.
+        if held > 0 and now - window.marks_at >= 5.0 and window.tokens:
+            window.marks_at = now
+            for outcome, token in window.tokens.items():
+                if self._held_shares(window.slug, outcome) <= 0:
+                    continue
+                try:
+                    bids, asks = await self._book(token)
+                except Exception:  # noqa: BLE001
+                    continue
+                best_bid, _, _ = touch(bids, asks)
+                if best_bid is not None:
+                    self.marks[(window.slug, outcome)] = best_bid
+        if window.end_ts <= 0:
+            # A market without a published close: only settle when something
+            # is actually held, and do not hammer the resolution endpoints.
+            if book is not None and book.open_shares() > 0 and now - window.resolve_at >= 60.0:
+                window.resolve_at = now
+                await self._resolve(window)
+            return
+        if now < window.end_ts:
+            return
+        if book is not None and book.open_shares() <= 0 and book.cost_basis() <= _ZERO:
+            window.resolved = True
+            self.portfolio.close_if_finished(window.slug, ended=True)
+            self._report_if_closed(window)
+            return
+        if now - window.resolve_at >= 15.0:
+            window.resolve_at = now
+            await self._resolve(window)
+
     async def _on_window(self, window: Window) -> None:
+        if self.cfg.strategy == "copy_wallet":
+            await self._copy_window_maintenance(window)
+            return
         books: dict[str, tuple[list, list]] = {}
         for outcome, token in window.tokens.items():
             bids, asks = await self._book(token)
@@ -1259,10 +2130,6 @@ class TradingEngine:
             await self._merge(window)
             if window.seconds_to_end < -8 and not self._ghosts_for(window):
                 await self._resolve(window)
-            return
-
-        if self.cfg.strategy == "copy_wallet":
-            await self._merge(window)
             return
 
         if self.paused or self.halt_reason or not in_entry_window(window.seconds_from_start, window.seconds_to_end):
@@ -1399,7 +2266,9 @@ class TradingEngine:
             if order_id not in self.paper.orders:
                 window.orders.pop(key, None)
 
-    def _apply_fill(self, window: Window, fill: Fill) -> None:
+    def _apply_fill(
+        self, window: Window, fill: Fill, *, persist: bool = True, raise_on_error: bool = False,
+    ) -> None:
         try:
             self.portfolio.buy_fill(
                 slug=window.slug,
@@ -1414,6 +2283,8 @@ class TradingEngine:
             )
         except ValueError as exc:
             self._note("ERROR", f"Филл не записан ({window.slug}): {exc}")
+            if raise_on_error:
+                raise
             return
         if (
             self.mode == "paper"
@@ -1434,13 +2305,15 @@ class TradingEngine:
             book=fill.book,
         )
         side = "Вверх" if fill.outcome == "Up" else "Вниз"
+        role = "Мейкер" if fill.role == "MAKER" else "Тейкер"
         self._note(
             "INFO",
-            f"Заявка исполнена · {side} {window.asset} {window.timeframe} · "
+            f"{role} · {side} {window.asset} {window.timeframe} · "
             f"{fill.shares} шт по {fill.price} · ${notional} · комиссия ${fill.fee}",
-            notify=True,
+            notify=persist,
         )
-        self._persist()
+        if persist:
+            self._persist()
 
     async def _pull_live_fills(self, window: Window) -> None:
         for key, order_id in list(window.orders.items()):
@@ -1693,7 +2566,10 @@ class TradingEngine:
         if winner is None:
             return
         self._cancel_window(window)
-        await self._merge(window)
+        if self.cfg.strategy != "copy_wallet":
+            # The copier mirrors the wallet's own MERGE events 1:1. Merging
+            # pairs on its own would diverge from the wallet's cash flow.
+            await self._merge(window)
         book = self.portfolio.markets.get(window.slug)
         if book is None or book.open_shares() <= 0:
             window.resolved = True
@@ -1725,7 +2601,7 @@ class TradingEngine:
         self.ledger.record_resolution(
             mode=self.mode, slug=window.slug, condition_id=window.condition_id,
             asset=window.asset, timeframe=window.timeframe, winner=winner,
-            pnl=total, payout=str(payout),
+            pnl=total, payout=str(payout), overwrite=True,
         )
         window.reported = True
         word = "Вверх" if winner == "Up" else "Вниз"
@@ -1761,8 +2637,14 @@ class TradingEngine:
 
         data-api /v2/resolutions can say status=resolved while Gamma is still
         open and the book is still priced in the middle. That row is ignored.
+
+        When only one token is known (a window rebuilt from the ledger, or a
+        market whose metadata never arrived) the official outcome names are
+        still trustworthy: the market is closed and UMA resolved it, so the
+        winner is accepted by name instead of being rejected for not being in
+        a one-element set. That is what keeps a remaining position settleable.
         """
-        known = set(window.tokens)
+        known: set[str] | None = set(window.tokens) if len(window.tokens) >= 2 else None
         clob = winner_from_clob_market(
             await self._get_json(f"https://clob.polymarket.com/markets/{window.condition_id}"),
             known,
@@ -1817,7 +2699,9 @@ class TradingEngine:
                     realized=str(self.portfolio.realized),
                 )
                 self._last_equity_ts = now
-                self._persist()
+                self._persist(copy=False)
+                if self._copy_dirty:
+                    self._persist_copy(force=True)
             except Exception as exc:  # noqa: BLE001
                 self._note("ERROR", f"Запись капитала: {exc}. Котировки продолжаются.")
         stale = []
@@ -1825,14 +2709,34 @@ class TradingEngine:
             book = self.portfolio.markets.get(slug)
             still_open = book is not None and not book.closed
             if still_open:
-                if window.end_ts < now - 6 * 3600 and slug not in self._stuck_noted:
+                if window.end_ts > 0 and window.end_ts < now - 6 * 3600 and slug not in self._stuck_noted:
                     self._stuck_noted.add(slug)
                     self._note("ERROR", f"Окно {slug} без итога больше 6 часов, позиция сохранена")
                 continue
-            if window.end_ts < now - 600:
+            if window.end_ts > 0 and window.end_ts < now - 600:
+                stale.append(slug)
+            elif window.end_ts <= 0 and window.marks_at < now - 3600:
+                # Unknown close time and untouched for an hour: drop the view.
                 stale.append(slug)
         for slug in stale:
             self.windows.pop(slug, None)
+            for key in [key for key in self.marks if key[0] == slug]:
+                self.marks.pop(key, None)
+        # Bound everything that otherwise grows for the life of the process.
+        self.copy.prune()
+        if len(self._meta_retry_at) > 2000:
+            self._meta_retry_at = dict(list(self._meta_retry_at.items())[-1000:])
+        if len(self._note_last) > 500:
+            self._note_last = dict(list(self._note_last.items())[-250:])
+        if len(self._stale_tape) > 1000:
+            self._stale_tape.clear()
+        if len(self._stuck_noted) > 1000:
+            self._stuck_noted.clear()
+        if len(self._resolution_conflict) > 1000:
+            self._resolution_conflict.clear()
+        dropped = self.portfolio.prune_closed(max_age_s=3 * 86400)
+        if dropped:
+            self._persist(copy=False)
 
     def snapshot(self) -> dict[str, Any]:
         equity = self.portfolio.equity(self.marks)
@@ -1921,6 +2825,30 @@ class TradingEngine:
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)) if self.cfg.strategy == "copy_wallet" else None,
             "copy_scale": self._scale_label() if self.cfg.strategy == "copy_wallet" else None,
             "copy_max_slip": self.cfg.copy_max_slip if self.cfg.strategy == "copy_wallet" else None,
+            "copy": (
+                {
+                    "target_wallet": self.cfg.copy_wallet.lower(),
+                    "size_mode": self.cfg.copy_size_mode,
+                    "scope": list(self.cfg.copy_slug_prefixes),
+                    "poll_s": self.cfg.copy_poll_s,
+                    "slip": self.cfg.copy_max_slip,
+                    # Trade seeding is what actually starts the copying. The
+                    # activity feed is reported separately so a slow endpoint
+                    # does not make the whole copier look idle.
+                    "seeded": bool(self.copy.seeded),
+                    "activity_seeded": bool(self.copy.seeded_activity),
+                    "seen": len(self.copy.seen_tx),
+                    "applied": len(self.copy.applied),
+                    "pending": sum(1 for job in self.copy.jobs if not job.done),
+                    "counters": dict(self.copy.counters),
+                    "last_lag_s": round(self._copy_last_lag, 3),
+                    "last_event_at": self._copy_last_seen_at,
+                    "window_cap_usd": self.cfg.copy_window_cap_usd,
+                    "exposure_cap_usd": self.cfg.copy_exposure_cap_usd,
+                }
+                if self.cfg.strategy == "copy_wallet"
+                else None
+            ),
             "copies": self.ledger.copies(self.mode, limit=40) if self.cfg.strategy == "copy_wallet" else [],
             "equity": str(equity),
             "cash": str(self.portfolio.cash),
@@ -1953,8 +2881,15 @@ class TradingEngine:
             "windows": [
                 {
                     "slug": w.slug, "asset": w.asset, "timeframe": w.timeframe,
-                    "seconds_to_end": round(w.seconds_to_end, 1),
-                    "quoting": in_entry_window(w.seconds_from_start, w.seconds_to_end) and not self.paused and not self.halt_reason,
+                    # Infinity is not valid JSON for the browser. Unknown
+                    # close time is reported as null.
+                    "seconds_to_end": round(w.seconds_to_end, 1) if w.end_ts > 0 else None,
+                    "quoting": (
+                        self.cfg.strategy != "copy_wallet"
+                        and in_entry_window(w.seconds_from_start, w.seconds_to_end)
+                        and not self.paused and not self.halt_reason
+                    ),
+                    "copying": self.cfg.strategy == "copy_wallet" and not w.resolved,
                 }
                 for w in sorted(self.windows.values(), key=lambda w: w.end_ts)
                 if not w.resolved
@@ -1972,6 +2907,9 @@ class TradingEngine:
                 "max_total_exposure_usd": self.cfg.max_total_exposure_usd,
                 "max_daily_loss_usd": self.cfg.max_daily_loss_usd,
                 "max_consecutive_losses": self.cfg.max_consecutive_losses,
+                "copy_window_cap_usd": self.cfg.copy_window_cap_usd,
+                "copy_exposure_cap_usd": self.cfg.copy_exposure_cap_usd,
+                "copy_risk_limits": self.cfg.copy_use_risk_limits,
             },
             "assets": self.cfg.enabled_assets,
             "timeframes": self.cfg.enabled_timeframes,
@@ -2005,11 +2943,13 @@ def _closed_flag(value: Any) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
-def winner_from_clob_market(payload: Any, known: set[str]) -> str | None:
+def winner_from_clob_market(payload: Any, known: set[str] | None) -> str | None:
     """CLOB is official only when the market is closed and one token won.
 
     A winner flag on an still-open market is ignored. If flags are absent,
     payout numerators aligned with the token list are accepted the same way.
+    ``known=None`` means only one token is known (a window rebuilt from the
+    ledger), so the official name is accepted instead of cross-checked.
     """
     if not isinstance(payload, dict) or not _closed_flag(payload.get("closed")):
         return None
@@ -2018,7 +2958,7 @@ def winner_from_clob_market(payload: Any, known: set[str]) -> str | None:
     for token in tokens:
         if token.get("winner") is True:
             name = str(token.get("outcome") or "")
-            if name in known:
+            if known is None or name in known:
                 flagged.append(name)
     if len(flagged) == 1:
         return flagged[0]
@@ -2038,12 +2978,12 @@ def winner_from_clob_market(payload: Any, known: set[str]) -> str | None:
     if not amounts or max(amounts) <= 0 or amounts.count(max(amounts)) != 1:
         return None
     name = str(tokens[amounts.index(max(amounts))].get("outcome") or "")
-    if name not in known:
+    if known is not None and name not in known:
         return None
     return name
 
 
-def winner_from_gamma_market(market: Any, known: set[str]) -> str | None:
+def winner_from_gamma_market(market: Any, known: set[str] | None) -> str | None:
     """Gamma is official only when the market is closed and UMA says resolved.
 
     Outcome prices must be exactly 1 and 0. A live price such as 0.995 is not
@@ -2070,7 +3010,7 @@ def winner_from_gamma_market(market: Any, known: set[str]) -> str | None:
             winner = str(name)
         elif price != 0:
             return None
-    if winner not in known:
+    if known is not None and winner not in known:
         return None
     return winner
 
