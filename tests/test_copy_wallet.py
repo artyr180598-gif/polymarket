@@ -301,6 +301,18 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(row["reason"], "no inventory")
         self.assertEqual(engine.portfolio.markets[window.slug].open_shares(), Decimal("0"))
 
+    def test_auto_scale_api_failure_keeps_copy_event_pending(self) -> None:
+        from unittest.mock import AsyncMock
+
+        cfg = _cfg(copy_scale_auto=True)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xscale-outage"), now=1_000_051, cfg=cfg)
+        engine._copy_scale = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        self.assertFalse(job.done)
+        self.assertEqual(engine.ledger.copies("paper"), [])
+
     def test_split_obeys_total_exposure_cap(self) -> None:
         cfg = _cfg(copy_scale=1, max_total_exposure_usd=1, max_window_risk_usd=1000)
         engine = TradingEngine(cfg)
