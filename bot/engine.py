@@ -613,17 +613,22 @@ class TradingEngine:
         }
 
     async def _book(self, token_id: str) -> tuple[list, list]:
-        if self._session is None or not token_id:
-            return [], []
+        if self._session is None:
+            raise RuntimeError("book session is not initialized")
+        if not token_id:
+            raise ValueError("book token_id is empty")
         try:
             async with self._session.get("https://clob.polymarket.com/book", params={"token_id": token_id}) as response:
                 if response.status != 200:
-                    return [], []
+                    raise RuntimeError(f"order book HTTP {response.status}")
                 payload = await response.json(content_type=None)
+            if not isinstance(payload, dict) or not isinstance(payload.get("bids"), list) or not isinstance(payload.get("asks"), list):
+                raise ValueError("order book response has an invalid shape")
+            # A valid empty book is [], []; transport/API failures are raised.
+            return payload["bids"], payload["asks"]
         except Exception as exc:  # noqa: BLE001
-            self._note("ERROR", f"Стакан: {exc}")
-            return [], []
-        return payload.get("bids") or [], payload.get("asks") or []
+            self._note("ERROR", f"Стакан недоступен: {exc}")
+            raise
 
     async def _trade_loop(self) -> None:
         while self.running:
