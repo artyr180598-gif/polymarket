@@ -96,6 +96,15 @@ class WalletFilterTests(unittest.TestCase):
         self.assertIsNone(restored.observe(first, now=1_000_120, cfg=cfg))
         self.assertIsNone(restored.observe(second, now=1_000_121, cfg=cfg))
 
+    def test_chain_logs_in_same_transaction_have_distinct_event_keys(self) -> None:
+        base = _buy("0xonchain")
+        first = {**base, "source": "polygon", "contract": "0xexchange", "logIndex": 7}
+        second = {**base, "source": "polygon", "contract": "0xexchange", "logIndex": 8}
+        other_contract = {**first, "contract": "0xneg-risk"}
+        self.assertNotEqual(event_key(first), event_key(second))
+        self.assertNotEqual(event_key(first), event_key(other_contract))
+        self.assertEqual(event_key(first), event_key({**first, "log_index": "7"}))
+
     def test_legacy_tx_only_seen_state_is_still_honored(self) -> None:
         book = CopyBook.from_dict({"seen_tx": ["0xlegacy"]})
         self.assertIsNone(book.observe(_buy("0xlegacy"), now=1_000_120, cfg=_cfg()))
