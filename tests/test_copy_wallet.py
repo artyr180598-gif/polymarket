@@ -359,6 +359,16 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(engine.snapshot()["copy_scale"], "0.07")
         self.assertEqual(engine.snapshot()["copy_max_slip"], 0.03)
 
+    def test_resume_cannot_override_an_active_daily_loss_halt(self) -> None:
+        cfg = _cfg(strategy="maker_ladder", auto_start=True, max_daily_loss_usd=100)
+        engine = TradingEngine(cfg)
+        engine.portfolio.cash -= Decimal("150")
+        engine.pause()
+        engine.resume()
+        self.assertTrue(engine.paused)
+        self.assertTrue(engine.manual_pause)
+        self.assertIn("дневной лимит", engine.halt_reason)
+
     def test_manual_pause_survives_restart_and_the_daily_reset(self) -> None:
         cfg = _cfg(strategy="maker_ladder", auto_start=True, copy_scale=None)
         engine = TradingEngine(cfg)
