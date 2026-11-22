@@ -301,6 +301,17 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(row["reason"], "no inventory")
         self.assertEqual(engine.portfolio.markets[window.slug].open_shares(), Decimal("0"))
 
+    def test_auto_scale_value_lookup_uses_backoff_after_failure(self) -> None:
+        from unittest.mock import AsyncMock
+
+        engine = TradingEngine(_cfg(copy_scale_auto=True))
+        lookup = AsyncMock(return_value=None)
+        engine._wallet_portfolio_value = lookup  # type: ignore[method-assign]
+        now = time.time()
+        self.assertIsNone(asyncio.run(engine._copy_scale(now)))
+        self.assertIsNone(asyncio.run(engine._copy_scale(now)))
+        lookup.assert_awaited_once()
+
     def test_auto_scale_api_failure_keeps_copy_event_pending(self) -> None:
         from unittest.mock import AsyncMock
 
