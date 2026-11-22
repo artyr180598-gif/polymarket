@@ -507,6 +507,12 @@ class WalletApiTests(unittest.TestCase):
         engine._session = _FakeSession([_FakeResponse({"bids": [], "asks": []})])
         self.assertEqual(asyncio.run(engine._book("token-1")), ([], []))
 
+    def test_order_book_malformed_payload_is_not_treated_as_empty(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = _FakeSession([_FakeResponse({"data": []})])
+        with self.assertRaisesRegex(ValueError, "invalid shape"):
+            asyncio.run(engine._book("token-1"))
+
     def test_wallet_api_retries_transient_server_errors(self) -> None:
         from unittest.mock import AsyncMock, patch
 
