@@ -262,6 +262,7 @@ class TradingEngine:
         self._notify: Notify | None = None
         self._last_equity_ts = 0.0
         self._last_activity_poll = 0.0
+        self._copy_scale_retry_at = 0.0
         self._live_prices: dict[str, Decimal] = {}
         self._live_left: dict[str, Decimal] = {}
         self._live_original: dict[str, Decimal] = {}
@@ -1021,9 +1022,13 @@ class TradingEngine:
         cached = getattr(self, "_copy_scale_value", None)
         if cached is not None and getattr(self, "_copy_scale_day", "") == day:
             return cached
+        if cached is None and time.monotonic() < self._copy_scale_retry_at:
+            return None
         value = await self._wallet_portfolio_value()
         if value is None or value <= 0:
+            self._copy_scale_retry_at = time.monotonic() + 30.0
             return cached
+        self._copy_scale_retry_at = 0.0
         equity = self.portfolio.equity(self.marks)
         scale = equity / value
         self._copy_scale_value = scale
