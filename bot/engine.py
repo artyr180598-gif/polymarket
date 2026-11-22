@@ -741,6 +741,11 @@ class TradingEngine:
         min_shares = window.min_shares
         fee_rate = window.fee_rate
         fee_exp = window.fee_exponent
+        # Validate all required market identifiers before consuming the event's
+        # sizing carry or mutating the wallet shadow book.
+        if not job.token_id:
+            await self._skip_copy(job, "missing token", now, scale=scale)
+            return
         key = f"{job.token_id}|{job.side}"
         desired, carry = self._size_once(job, scale, key, min_shares, shadow=True)
         if desired <= 0:
@@ -749,9 +754,6 @@ class TradingEngine:
                 scaled=job.wallet_size * scale, carry=carry,
             )
             job.done = True
-            return
-        if not job.token_id:
-            await self._skip_copy(job, "missing token", now, scale=scale)
             return
         bids, asks = await self._book(job.token_id)
         if window.resolved or now >= window.end_ts:
