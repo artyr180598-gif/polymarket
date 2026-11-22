@@ -420,10 +420,16 @@ class TradingEngine:
         if self.cfg.strategy != "copy_wallet" and self.cfg.live_requested and not self.live.ready:
             self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
             return
-        self.consecutive_losses = 0
+        # Re-evaluate the risk stop before clearing a manual pause. Resume is
+        # not an override for a daily-loss or consecutive-loss halt.
+        self._refresh_halt()
+        if self.halt_reason:
+            self.paused = True
+            self._persist()
+            self._note("ERROR", f"Возобновление отклонено: активен стоп риска ({self.halt_reason})", notify=True)
+            return
         self.manual_pause = False
         self.paused = False
-        self.halt_reason = ""
         self._persist()
         self._note("INFO", "Торговля включена", notify=True)
 
