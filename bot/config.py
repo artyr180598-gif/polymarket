@@ -165,7 +165,7 @@ class BotConfig:
             strategy=strategy,
             copy_wallet=os.getenv(
                 "COPY_WALLET", "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
-            ).strip() or "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
+            ).strip().lower() or "0x32ed2e546b187ca15e2841edc82b22c713cf8ec3",
             copy_min_price=_bounded("COPY_MIN_PRICE", "0.50", 0.01, 0.99),
             copy_max_price=_bounded("COPY_MAX_PRICE", "0.95", 0.01, 0.99),
             copy_min_t=max(0.0, float(os.getenv("COPY_MIN_T", "0"))),
