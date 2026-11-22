@@ -115,13 +115,12 @@ class WalletFilterTests(unittest.TestCase):
         self.assertTrue(all(job is not None for job in (cheap, other, sell, fourth)))
         self.assertEqual(len(book.jobs), 4)
 
-    def test_the_copy_waits_for_the_delay(self) -> None:
+    def test_detected_fill_is_due_immediately_even_with_legacy_delay_setting(self) -> None:
         book = CopyBook()
         cfg = _cfg(copy_delay_s=1)
         job = book.observe(_buy("0xabc"), now=5_000, cfg=cfg)
-        self.assertEqual(job.execute_at, 5_001)
-        self.assertEqual(book.due(5_000.9), [])
-        self.assertEqual(book.due(5_001), [job])
+        self.assertEqual(job.execute_at, 5_000)
+        self.assertEqual(book.due(5_000), [job])
 
 
 class ScaleAndBookTests(unittest.TestCase):
