@@ -697,14 +697,14 @@ class TradingEngine:
             if end is not None and now > end + 30:
                 await self._skip_copy(job, "window unknown", now)
             return
-        if job.kind == "TRADE" and window is not None and (window.resolved or window.seconds_to_end <= 0):
+        if job.kind == "TRADE" and window is not None and (window.resolved or now >= window.end_ts):
             await self._skip_copy(job, "market closed", now)
             return
         scale = await self._copy_scale(now)
         if scale is None or scale <= 0:
             await self._skip_copy(job, "scale unknown", now)
             return
-        if job.kind == "TRADE" and window is not None and (window.resolved or window.seconds_to_end <= 0):
+        if job.kind == "TRADE" and window is not None and (window.resolved or now >= window.end_ts):
             await self._skip_copy(job, "market closed", now, scale=scale)
             return
         if job.kind == "REDEEM":
@@ -739,7 +739,7 @@ class TradingEngine:
             await self._skip_copy(job, "missing token", now, scale=scale)
             return
         bids, asks = await self._book(job.token_id)
-        if window.resolved or window.seconds_to_end <= 0:
+        if window.resolved or now >= window.end_ts:
             await self._skip_copy(job, "market closed", now, scale=scale)
             return
         if not bids and not asks:
