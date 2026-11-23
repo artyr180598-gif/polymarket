@@ -52,6 +52,8 @@ class PaperHistoryResetTests(unittest.TestCase):
         result = self.ledger.backup_and_reset_paper_history("clean-paper-v1")
 
         self.assertTrue(result["reset"])
+        self.assertGreater(result["reset_at"], 0)
+        self.assertEqual(self.ledger.paper_history_reset_at(), result["reset_at"])
         self.assertEqual(result["counts"]["fills"], 1)
         self.assertTrue(os.path.exists(result["backup_path"]))
         backup = sqlite3.connect(result["backup_path"])
