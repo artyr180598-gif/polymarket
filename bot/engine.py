@@ -234,6 +234,11 @@ def _enumerate_prints(rows: list[dict]) -> list[tuple[str, dict]]:
     return numbered
 
 
+def _wallet_page_limit(*, seeded: bool, seed_on_start: bool) -> int:
+    """Use deep pagination only for the one-time history/baseline seed."""
+    return COPY_API_MAX_PAGES if (not seeded and seed_on_start) else 1
+
+
 def _trade_query(
     condition_id: str, cursor: str | None, now_ms: int, *, taker_only: bool,
 ) -> dict[str, str]:
@@ -2032,14 +2037,23 @@ class TradingEngine:
         base = endpoints[0]
         # On the first seeded poll, walk the recent backlog too. Otherwise
         # pages beyond the first are mistaken for fresh trades on the next tick.
-        pages = COPY_API_MAX_PAGES if (seeded or self.cfg.copy_seed_on_start) else 1
+        # Walk the backlog only once when establishing the stream baseline.
+        # The old condition (seeded OR copy_seed_on_start) kept the 20-page
+        # bootstrap enabled forever when COPY_SEED_ON_START=true.
+        pages = _wallet_page_limit(
+            seeded=seeded, seed_on_start=self.cfg.copy_seed_on_start,
+        )
         page_rows: list[dict] = []
         cursor = ""
         first_ok = False
         for page_number in range(pages):
+            # Data API /v2/trades can be served from a 300s CloudFront cache.
+            # A unique query key is essential: polling every 500ms without it
+            # can repeatedly receive stale pages and miss the live wallet tape.
             params = {
                 "user": self.cfg.copy_wallet.lower(),
                 "limit": "200",
+                "_": str(time.time_ns() // 1_000_000),
             }
             if kind == "trades":
                 params["takerOnly"] = "true" if taker_only else "false"
