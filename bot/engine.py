@@ -1335,7 +1335,7 @@ class TradingEngine:
             await self._skip_copy(job, "missing token", now, scale=scale)
             return
         key = f"{job.token_id}|{job.side}"
-        desired, carry = self._size_once(job, scale, key, min_shares, shadow=True)
+        desired, carry = self._size_once(job, scale, key, min_shares)
         if desired <= 0:
             await self._record_copy(
                 job, now, scale, status="SKIPPED", reason="below minimum, carried",
@@ -1670,7 +1670,7 @@ class TradingEngine:
         )
         job.done = True
 
-    def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal, *, shadow: bool) -> tuple[Decimal, Decimal]:
+    def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal) -> tuple[Decimal, Decimal]:
         event_id = job.event_id or job.tx
         saved = self.copy.sized.get(event_id)
         if saved:
