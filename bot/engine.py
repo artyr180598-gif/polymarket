@@ -117,7 +117,7 @@ def _strategy_lines(cfg) -> list[str]:
             f"Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск; тейкерская комиссия списывается.",
             "Это PAPER-копия после публичного исполнения: наши сделки проходят как TAKER. Maker-очередь кошелька из публичной ленты не видна.",
             "MERGE, SPLIT и REDEEM кошелька повторяются отдельно; остаток гасится только по официальному итогу рынка.",
-            "Недобранный остаток пишется как PARTIAL или SKIPPED. Рядом виден теневой PnL кошелька без комиссий.",
+            "Недобранный остаток пишется как PARTIAL или SKIPPED. Теневой PnL считается с начала наблюдения и не включает позиции, открытые до старта бота.",
         ]
     return [
         "Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль. Продаж нет.",
@@ -2095,6 +2095,7 @@ class TradingEngine:
             "last_detection_lag_s": round(self._copy_detection_lag, 3),
             "last_execution_lag_s": round(self._copy_execution_lag, 3),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
+            "shadow_basis": "since_tracking_started",
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
             "copies": rows,
@@ -2865,6 +2866,7 @@ class TradingEngine:
             "strategy_title": _strategy_title(self.cfg.strategy),
             "strategy_lines": _strategy_lines(self.cfg),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)) if self.cfg.strategy == "copy_wallet" else None,
+            "shadow_basis": "since_tracking_started" if self.cfg.strategy == "copy_wallet" else None,
             "copy_scale": self._scale_label() if self.cfg.strategy == "copy_wallet" else None,
             "copy_max_slip": self.cfg.copy_max_slip if self.cfg.strategy == "copy_wallet" else None,
             "copy": (
