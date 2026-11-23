@@ -35,6 +35,19 @@ class PaperHistoryResetTests(unittest.TestCase):
         self.ledger.save_portfolio("paper", {"cash": "123"})
         self.ledger.save_copy("paper", {"seen_tx": ["old-event"]})
         self.ledger.save_copy_pending("paper", [{"event_id": "pending-old"}])
+        self.ledger.record_fill(
+            mode="live",
+            slug="eth-updown-5m-live",
+            condition_id="live-condition",
+            asset="ETH",
+            timeframe="5m",
+            outcome="Up",
+            role="TAKER",
+            shares="1",
+            price="0.5",
+            notional="0.5",
+            fee="0",
+        )
 
         result = self.ledger.backup_and_reset_paper_history("clean-paper-v1")
 
@@ -56,6 +69,7 @@ class PaperHistoryResetTests(unittest.TestCase):
             backup.close()
 
         self.assertEqual(self.ledger.fills("paper"), [])
+        self.assertEqual(self.ledger.fills("live")[0]["slug"], "eth-updown-5m-live")
         self.assertIsNone(self.ledger.load_portfolio("paper"))
         self.assertIsNone(self.ledger.load_copy("paper"))
         self.assertEqual(self.ledger.load_copy_pending("paper"), [])
