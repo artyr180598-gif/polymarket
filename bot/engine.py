@@ -53,17 +53,16 @@ _ZERO = Decimal(0)
 WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 COPY_API_MAX_PAGES = 20
 COPY_API_ATTEMPTS = 3
-# The public Data API has appeared under both a versioned and an unversioned
-# path, with cursor and with offset pagination. Guessing one and being wrong
-# means the copier never sees a single trade, so every shape is tried once and
-# the working one is remembered.
+# Polymarket Data API v2 uses cursor-only pagination. The unversioned v1
+# wallet feeds were retired; do not fall back to an endpoint that no longer
+# serves current data.
 DATA_API = "https://data-api.polymarket.com"
+TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades",)
+ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity",)
 
 
 class OrderBookNotFound(RuntimeError):
     """CLOB has no book for the supplied token id (HTTP 404)."""
-TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades", f"{DATA_API}/trades")
-ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity", f"{DATA_API}/activity")
 
 
 def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
@@ -1927,7 +1926,7 @@ class TradingEngine:
 
     @staticmethod
     def _page_cursor(payload) -> tuple[str, bool]:
-        """``(next_cursor, has_more)`` for cursor endpoints, else ``("", False)``."""
+        """Return the v2 cursor and its explicit has-more flag."""
         if not isinstance(payload, dict):
             return "", False
         for blob in (payload.get("pagination"), payload):
@@ -1935,8 +1934,8 @@ class TradingEngine:
                 continue
             cursor = blob.get("next_cursor") or blob.get("nextCursor") or ""
             more = blob.get("has_more", blob.get("hasMore"))
-            if cursor:
-                return str(cursor), (True if more is None else bool(more))
+            if cursor or more is not None:
+                return str(cursor or ""), bool(more) if more is not None else bool(cursor)
         return "", False
 
     async def _wallet_pages(
@@ -1958,85 +1957,66 @@ class TradingEngine:
             return []
         label = "Лента кошелька" if kind == "trades" else "Активность кошелька"
         endpoints = TRADE_ENDPOINTS if kind == "trades" else ACTIVITY_ENDPOINTS
-        chosen = self._feed_endpoint.get(kind, "")
-        ordered = ((chosen,) if chosen else ()) + tuple(url for url in endpoints if url != chosen)
+        base = endpoints[0]
         pages = 1 if not seeded else COPY_API_MAX_PAGES
-        collected: list[dict] = []
-        for base in ordered:
-            page_rows: list[dict] = []
-            cursor = ""
-            offset = 0
-            style = ""
-            first_ok = False
-            for page_number in range(pages):
-                params = {
-                    "user": self.cfg.copy_wallet.lower(),
-                    "limit": "200",
-                }
-                if kind == "trades":
-                    params["takerOnly"] = "true" if taker_only else "false"
-                if style == "cursor" and cursor:
-                    params["cursor"] = cursor
-                elif style != "cursor" and offset:
-                    params["offset"] = str(offset)
-                payload = await self._wallet_api_page(base, params, label)
-                if payload is None:
-                    if not first_ok:
-                        break
-                    # Keep the rows already read; the next poll resumes.
-                    self._note_once(
-                        f"{kind}-deep-page", "ERROR",
-                        f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
-                        60,
-                    )
-                    return page_rows
-                first_ok = True
-                if not style:
-                    style = "cursor" if self._page_cursor(payload)[0] else "offset"
-                page = self._page_rows(payload)
-                if not page:
-                    break
-                known = all(
-                    (event_key(row) in seen)
-                    or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
-                    for row in page
+        page_rows: list[dict] = []
+        cursor = ""
+        first_ok = False
+        for page_number in range(pages):
+            params = {
+                "user": self.cfg.copy_wallet.lower(),
+                "limit": "200",
+            }
+            if kind == "trades":
+                params["takerOnly"] = "true" if taker_only else "false"
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._wallet_api_page(base, params, label)
+            if payload is None:
+                if not first_ok:
+                    return None
+                # Keep the rows already read; the next poll resumes.
+                self._note_once(
+                    f"{kind}-deep-page", "ERROR",
+                    f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
+                    60,
                 )
-                if known:
-                    break
-                fresh = [
-                    row for row in page
-                    if event_key(row) not in seen
-                    and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
-                ]
-                page_rows.extend(fresh)
-                seen.update(key for row in page if (key := event_key(row)))
-                cursor, has_more = self._page_cursor(payload)
-                if style == "cursor":
-                    if not has_more or not cursor:
-                        break
-                else:
-                    offset += len(page)
-                    explicit = None
-                    if isinstance(payload, dict):
-                        for blob in (payload.get("pagination"), payload):
-                            if isinstance(blob, dict) and blob.get("has_more") is not None:
-                                explicit = bool(blob.get("has_more"))
-                                break
-                    if explicit is False:
-                        break
-                    # The endpoint may cap ``limit`` below what was asked for.
-                    # A short page means the end; a full one may still have a
-                    # tail, so it is followed up to the page cap.
-                    if explicit is None and len(page) < 100:
-                        break
-            if first_ok:
-                if self._feed_endpoint.get(kind) != base:
-                    self._feed_endpoint[kind] = base
-                    self._note("INFO", f"{label}: используется {base}")
-                collected = page_rows
+                return page_rows
+            first_ok = True
+            page = self._page_rows(payload)
+            if not page:
                 break
-        else:
+            known = all(
+                (event_key(row) in seen)
+                or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
+                for row in page
+            )
+            if known:
+                break
+            fresh = [
+                row for row in page
+                if event_key(row) not in seen
+                and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
+            ]
+            page_rows.extend(fresh)
+            seen.update(key for row in page if (key := event_key(row)))
+            next_cursor, has_more = self._page_cursor(payload)
+            if not has_more:
+                break
+            if not next_cursor:
+                self._note_once(
+                    f"{kind}-cursor-missing", "ERROR",
+                    f"{label}: API сообщил has_more без next_cursor; хвост отложен",
+                    60,
+                )
+                break
+            cursor = next_cursor
+        if not first_ok:
             return None
+        if self._feed_endpoint.get(kind) != base:
+            self._feed_endpoint[kind] = base
+            self._note("INFO", f"{label}: используется {base}")
+        collected = page_rows
         named = [row for row in collected if wallet_of(row)]
         if collected and not named:
             # The endpoint answered but the rows carry no wallet field, so the
