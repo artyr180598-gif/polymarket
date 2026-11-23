@@ -266,7 +266,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(report["slip"], "0.03")
         self.assertEqual(report["copies"][0]["wallet_tx"], "0xfill")
 
-    def test_missing_token_does_not_consume_size_carry_or_shadow(self) -> None:
+    def test_missing_token_does_not_consume_size_carry_but_keeps_wallet_shadow(self) -> None:
         cfg = _cfg(copy_scale=0.1)
         engine = TradingEngine(cfg)
         window = self._window(engine)
@@ -279,7 +279,8 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(job.done)
         self.assertEqual(engine.copy.carry, {})
         self.assertEqual(engine.copy.sized, {})
-        self.assertEqual(engine.copy.shadow.cumulative(), Decimal("0"))
+        self.assertEqual(engine.copy.shadow.lots[window.slug]["Up"][0], "10.0")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
         recorded = engine.ledger.copies("paper")[0]
         self.assertEqual(recorded["status"], "SKIPPED")
         self.assertEqual(recorded["reason"], "missing token")
@@ -487,6 +488,7 @@ class ExecuteTests(unittest.TestCase):
         asyncio.run(engine._execute_copy(job, 1_000_052))
         asyncio.run(engine._execute_copy(job, 1_000_053))
         self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
+
     def test_manual_pause_survives_restart_and_the_daily_reset(self) -> None:
         cfg = _cfg(strategy="maker_ladder", auto_start=True, copy_scale=None)
         engine = TradingEngine(cfg)
