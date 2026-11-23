@@ -327,6 +327,7 @@ class CopyBook:
     carry: dict[str, str] = field(default_factory=dict)
     sized: dict[str, list] = field(default_factory=dict)
     applied: list[str] = field(default_factory=list)
+    shadowed: list[str] = field(default_factory=list)
     shadow: ShadowBook = field(default_factory=ShadowBook)
     # False until the first successful poll of each feed. That poll is
     # history, not a signal.
@@ -336,10 +337,12 @@ class CopyBook:
     counters: dict[str, int] = field(default_factory=dict)
     _seen: set[str] = field(default_factory=set)
     _applied: set[str] = field(default_factory=set)
+    _shadowed: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self._seen = set(self.seen_tx)
         self._applied = set(self.applied)
+        self._shadowed = set(self.shadowed)
 
     # ---- dedupe / history -------------------------------------------------
 
@@ -376,6 +379,20 @@ class CopyBook:
 
     def was_applied(self, event_id: str) -> bool:
         return bool(event_id) and event_id in self._applied
+
+    def mark_shadowed(self, event_id: str, *, limit: int = 20000) -> None:
+        if not event_id or event_id in self._shadowed:
+            return
+        self._shadowed.add(event_id)
+        self.shadowed.append(event_id)
+        if len(self.shadowed) > limit:
+            drop = self.shadowed[:-limit]
+            self.shadowed = self.shadowed[-limit:]
+            for old in drop:
+                self._shadowed.discard(old)
+
+    def was_shadowed(self, event_id: str) -> bool:
+        return bool(event_id) and event_id in self._shadowed
 
     # ---- observation ------------------------------------------------------
 
@@ -532,6 +549,7 @@ class CopyBook:
             "carry": dict(self.carry),
             "sized": {k: list(v) for k, v in self.sized.items()},
             "applied": self.applied[-2000:],
+            "shadowed": self.shadowed[-20000:],
             "shadow": self.shadow.to_dict(),
             "jobs": [job.to_dict() for job in self.jobs if not job.done],
             "seeded": self.seeded,
@@ -548,6 +566,7 @@ class CopyBook:
             carry={str(k): str(v) for k, v in (raw.get("carry") or {}).items()},
             sized={str(k): list(v) for k, v in (raw.get("sized") or {}).items()},
             applied=[str(item) for item in (raw.get("applied") or [])],
+            shadowed=[str(item) for item in (raw.get("shadowed") or [])],
             shadow=ShadowBook.from_dict(raw.get("shadow")),
             jobs=[CopyJob.from_dict(item) for item in (raw.get("jobs") or [])],
             # A ledger written by an older build has history but no flag. It
