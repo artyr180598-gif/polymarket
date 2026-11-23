@@ -28,7 +28,12 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "pnl": "TEXT NOT NULL DEFAULT '0'",
         "payout": "TEXT NOT NULL DEFAULT '0'",
     },
-    "copies": {"event_id": "TEXT NOT NULL DEFAULT ''"},
+    "copies": {
+        "event_id": "TEXT NOT NULL DEFAULT ''",
+        "execution_at": "REAL",
+        "execution_lag_s": "REAL",
+        "total_lag_s": "REAL",
+    },
     "equity_points": {"realized": "TEXT NOT NULL DEFAULT '0'"},
 }
 
@@ -366,6 +371,9 @@ class Ledger:
                     "wallet_ts": row.get("wallet_ts", 0),
                     "detected_at": row.get("detected_at", 0),
                     "lag_s": row.get("lag_s", 0),
+                    "execution_at": row.get("execution_at"),
+                    "execution_lag_s": row.get("execution_lag_s"),
+                    "total_lag_s": row.get("total_lag_s"),
                     "side": row.get("side", ""),
                     "outcome": row.get("outcome", ""),
                     "wallet_size": str(row.get("wallet_size", "")),
