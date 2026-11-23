@@ -1278,6 +1278,14 @@ class TradingEngine:
                 return
             await self._skip_copy(job, "scale unknown", now)
             return
+        if job.kind in ("TRADE", "MERGE", "SPLIT") and not self.copy.was_shadowed(job.event_id):
+            # The shadow ledger models the target wallet, not only the trades
+            # our execution filters allow. A bad book, price/time filter, or
+            # missing local inventory must not erase a wallet fill from its PnL.
+            shadow_scale = D("1") if self.cfg.copy_size_mode != "scale" else scale
+            self._shadow_trade(job, job.wallet_size * shadow_scale)
+            self.copy.mark_shadowed(job.event_id, limit=int(self.cfg.copy_seen_limit))
+            self._persist_copy()
         if job.kind == "REDEEM":
             await self._mirror_redeem(job, now, scale, window)
             return
@@ -1520,10 +1528,8 @@ class TradingEngine:
             )
             job.done = True
             return
-        had = job.event_id in self.copy.sized
-        if not had:
+        if job.event_id not in self.copy.sized:
             self.copy.sized[job.event_id] = [str(desired), str(carry)]
-            self._shadow_trade(job, job.wallet_size * (D("1") if mode != "scale" else scale))
         if job.kind == "MERGE":
             book = self.portfolio.markets.get(job.slug)
             lots = [lot.shares for lot in (book.outcomes.values() if book else []) if lot.shares > 0]
@@ -1682,9 +1688,6 @@ class TradingEngine:
             desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
             self.copy.set_carry(key, carry)
         self.copy.sized[event_id] = [str(desired), str(carry)]
-        if shadow:
-            shadow_scale = D("1") if mode != "scale" else scale
-            self._shadow_trade(job, job.wallet_size * shadow_scale)
         return desired, carry
 
     def _shadow_trade(self, job, exact: Decimal) -> None:
