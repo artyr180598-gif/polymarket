@@ -131,6 +131,20 @@ class WalletFilterTests(unittest.TestCase):
         self.assertEqual(job.execute_at, 5_000)
         self.assertEqual(book.due(5_000), [job])
 
+    def test_copy_ledger_records_detection_execution_and_total_latency(self) -> None:
+        cfg = _cfg()
+        engine = TradingEngine(cfg)
+        job = engine.copy.observe(_buy("0xlatency", ts=1_000), now=1_005, cfg=cfg)
+        asyncio.run(engine._record_copy(
+            job, 1_012, Decimal("0.1"), status="SKIPPED", reason="test",
+            scaled=Decimal("0"), carry=Decimal("0"),
+        ))
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["lag_s"], 5.0)
+        self.assertEqual(row["execution_at"], 1_012.0)
+        self.assertEqual(row["execution_lag_s"], 7.0)
+        self.assertEqual(row["total_lag_s"], 12.0)
+
 
 class ScaleAndBookTests(unittest.TestCase):
     def test_carry_tracks_the_scale_without_rounding_up(self) -> None:
