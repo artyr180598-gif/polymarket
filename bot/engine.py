@@ -1751,18 +1751,28 @@ class TradingEngine:
 
     def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal) -> tuple[Decimal, Decimal]:
         event_id = job.event_id or job.tx
-        saved = self.copy.sized.get(event_id)
-        if saved:
-            return D(saved[0]), D(saved[1])
         mode = getattr(self.cfg, "copy_size_mode", "scale")
+        saved = self.copy.sized.get(event_id)
+        # Exact-mode sizing is derived only from this source event. Recompute
+        # even legacy persisted entries because older builds may have stored
+        # an aggregate that included another event's carried remainder.
+        if saved and mode != "exact":
+            return D(saved[0]), D(saved[1])
         if mode == "fixed":
             desired = floor_to_step(D(str(self.cfg.copy_shares)), D("0.01"))
             carry = _ZERO
             if desired < min_shares:
                 desired = _ZERO
         elif mode == "exact":
-            desired, carry = scale_size(job.wallet_size, D("1"), self.copy.carry_of(key), min_shares)
-            self.copy.set_carry(key, carry)
+            # Exact mode is per source event. Never combine the remainder of
+            # one wallet fill with a later fill: doing so overstates the later
+            # event and breaks source-to-copy attribution. Sub-minimum fills
+            # are explicitly skipped; only the 0.01 share precision is floored.
+            desired = floor_to_step(D(job.wallet_size), D("0.01"))
+            carry = _ZERO
+            self.copy.set_carry(key, _ZERO)
+            if desired < min_shares:
+                desired = _ZERO
         else:
             desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
             self.copy.set_carry(key, carry)

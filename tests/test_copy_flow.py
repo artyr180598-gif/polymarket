@@ -352,16 +352,18 @@ class CopyFlowTests(unittest.TestCase):
             "open lots are marked at their purchase price",
         )
 
-    def test_both_taker_views_are_requested(self) -> None:
+    def test_complete_wallet_trade_feed_is_requested_once(self) -> None:
         session = FakeSession()
         engine = self._engine(session)
         asyncio.run(engine._copy_wallet_tick())
-        views = {
+        trade_calls = [
             params.get("takerOnly")
             for url, params in session.calls
             if url.endswith("/trades")
-        }
-        self.assertEqual(views, {"true", "false"})
+        ]
+        # Data API takerOnly=false includes maker and taker rows. Fetching
+        # both views is redundant and can replay the same wallet fill twice.
+        self.assertEqual(trade_calls, ["false"])
 
 
 if __name__ == "__main__":

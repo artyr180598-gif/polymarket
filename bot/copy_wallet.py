@@ -5,10 +5,11 @@ wallet's resting orders or its place in the maker queue, so our copy crosses
 the book as a TAKER right after the wallet has already filled. Only rows whose
 own wallet field matches the configured target are considered.
 
-Default behaviour is 1:1: every fill of every market the wallet touches is
-replayed with the same share count (floored to the 0.01 share step, with the
-remainder carried to the next fill of the same token). ``COPY_SIZE_MODE`` can
-switch to a scaled or fixed size instead.
+Exact mode is per source event: each fill is floored to the 0.01 share
+step independently. Remainders are never transferred to a later wallet fill,
+because that would make the later copy larger than its source event and break
+event-level auditability. A source fill below the market minimum is recorded
+as skipped. COPY_SIZE_MODE can switch to a scaled or fixed size instead.
 """
 
 from __future__ import annotations
