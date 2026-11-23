@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from bot.copy_wallet import CopyBook, DEFAULT_WALLET
+from bot.copy_wallet import CopyBook, DEFAULT_WALLET, event_key
 from bot.engine import TradingEngine
 
 
@@ -36,8 +36,8 @@ class CopySeedCutoffTests(unittest.TestCase):
         self.assertEqual(seeded, 1)
         self.assertEqual([row["transaction_hash"] for row in fresh], ["new-tx"])
         self.assertTrue(engine.copy.seeded)
-        self.assertTrue(engine.copy.was_seen("old-tx") is False)  # keys are event IDs, not raw tx hashes
-        self.assertTrue(engine.copy.was_seen(engine.copy._event_id(rows[0])) if hasattr(engine.copy, "_event_id") else True)
+        self.assertIn(event_key(rows[0]), engine.copy._seen)
+        self.assertNotIn(event_key(rows[1]), engine.copy._seen)
 
     def test_timestamp_normalizes_milliseconds(self) -> None:
         self.assertEqual(
