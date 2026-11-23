@@ -1882,7 +1882,7 @@ class TradingEngine:
         if status == "SKIPPED":
             self._note_once(
                 f"skip:{job.event_id[:16]}:{reason}", "INFO",
-                f"SKIPPED {job.slug} {job.side} {job.outcome}: {reason}", 10,
+                f"SKIPPED {job.slug} {job.side} {job.outcome} id={job.event_id[-12:]}: {reason}", 10,
             )
         elif job.kind == "TRADE" and status in ("FILLED", "PARTIAL"):
             asset, timeframe = _asset_timeframe(job.slug)
@@ -1897,7 +1897,7 @@ class TradingEngine:
                 f"{result_word} · {direction} {outcome} {asset} {timeframe} · "
                 f"{our_size} шт. × {our_price} = ${notional} · "
                 f"кошелёк {job.wallet_size} шт. × {job.wallet_price} · "
-                f"задержка {total_lag:.2f} с · комиссия ${fee}",
+                f"id={job.event_id[-12:]} · задержка {total_lag:.2f} с · комиссия ${fee}",
                 notify=True,
             )
 
