@@ -248,6 +248,35 @@ class ScaleAndBookTests(unittest.TestCase):
 
 
 class ExecuteTests(unittest.TestCase):
+    def test_exact_mode_never_carries_one_wallet_fill_into_the_next(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        first = engine.copy.observe(_buy("0xsmall-1", size="0.60"), now=1_000_050, cfg=cfg)
+        second = engine.copy.observe(_buy("0xsmall-2", size="0.60"), now=1_000_051, cfg=cfg)
+        third = engine.copy.observe(_buy("0xlarge-3", size="2.40"), now=1_000_052, cfg=cfg)
+
+        first_size, first_carry = engine._size_once(first, Decimal("1"), "tok-Up|BUY", Decimal("1"))
+        second_size, second_carry = engine._size_once(second, Decimal("1"), "tok-Up|BUY", Decimal("1"))
+        third_size, third_carry = engine._size_once(third, Decimal("1"), "tok-Up|BUY", Decimal("1"))
+
+        self.assertEqual((first_size, first_carry), (Decimal("0"), Decimal("0")))
+        self.assertEqual((second_size, second_carry), (Decimal("0"), Decimal("0")))
+        self.assertEqual((third_size, third_carry), (Decimal("2.40"), Decimal("0")))
+        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+        # Re-reading an event must return its original sizing, not consume state.
+        self.assertEqual(
+            engine._size_once(third, Decimal("1"), "tok-Up|BUY", Decimal("1")),
+            (Decimal("2.40"), Decimal("0")),
+        )
+
+    def test_exact_mode_floors_only_to_centish_share_step(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        job = engine.copy.observe(_buy("0xfractional", size="3.579"), now=1_000_050, cfg=cfg)
+        desired, carry = engine._size_once(job, Decimal("1"), "tok-Up|BUY", Decimal("1"))
+        self.assertEqual(desired, Decimal("3.57"))
+        self.assertEqual(carry, Decimal("0"))
+
     def _window(self, engine: TradingEngine) -> Window:
         window = Window(
             slug="btc-updown-5m-1000000", asset="BTC", timeframe="5m", condition_id="cond",
