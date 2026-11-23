@@ -24,7 +24,7 @@ from bot.copy_wallet import (
     scale_size,
     walk_book,
 )
-from bot.engine import TradingEngine, Window
+from bot.engine import OrderBookNotFound, TradingEngine, Window
 from bot.fees import taker_fee_usdc
 
 
@@ -284,6 +284,32 @@ class ExecuteTests(unittest.TestCase):
         recorded = engine.ledger.copies("paper")[0]
         self.assertEqual(recorded["status"], "SKIPPED")
         self.assertEqual(recorded["reason"], "missing token")
+
+    def test_paused_event_still_updates_shadow_accounting(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        job = engine.copy.observe(_buy("0xpaused-shadow", size="100"), now=1_000_050, cfg=cfg)
+        asyncio.run(engine._skip_copy(job, "paused", 1_000_051))
+        self.assertEqual(engine.copy.shadow.lots[window.slug]["Up"][0], "100")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
+
+    def test_missing_order_book_is_recorded_as_terminal_skip(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xbook-404", size="10"), now=1_000_050, cfg=cfg)
+        engine._cached_book = lambda _token: ([], [])  # type: ignore[method-assign]
+
+        async def missing(_token: str):
+            raise OrderBookNotFound("order book HTTP 404")
+
+        engine._book_for = missing  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        self.assertTrue(job.done)
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "order book HTTP 404")
 
     def test_copy_fee_uses_the_market_fee_schedule(self) -> None:
         cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
