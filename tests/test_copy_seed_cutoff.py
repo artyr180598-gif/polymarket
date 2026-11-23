@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from bot.copy_wallet import CopyBook, DEFAULT_WALLET, event_key
 from bot.engine import TradingEngine, _wallet_page_limit
@@ -69,3 +72,19 @@ class WalletFeedPollingTests(unittest.TestCase):
         self.assertEqual(_wallet_page_limit(seeded=True, seed_on_start=True), 1)
         self.assertEqual(_wallet_page_limit(seeded=False, seed_on_start=False), 1)
 
+
+
+    def test_complete_wallet_feed_is_requested_once(self) -> None:
+        engine = TradingEngine.__new__(TradingEngine)
+        engine._session = object()
+        engine.cfg = SimpleNamespace(copy_wallet=DEFAULT_WALLET)
+        engine.copy = SimpleNamespace(seeded=True, _seen={"already-seen"})
+        rows = [{"transaction_hash": "maker-fill", "proxy_wallet": DEFAULT_WALLET}]
+        engine._wallet_pages = AsyncMock(return_value=rows)
+
+        result = asyncio.run(engine._fetch_wallet_trades())
+
+        self.assertEqual(result, rows)
+        engine._wallet_pages.assert_awaited_once_with(
+            "trades", seeded=True, seen={"already-seen"}, taker_only=False,
+        )

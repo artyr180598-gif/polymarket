@@ -1147,9 +1147,9 @@ class TradingEngine:
             return
         now = self._clock()
         monotonic_now = time.monotonic()
-        # Both trade views are requested: Polymarket returns the maker side
-        # for takerOnly=false and the taker side for takerOnly=true. A
-        # one-sided poll silently misses part of the wallet's activity.
+        # One complete trade feed is enough: takerOnly=false includes
+        # maker and taker fills. Polling both views duplicates requests and
+        # risks replaying a fill when the row fingerprints differ.
         want_activity = monotonic_now - self._last_activity_poll >= float(self.cfg.copy_activity_poll_s)
         tasks = [asyncio.create_task(self._fetch_wallet_trades())]
         if want_activity:
@@ -2118,17 +2118,19 @@ class TradingEngine:
         return [row for row in collected if is_target_wallet(row, self.cfg.copy_wallet)]
 
     async def _fetch_wallet_trades(self, taker_only: bool | None = None) -> list[dict] | None:
-        """New target-wallet trade rows from both the maker and taker view."""
+        """Fetch the complete wallet fill feed exactly once.
+
+        Data API v2's takerOnly=false includes the wallet's maker rows as well
+        as its taker rows. Fetching both false and true is redundant and can
+        replay a fill twice when the two response shapes produce different
+        event fingerprints.
+        """
         if self._session is None or not is_valid_wallet_address(self.cfg.copy_wallet):
             return []
+        # None means the complete feed. Keep explicit True/False support for
+        # callers/tests, but the copier always uses False (all wallet fills).
         if taker_only is None:
-            maker, taker = await asyncio.gather(
-                self._fetch_wallet_trades(False),
-                self._fetch_wallet_trades(True),
-            )
-            if maker is None and taker is None:
-                return None
-            return self._unique_rows(list(maker or []) + list(taker or []))
+            taker_only = False
         return await self._wallet_pages(
             "trades", seeded=self.copy.seeded, seen=set(self.copy._seen),
             taker_only=taker_only,
