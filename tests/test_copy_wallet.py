@@ -311,6 +311,20 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(row["status"], "SKIPPED")
         self.assertEqual(row["reason"], "order book HTTP 404")
 
+    def test_paused_losing_redeem_still_closes_shadow_lot_once(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        engine.copy.shadow.buy(window.slug, "Down", Decimal("12"), Decimal("0.70"))
+        row = _buy("0xpaused-redeem", outcome="Down", size="0")
+        row["type"] = "REDEEM"
+        row["usdc_size"] = "0"
+        job = engine.copy.observe(row, now=1_000_050, cfg=cfg)
+        asyncio.run(engine._skip_copy(job, "paused", 1_000_051))
+        self.assertEqual(engine.copy.shadow.lots[window.slug]["Down"], ["0", "0"])
+        self.assertEqual(engine.copy.shadow.realized[window.slug], "-8.4")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
+
     def test_copy_fee_uses_the_market_fee_schedule(self) -> None:
         cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
         engine = TradingEngine(cfg)
