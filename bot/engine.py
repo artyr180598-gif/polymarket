@@ -1333,6 +1333,15 @@ class TradingEngine:
         if reason:
             await self._skip_copy(job, reason, now, scale=scale)
             return
+        # Resolved markets no longer have a CLOB order book (the API returns
+        # 404). Reject stale prints before spending a network round trip; the
+        # same condition is checked again after the book await for race safety.
+        if (
+            window.end_ts > 0
+            and self._clock() >= window.end_ts + float(self.cfg.copy_late_grace_s)
+        ):
+            await self._skip_copy(job, "market closed", now, scale=scale)
+            return
         min_shares = window.min_shares
         fee_rate = window.fee_rate
         fee_exp = window.fee_exponent
