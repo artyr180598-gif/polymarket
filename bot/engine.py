@@ -293,8 +293,19 @@ class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
         self.ledger = Ledger(cfg.db_path)
+        # A reset request is a one-time, idempotent operation. The full DB is
+        # backed up before PAPER rows and snapshots are cleared.
         # copy_wallet never sends a live order, even if TRADING_MODE=live.
         self.mode = "paper" if (not cfg.live_requested or cfg.strategy == "copy_wallet") else "live"
+        if self.mode == "paper" and cfg.strategy == "copy_wallet" and cfg.paper_reset_id:
+            reset = self.ledger.backup_and_reset_paper_history(cfg.paper_reset_id)
+            if reset["reset"]:
+                log.info(
+                    "PAPER_HISTORY_RESET complete backup=%s cleared=%s reset_id=%s",
+                    reset["backup_path"], reset["counts"], cfg.paper_reset_id,
+                )
+            else:
+                log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
         saved = self.ledger.load_portfolio(self.mode)
         self.consecutive_losses = 0
         self.manual_pause = False
@@ -368,11 +379,6 @@ class TradingEngine:
             self._preset_note = (
                 f"Пресет «{cfg.strategy_preset}» больше не используется. "
                 "Работают измеренные правила mo-money."
-            )
-        if cfg.paper_reset_requested:
-            self._note(
-                "INFO",
-                "PAPER_RESET_ONCE / PAPER_RESET_ID проигнорированы: база на томе не стирается при старте.",
             )
 
     def set_notifier(self, fn: Notify) -> None:
