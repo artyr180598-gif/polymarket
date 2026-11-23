@@ -1751,10 +1751,13 @@ class TradingEngine:
 
     def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal) -> tuple[Decimal, Decimal]:
         event_id = job.event_id or job.tx
-        saved = self.copy.sized.get(event_id)
-        if saved:
-            return D(saved[0]), D(saved[1])
         mode = getattr(self.cfg, "copy_size_mode", "scale")
+        saved = self.copy.sized.get(event_id)
+        # Exact-mode sizing is derived only from this source event. Recompute
+        # even legacy persisted entries because older builds may have stored
+        # an aggregate that included another event's carried remainder.
+        if saved and mode != "exact":
+            return D(saved[0]), D(saved[1])
         if mode == "fixed":
             desired = floor_to_step(D(str(self.cfg.copy_shares)), D("0.01"))
             carry = _ZERO
