@@ -145,26 +145,6 @@ class WalletFilterTests(unittest.TestCase):
         self.assertEqual(row["execution_lag_s"], 7.0)
         self.assertEqual(row["total_lag_s"], 12.0)
 
-    def test_shadow_tracks_wallet_fill_even_when_copy_is_filtered(self) -> None:
-        cfg = _cfg(copy_min_price=0.90)
-        engine = TradingEngine(cfg)
-        self._window(engine)
-        job = engine.copy.observe(_buy("0xshadow-filter", size="100"), now=1_000_051, cfg=cfg)
-        asyncio.run(engine._execute_copy(job, 1_000_052))
-        self.assertTrue(job.done)
-        self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
-        self.assertTrue(engine.copy.was_shadowed(job.event_id))
-        restored = CopyBook.from_dict(engine.copy.to_dict())
-        self.assertTrue(restored.was_shadowed(job.event_id))
-
-    def test_shadow_is_not_double_counted_when_copy_job_retries(self) -> None:
-        cfg = _cfg(copy_min_price=0.90)
-        engine = TradingEngine(cfg)
-        self._window(engine)
-        job = engine.copy.observe(_buy("0xshadow-once", size="100"), now=1_000_051, cfg=cfg)
-        asyncio.run(engine._execute_copy(job, 1_000_052))
-        asyncio.run(engine._execute_copy(job, 1_000_053))
-        self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
 
 
 class ScaleAndBookTests(unittest.TestCase):
@@ -529,6 +509,27 @@ class _FakeSession:
     def get(self, url, params=None):
         self.calls.append((url, dict(params or {})))
         return self.responses.pop(0)
+
+    def test_shadow_tracks_wallet_fill_even_when_copy_is_filtered(self) -> None:
+        cfg = _cfg(copy_min_price=0.90)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xshadow-filter", size="100"), now=1_000_051, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        self.assertTrue(job.done)
+        self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
+        restored = CopyBook.from_dict(engine.copy.to_dict())
+        self.assertTrue(restored.was_shadowed(job.event_id))
+
+    def test_shadow_is_not_double_counted_when_copy_job_retries(self) -> None:
+        cfg = _cfg(copy_min_price=0.90)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xshadow-once", size="100"), now=1_000_051, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        asyncio.run(engine._execute_copy(job, 1_000_053))
+        self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
 
 
 class WalletApiTests(unittest.TestCase):
