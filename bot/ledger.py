@@ -198,10 +198,16 @@ class Ledger:
                     "DELETE FROM kv WHERE k IN (?, ?, ?)",
                     ("portfolio:paper", "copy:paper", "copy_pending:paper"),
                 )
+                reset_at = time.time()
                 self.conn.execute(
                     "INSERT INTO kv(k, v) VALUES(?, ?) "
                     "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                     ("paper_history_reset_id", reset_id),
+                )
+                self.conn.execute(
+                    "INSERT INTO kv(k, v) VALUES(?, ?) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    ("paper_history_reset_at", str(reset_at)),
                 )
                 self.conn.commit()
             except Exception:
@@ -213,7 +219,19 @@ class Ledger:
                 "already_applied": False,
                 "backup_path": backup_path,
                 "counts": counts,
+                "reset_at": reset_at,
             }
+
+    def paper_history_reset_at(self) -> float:
+        """Timestamp cutoff for distinguishing pre-reset wallet history."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT v FROM kv WHERE k = ?", ("paper_history_reset_at",)
+            ).fetchone()
+        try:
+            return float(row["v"]) if row else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def _migrate_locked(self) -> None:
         """Add columns an older file does not have. Never drops or rewrites rows."""
