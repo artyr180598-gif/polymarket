@@ -109,6 +109,26 @@ class WalletFilterTests(unittest.TestCase):
         book = CopyBook.from_dict({"seen_tx": ["0xlegacy"]})
         self.assertIsNone(book.observe(_buy("0xlegacy"), now=1_000_120, cfg=_cfg()))
 
+    def test_data_api_v2_cursor_parser_preserves_has_more(self) -> None:
+        self.assertEqual(
+            TradingEngine._page_cursor({
+                "pagination": {"next_cursor": "cursor-2", "has_more": True},
+            }),
+            ("cursor-2", True),
+        )
+        self.assertEqual(
+            TradingEngine._page_cursor({
+                "pagination": {"next_cursor": None, "has_more": True},
+            }),
+            ("", True),
+        )
+        self.assertEqual(
+            TradingEngine._page_cursor({
+                "pagination": {"next_cursor": None, "has_more": False},
+            }),
+            ("", False),
+        )
+
     def test_wallet_address_validation(self) -> None:
         self.assertTrue(is_valid_wallet_address(DEFAULT_WALLET))
         self.assertFalse(is_valid_wallet_address("0x1234"))
