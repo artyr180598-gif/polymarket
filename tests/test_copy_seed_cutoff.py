@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from bot.copy_wallet import CopyBook, DEFAULT_WALLET, event_key
-from bot.engine import TradingEngine
+from bot.engine import TradingEngine, _wallet_page_limit
 
 
 class CopySeedCutoffTests(unittest.TestCase):
@@ -59,4 +59,13 @@ class CopySeedCutoffTests(unittest.TestCase):
             [row["transaction_hash"] for row in filtered],
             ["new-fill"],
         )
+
+
+
+
+class WalletFeedPollingTests(unittest.TestCase):
+    def test_deep_pagination_only_runs_during_initial_seed(self) -> None:
+        self.assertEqual(_wallet_page_limit(seeded=False, seed_on_start=True), 20)
+        self.assertEqual(_wallet_page_limit(seeded=True, seed_on_start=True), 1)
+        self.assertEqual(_wallet_page_limit(seeded=False, seed_on_start=False), 1)
 
