@@ -58,6 +58,10 @@ COPY_API_ATTEMPTS = 3
 # means the copier never sees a single trade, so every shape is tried once and
 # the working one is remembered.
 DATA_API = "https://data-api.polymarket.com"
+
+
+class OrderBookNotFound(RuntimeError):
+    """CLOB has no book for the supplied token id (HTTP 404)."""
 TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades", f"{DATA_API}/trades")
 ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity", f"{DATA_API}/activity")
 
@@ -942,6 +946,12 @@ class TradingEngine:
                     "https://clob.polymarket.com/book",
                     params={"token_id": token_id, "_": str(int(time.time() * 1000))},
                 ) as response:
+                    if response.status == 404:
+                        body = (await response.text())[:120].strip()
+                        detail = f"order book HTTP 404 (token …{token_id[-12:]})"
+                        if body:
+                            detail += f": {body}"
+                        raise OrderBookNotFound(detail)
                     if response.status != 200:
                         raise RuntimeError(f"order book HTTP {response.status}")
                     payload = await response.json(content_type=None)
@@ -954,7 +964,7 @@ class TradingEngine:
                     raise ValueError("order book response has an invalid shape")
                 # A valid empty book is [], []; transport/API failures are raised.
                 return payload["bids"], payload["asks"]
-            except ValueError:
+            except (ValueError, OrderBookNotFound):
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -1278,14 +1288,9 @@ class TradingEngine:
                 return
             await self._skip_copy(job, "scale unknown", now)
             return
-        if job.kind in ("TRADE", "MERGE", "SPLIT") and not self.copy.was_shadowed(job.event_id):
-            # The shadow ledger models the target wallet, not only the trades
-            # our execution filters allow. A bad book, price/time filter, or
-            # missing local inventory must not erase a wallet fill from its PnL.
-            shadow_scale = D("1") if self.cfg.copy_size_mode != "scale" else scale
-            self._shadow_trade(job, job.wallet_size * shadow_scale)
-            self.copy.mark_shadowed(job.event_id, limit=int(self.cfg.copy_seen_limit))
-            self._persist_copy()
+        # The shadow ledger models wallet events independently of our
+        # execution filters. _skip_copy also calls this for paused/expired jobs.
+        self._shadow_event(job, scale)
         if job.kind == "REDEEM":
             await self._mirror_redeem(job, now, scale, window)
             return
@@ -1355,7 +1360,17 @@ class TradingEngine:
             want = min(desired, held)
         else:
             want = desired
-        bids, asks = await self._book_for(job.token_id)
+        try:
+            bids, asks = await self._book_for(job.token_id)
+        except OrderBookNotFound as exc:
+            # A 404 is a token/book lookup failure, not a transient network
+            # timeout. Retrying the same event five times only adds latency.
+            await self._record_copy(
+                job, now, scale, status="SKIPPED", reason=str(exc),
+                scaled=desired, carry=carry,
+            )
+            job.done = True
+            return
         execution_now = self._clock()
         self._refresh_halt()
         if self.paused or self.halt_reason:
@@ -1740,7 +1755,31 @@ class TradingEngine:
             return "exposure cap"
         return ""
 
+    def _shadow_event(self, job, scale: Decimal | None = None) -> None:
+        if job.kind not in ("TRADE", "MERGE", "SPLIT") or self.copy.was_shadowed(job.event_id):
+            return
+        if self.cfg.copy_size_mode != "scale":
+            shadow_scale = D("1")
+        elif scale is not None:
+            shadow_scale = scale
+        elif not self.cfg.copy_scale_auto:
+            shadow_scale = D(str(self.cfg.copy_scale))
+        else:
+            # Use today's already measured auto-scale, but never invent one
+            # when the wallet-value endpoint has not answered yet.
+            cached = getattr(self, "_copy_scale_value", None)
+            day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+            shadow_scale = cached if cached is not None and getattr(self, "_copy_scale_day", "") == day else None
+        if shadow_scale is None:
+            return
+        self._shadow_trade(job, job.wallet_size * shadow_scale)
+        self.copy.mark_shadowed(job.event_id, limit=int(self.cfg.copy_seen_limit))
+        self._persist_copy()
+
     async def _skip_copy(self, job, reason: str, now: float, scale: Decimal | None = None) -> None:
+        # Paused/expired jobs bypass _execute_copy; keep their wallet-side
+        # shadow accounting complete even though no paper order is attempted.
+        self._shadow_event(job, scale)
         job.done = True
         self.copy.bump("skipped")
         await self._record_copy(
