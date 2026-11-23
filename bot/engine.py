@@ -1740,9 +1740,11 @@ class TradingEngine:
             our_size=shares, our_price=D("1"),
         )
         word = "Вверх" if winner == "Up" else ("Вниз" if winner == "Down" else winner)
+        wallet_shadow_pnl = self.copy.shadow.window_pnl(job.slug, self.marks)
         self._note(
             "INFO",
-            f"REDEEM кошелька · {job.slug} · победил {word} · итог ${total}",
+            f"REDEEM кошелька · {job.slug} · победил {word} · "
+            f"PAPER PnL ${total} · shadow кошелька ${wallet_shadow_pnl}",
             notify=True,
         )
         job.done = True
