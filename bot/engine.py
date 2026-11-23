@@ -306,6 +306,7 @@ class TradingEngine:
                 )
             else:
                 log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
+        self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
         saved = self.ledger.load_portfolio(self.mode)
         self.consecutive_losses = 0
         self.manual_pause = False
@@ -1097,6 +1098,32 @@ class TradingEngine:
                 delay = max(delay, self._copy_backoff_until - time.monotonic())
             await asyncio.sleep(delay)
 
+    @staticmethod
+    def _copy_row_timestamp(row: dict) -> float:
+        try:
+            stamp = float(row.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if stamp > 1e11:
+            stamp /= 1000.0
+        return stamp
+
+    def _seed_copy_stream(self, rows: list[dict], stream: str) -> tuple[int, list[dict]]:
+        """Seed pre-reset events, but keep post-reset events for real copying."""
+        cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
+        if cutoff <= 0:
+            old_rows, new_rows = rows, []
+        else:
+            old_rows, new_rows = [], []
+            for row in rows:
+                stamp = self._copy_row_timestamp(row)
+                if stamp > cutoff:
+                    new_rows.append(row)
+                else:
+                    old_rows.append(row)
+        added = self.copy.seed(old_rows, cfg=self.cfg, stream=stream)
+        return added, new_rows
+
     async def _copy_wallet_tick(self) -> None:
         """Copy every new wallet event: trades, merges, splits and redeems."""
         if not is_valid_wallet_address(self.cfg.copy_wallet) or self._session is None:
@@ -1131,10 +1158,12 @@ class TradingEngine:
         if trades is not None:
             if not self.copy.seeded:
                 if self.cfg.copy_seed_on_start:
-                    added = self.copy.seed(trades, cfg=self.cfg, stream="trades")
+                    added, fresh = self._seed_copy_stream(trades, "trades")
+                    incoming.extend(fresh)
                     self._note(
                         "INFO",
-                        f"Точка отсчёта ленты: {added} старых исполнений не копируются.",
+                        f"Точка отсчёта ленты: {added} старых исполнений не копируются; "
+                        f"после сброса обнаружено {len(fresh)} новых.",
                     )
                 else:
                     # Explicit backfill: the newest page is copied once.
@@ -1145,10 +1174,15 @@ class TradingEngine:
         if activity is not None:
             if not self.copy.seeded_activity:
                 if self.cfg.copy_seed_on_start:
-                    added = self.copy.seed(activity, cfg=self.cfg, stream="activity")
+                    added, fresh = self._seed_copy_stream(activity, "activity")
+                    incoming.extend(
+                        row for row in fresh
+                        if str(row.get("type") or "").upper() not in ("TRADE", "REWARD", "MAKER_REBATE", "TAKER_REBATE")
+                    )
                     self._note(
                         "INFO",
-                        f"Точка отсчёта активности: {added} старых записей не копируются.",
+                        f"Точка отсчёта активности: {added} старых записей не копируются; "
+                        f"после сброса обнаружено {len(fresh)} новых.",
                     )
                 else:
                     self.copy.seeded_activity = True
@@ -1980,7 +2014,9 @@ class TradingEngine:
         label = "Лента кошелька" if kind == "trades" else "Активность кошелька"
         endpoints = TRADE_ENDPOINTS if kind == "trades" else ACTIVITY_ENDPOINTS
         base = endpoints[0]
-        pages = 1 if not seeded else COPY_API_MAX_PAGES
+        # On the first seeded poll, walk the recent backlog too. Otherwise
+        # pages beyond the first are mistaken for fresh trades on the next tick.
+        pages = COPY_API_MAX_PAGES if (seeded or self.cfg.copy_seed_on_start) else 1
         page_rows: list[dict] = []
         cursor = ""
         first_ok = False
