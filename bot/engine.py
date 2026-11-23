@@ -353,6 +353,8 @@ class TradingEngine:
         self._meta_retry_at: dict[str, float] = {}
         self._note_last: dict[str, float] = {}
         self._copy_last_lag = 0.0
+        self._copy_detection_lag = 0.0
+        self._copy_execution_lag = 0.0
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
         # One clock for the latency-critical copy path. Tests freeze it; in
@@ -1199,7 +1201,10 @@ class TradingEngine:
                 if job.attempts >= int(self.cfg.copy_max_attempts):
                     await self._skip_copy(job, f"error: {exc}", self._clock())
             if job.done:
-                self._copy_last_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+                finished_at = self._clock()
+                self._copy_detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+                self._copy_execution_lag = max(0.0, finished_at - job.detected_at)
+                self._copy_last_lag = max(0.0, finished_at - job.trade_ts) if job.trade_ts else 0.0
                 self._copy_dirty = True
                 # Portfolio state is small and must survive a crash between
                 # events. Seen-id history is flushed less often.
@@ -1748,10 +1753,14 @@ class TradingEngine:
         fee: Decimal = _ZERO, slip: Decimal = _ZERO,
         levels: list | None = None,
     ) -> None:
-        lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0
+        detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+        execution_lag = max(0.0, float(now) - job.detected_at)
+        total_lag = max(0.0, float(now) - job.trade_ts) if job.trade_ts else 0.0
         self.ledger.record_copy(
             mode=self.mode, slug=job.slug, tx=job.tx, event_id=job.event_id,
-            wallet_ts=job.trade_ts, detected_at=job.detected_at, lag_s=lag,
+            wallet_ts=job.trade_ts, detected_at=job.detected_at,
+            lag_s=detection_lag, execution_at=float(now),
+            execution_lag_s=execution_lag, total_lag_s=total_lag,
             side=job.side, outcome=job.outcome,
             wallet_size=job.wallet_size, wallet_price=job.wallet_price,
             scale=scale, scaled_size=scaled, carry=carry,
@@ -2052,6 +2061,8 @@ class TradingEngine:
             "activity_seeded": bool(self.copy.seeded_activity),
             "counters": counters,
             "last_lag_s": round(self._copy_last_lag, 3),
+            "last_detection_lag_s": round(self._copy_detection_lag, 3),
+            "last_execution_lag_s": round(self._copy_execution_lag, 3),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
@@ -2842,6 +2853,8 @@ class TradingEngine:
                     "pending": sum(1 for job in self.copy.jobs if not job.done),
                     "counters": dict(self.copy.counters),
                     "last_lag_s": round(self._copy_last_lag, 3),
+                    "last_detection_lag_s": round(self._copy_detection_lag, 3),
+                    "last_execution_lag_s": round(self._copy_execution_lag, 3),
                     "last_event_at": self._copy_last_seen_at,
                     "window_cap_usd": self.cfg.copy_window_cap_usd,
                     "exposure_cap_usd": self.cfg.copy_exposure_cap_usd,
