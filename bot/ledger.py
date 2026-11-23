@@ -149,6 +149,72 @@ class Ledger:
             self._migrate_locked()
             self.conn.commit()
 
+    def backup_and_reset_paper_history(self, reset_id: str) -> dict[str, Any]:
+        """Back up the complete SQLite database, then start a fresh PAPER ledger once.
+
+        The reset marker is committed with the deletions. Re-deploys/restarts
+        with the same reset_id are therefore idempotent and never erase new trades.
+        """
+        reset_id = str(reset_id or "").strip()
+        if not reset_id:
+            raise ValueError("reset_id is required")
+        with self._lock:
+            marker = self.conn.execute(
+                "SELECT v FROM kv WHERE k = ?", ("paper_history_reset_id",)
+            ).fetchone()
+            if marker and str(marker["v"]) == reset_id:
+                return {"reset": False, "already_applied": True, "backup_path": None, "counts": {}}
+
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            backup_path = f"{self.db_path}.pre-reset-{stamp}.sqlite3"
+            suffix = 1
+            while os.path.exists(backup_path):
+                backup_path = f"{self.db_path}.pre-reset-{stamp}-{suffix}.sqlite3"
+                suffix += 1
+
+            # SQLite's online backup API includes committed WAL content and
+            # leaves the live database open. Never overwrite an earlier backup.
+            backup_conn = sqlite3.connect(backup_path)
+            try:
+                self.conn.backup(backup_conn)
+                integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise RuntimeError(f"backup integrity check failed: {integrity[0] if integrity else 'no result'}")
+            finally:
+                backup_conn.close()
+
+            tables = ("fills", "merges", "resolutions", "copies", "equity_points")
+            counts: dict[str, int] = {}
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                for table in tables:
+                    counts[table] = int(
+                        self.conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE mode = ?", ("paper",)
+                        ).fetchone()[0]
+                    )
+                    self.conn.execute(f"DELETE FROM {table} WHERE mode = ?", ("paper",))
+                self.conn.execute(
+                    "DELETE FROM kv WHERE k IN (?, ?, ?)",
+                    ("portfolio:paper", "copy:paper", "copy_pending:paper"),
+                )
+                self.conn.execute(
+                    "INSERT INTO kv(k, v) VALUES(?, ?) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    ("paper_history_reset_id", reset_id),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+            return {
+                "reset": True,
+                "already_applied": False,
+                "backup_path": backup_path,
+                "counts": counts,
+            }
+
     def _migrate_locked(self) -> None:
         """Add columns an older file does not have. Never drops or rewrites rows."""
         added: list[str] = []
