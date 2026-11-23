@@ -44,3 +44,19 @@ class CopySeedCutoffTests(unittest.TestCase):
             TradingEngine._copy_row_timestamp({"timestamp": 1_700_000_000_000}),
             1_700_000_000.0,
         )
+    def test_pre_reset_rows_are_filtered_on_later_polls(self) -> None:
+        engine = TradingEngine.__new__(TradingEngine)
+        engine._copy_seed_after_ts = 1_000.0
+        rows = [
+            {"transaction_hash": "late-old-page", "timestamp": 999},
+            {"transaction_hash": "new-fill", "timestamp": 1_001},
+            {"transaction_hash": "missing-time"},
+        ]
+
+        filtered = engine._copy_rows_after_reset(rows)
+
+        self.assertEqual(
+            [row["transaction_hash"] for row in filtered],
+            ["new-fill"],
+        )
+
