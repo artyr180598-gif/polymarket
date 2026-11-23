@@ -1761,8 +1761,15 @@ class TradingEngine:
             if desired < min_shares:
                 desired = _ZERO
         elif mode == "exact":
-            desired, carry = scale_size(job.wallet_size, D("1"), self.copy.carry_of(key), min_shares)
-            self.copy.set_carry(key, carry)
+            # Exact mode is per source event. Never combine the remainder of
+            # one wallet fill with a later fill: doing so overstates the later
+            # event and breaks source-to-copy attribution. Sub-minimum fills
+            # are explicitly skipped; only the 0.01 share precision is floored.
+            desired = floor_to_step(D(job.wallet_size), D("0.01"))
+            carry = _ZERO
+            self.copy.set_carry(key, _ZERO)
+            if desired < min_shares:
+                desired = _ZERO
         else:
             desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
             self.copy.set_carry(key, carry)
