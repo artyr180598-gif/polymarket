@@ -269,6 +269,19 @@ class ExecuteTests(unittest.TestCase):
             (Decimal("2.40"), Decimal("0")),
         )
 
+    def test_exact_mode_replaces_legacy_aggregate_sizing(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        job = engine.copy.observe(_buy("0xlegacy-sized", size="1.02"), now=1_000_050, cfg=cfg)
+        engine.copy.sized[job.event_id] = ["5.10", "0.00"]
+        engine.copy.set_carry("tok-Up|BUY", Decimal("4.08"))
+
+        desired, carry = engine._size_once(job, Decimal("1"), "tok-Up|BUY", Decimal("1"))
+
+        self.assertEqual(desired, Decimal("1.02"))
+        self.assertEqual(carry, Decimal("0"))
+        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+
     def test_exact_mode_floors_only_to_centish_share_step(self) -> None:
         cfg = _cfg(copy_size_mode="exact")
         engine = TradingEngine(cfg)
