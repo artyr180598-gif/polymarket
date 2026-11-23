@@ -1124,6 +1124,18 @@ class TradingEngine:
         added = self.copy.seed(old_rows, cfg=self.cfg, stream=stream)
         return added, new_rows
 
+    def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
+        """Reject pre-reset rows on every poll, including later API pages."""
+        cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
+        if cutoff <= 0:
+            return rows
+        # A missing/invalid timestamp cannot be proven to belong to the new
+        # PAPER run, so fail closed instead of replaying an unknown old fill.
+        return [
+            row for row in rows
+            if self._copy_row_timestamp(row) > cutoff
+        ]
+
     async def _copy_wallet_tick(self) -> None:
         """Copy every new wallet event: trades, merges, splits and redeems."""
         if not is_valid_wallet_address(self.cfg.copy_wallet) or self._session is None:
@@ -1195,6 +1207,10 @@ class TradingEngine:
                     row for row in activity
                     if str(row.get("type") or "").upper() not in ("TRADE", "REWARD", "MAKER_REBATE", "TAKER_REBATE")
                 )
+
+        # Enforce the reset cutoff on EVERY poll, not only the initial seed.
+        # Data API pagination can expose older pages several minutes later.
+        incoming = self._copy_rows_after_reset(incoming)
 
         # Chronological order matters: the wallet's later fill may sell what
         # its earlier fill bought, and the carry must follow the same order.
