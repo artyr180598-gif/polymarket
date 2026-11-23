@@ -322,7 +322,7 @@ class ExecuteTests(unittest.TestCase):
         job = engine.copy.observe(row, now=1_000_050, cfg=cfg)
         asyncio.run(engine._skip_copy(job, "paused", 1_000_051))
         self.assertEqual(engine.copy.shadow.lots[window.slug]["Down"], ["0", "0"])
-        self.assertEqual(engine.copy.shadow.realized[window.slug], "-8.4")
+        self.assertEqual(engine.copy.shadow.realized[window.slug], "-8.40")
         self.assertTrue(engine.copy.was_shadowed(job.event_id))
 
     def test_copy_fee_uses_the_market_fee_schedule(self) -> None:
