@@ -53,13 +53,16 @@ _ZERO = Decimal(0)
 WINDOW_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 COPY_API_MAX_PAGES = 20
 COPY_API_ATTEMPTS = 3
-# The public Data API has appeared under both a versioned and an unversioned
-# path, with cursor and with offset pagination. Guessing one and being wrong
-# means the copier never sees a single trade, so every shape is tried once and
-# the working one is remembered.
+# Polymarket Data API v2 uses cursor-only pagination. The unversioned v1
+# wallet feeds were retired; do not fall back to an endpoint that no longer
+# serves current data.
 DATA_API = "https://data-api.polymarket.com"
-TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades", f"{DATA_API}/trades")
-ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity", f"{DATA_API}/activity")
+TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades",)
+ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity",)
+
+
+class OrderBookNotFound(RuntimeError):
+    """CLOB has no book for the supplied token id (HTTP 404)."""
 
 
 def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
@@ -114,7 +117,7 @@ def _strategy_lines(cfg) -> list[str]:
             f"Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск; тейкерская комиссия списывается.",
             "Это PAPER-копия после публичного исполнения: наши сделки проходят как TAKER. Maker-очередь кошелька из публичной ленты не видна.",
             "MERGE, SPLIT и REDEEM кошелька повторяются отдельно; остаток гасится только по официальному итогу рынка.",
-            "Недобранный остаток пишется как PARTIAL или SKIPPED. Рядом виден теневой PnL кошелька без комиссий.",
+            "Недобранный остаток пишется как PARTIAL или SKIPPED. Теневой PnL считается с начала наблюдения и не включает позиции, открытые до старта бота.",
         ]
     return [
         "Лестница лимитных покупок на обе стороны. Комиссия мейкера — ноль. Продаж нет.",
@@ -353,6 +356,8 @@ class TradingEngine:
         self._meta_retry_at: dict[str, float] = {}
         self._note_last: dict[str, float] = {}
         self._copy_last_lag = 0.0
+        self._copy_detection_lag = 0.0
+        self._copy_execution_lag = 0.0
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
         # One clock for the latency-critical copy path. Tests freeze it; in
@@ -940,6 +945,12 @@ class TradingEngine:
                     "https://clob.polymarket.com/book",
                     params={"token_id": token_id, "_": str(int(time.time() * 1000))},
                 ) as response:
+                    if response.status == 404:
+                        body = (await response.text())[:120].strip()
+                        detail = f"order book HTTP 404 (token …{token_id[-12:]})"
+                        if body:
+                            detail += f": {body}"
+                        raise OrderBookNotFound(detail)
                     if response.status != 200:
                         raise RuntimeError(f"order book HTTP {response.status}")
                     payload = await response.json(content_type=None)
@@ -952,7 +963,7 @@ class TradingEngine:
                     raise ValueError("order book response has an invalid shape")
                 # A valid empty book is [], []; transport/API failures are raised.
                 return payload["bids"], payload["asks"]
-            except ValueError:
+            except (ValueError, OrderBookNotFound):
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
@@ -1199,7 +1210,10 @@ class TradingEngine:
                 if job.attempts >= int(self.cfg.copy_max_attempts):
                     await self._skip_copy(job, f"error: {exc}", self._clock())
             if job.done:
-                self._copy_last_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+                finished_at = self._clock()
+                self._copy_detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+                self._copy_execution_lag = max(0.0, finished_at - job.detected_at)
+                self._copy_last_lag = max(0.0, finished_at - job.trade_ts) if job.trade_ts else 0.0
                 self._copy_dirty = True
                 # Portfolio state is small and must survive a crash between
                 # events. Seen-id history is flushed less often.
@@ -1273,6 +1287,9 @@ class TradingEngine:
                 return
             await self._skip_copy(job, "scale unknown", now)
             return
+        # The shadow ledger models wallet events independently of our
+        # execution filters. _skip_copy also calls this for paused/expired jobs.
+        self._shadow_event(job, scale)
         if job.kind == "REDEEM":
             await self._mirror_redeem(job, now, scale, window)
             return
@@ -1315,6 +1332,15 @@ class TradingEngine:
         if reason:
             await self._skip_copy(job, reason, now, scale=scale)
             return
+        # Resolved markets no longer have a CLOB order book (the API returns
+        # 404). Reject stale prints before spending a network round trip; the
+        # same condition is checked again after the book await for race safety.
+        if (
+            window.end_ts > 0
+            and self._clock() >= window.end_ts + float(self.cfg.copy_late_grace_s)
+        ):
+            await self._skip_copy(job, "market closed", now, scale=scale)
+            return
         min_shares = window.min_shares
         fee_rate = window.fee_rate
         fee_exp = window.fee_exponent
@@ -1322,7 +1348,7 @@ class TradingEngine:
             await self._skip_copy(job, "missing token", now, scale=scale)
             return
         key = f"{job.token_id}|{job.side}"
-        desired, carry = self._size_once(job, scale, key, min_shares, shadow=True)
+        desired, carry = self._size_once(job, scale, key, min_shares)
         if desired <= 0:
             await self._record_copy(
                 job, now, scale, status="SKIPPED", reason="below minimum, carried",
@@ -1342,7 +1368,17 @@ class TradingEngine:
             want = min(desired, held)
         else:
             want = desired
-        bids, asks = await self._book_for(job.token_id)
+        try:
+            bids, asks = await self._book_for(job.token_id)
+        except OrderBookNotFound as exc:
+            # A 404 is a token/book lookup failure, not a transient network
+            # timeout. Retrying the same event five times only adds latency.
+            await self._record_copy(
+                job, now, scale, status="SKIPPED", reason=str(exc),
+                scaled=desired, carry=carry,
+            )
+            job.done = True
+            return
         execution_now = self._clock()
         self._refresh_halt()
         if self.paused or self.halt_reason:
@@ -1515,10 +1551,8 @@ class TradingEngine:
             )
             job.done = True
             return
-        had = job.event_id in self.copy.sized
-        if not had:
+        if job.event_id not in self.copy.sized:
             self.copy.sized[job.event_id] = [str(desired), str(carry)]
-            self._shadow_trade(job, job.wallet_size * (D("1") if mode != "scale" else scale))
         if job.kind == "MERGE":
             book = self.portfolio.markets.get(job.slug)
             lots = [lot.shares for lot in (book.outcomes.values() if book else []) if lot.shares > 0]
@@ -1593,13 +1627,6 @@ class TradingEngine:
                 winner = next(name for name in tokens if name != job.outcome)
             else:
                 winner = ""
-        had = job.event_id in self.copy.sized
-        if not had:
-            self.copy.sized[job.event_id] = ["0", "0"]
-            if job.payout > 0 and winner:
-                self.copy.shadow.redeem(job.slug, winner)
-            else:
-                self.copy.shadow.drop(job.slug, job.outcome)
         book = self.portfolio.markets.get(job.slug)
         if not winner or book is None or book.resolved:
             self.copy.bump("redeem_ignored")
@@ -1659,7 +1686,7 @@ class TradingEngine:
         )
         job.done = True
 
-    def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal, *, shadow: bool) -> tuple[Decimal, Decimal]:
+    def _size_once(self, job, scale: Decimal, key: str, min_shares: Decimal) -> tuple[Decimal, Decimal]:
         event_id = job.event_id or job.tx
         saved = self.copy.sized.get(event_id)
         if saved:
@@ -1677,9 +1704,6 @@ class TradingEngine:
             desired, carry = scale_size(job.wallet_size, scale, self.copy.carry_of(key), min_shares)
             self.copy.set_carry(key, carry)
         self.copy.sized[event_id] = [str(desired), str(carry)]
-        if shadow:
-            shadow_scale = D("1") if mode != "scale" else scale
-            self._shadow_trade(job, job.wallet_size * shadow_scale)
         return desired, carry
 
     def _shadow_trade(self, job, exact: Decimal) -> None:
@@ -1732,7 +1756,38 @@ class TradingEngine:
             return "exposure cap"
         return ""
 
+    def _shadow_event(self, job, scale: Decimal | None = None) -> None:
+        if job.kind not in ("TRADE", "MERGE", "SPLIT", "REDEEM") or self.copy.was_shadowed(job.event_id):
+            return
+        if job.kind == "REDEEM":
+            if job.payout > 0:
+                self.copy.shadow.redeem(job.slug, job.outcome)
+            else:
+                # A zero-payout redeem is the losing outcome's burn.
+                self.copy.shadow.drop(job.slug, job.outcome)
+        else:
+            if self.cfg.copy_size_mode != "scale":
+                shadow_scale = D("1")
+            elif scale is not None:
+                shadow_scale = scale
+            elif not self.cfg.copy_scale_auto:
+                shadow_scale = D(str(self.cfg.copy_scale))
+            else:
+                # Use today's already measured auto-scale, but never invent one
+                # when the wallet-value endpoint has not answered yet.
+                cached = getattr(self, "_copy_scale_value", None)
+                day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+                shadow_scale = cached if cached is not None and getattr(self, "_copy_scale_day", "") == day else None
+            if shadow_scale is None:
+                return
+            self._shadow_trade(job, job.wallet_size * shadow_scale)
+        self.copy.mark_shadowed(job.event_id, limit=int(self.cfg.copy_seen_limit))
+        self._persist_copy()
+
     async def _skip_copy(self, job, reason: str, now: float, scale: Decimal | None = None) -> None:
+        # Paused/expired jobs bypass _execute_copy; keep their wallet-side
+        # shadow accounting complete even though no paper order is attempted.
+        self._shadow_event(job, scale)
         job.done = True
         self.copy.bump("skipped")
         await self._record_copy(
@@ -1748,10 +1803,14 @@ class TradingEngine:
         fee: Decimal = _ZERO, slip: Decimal = _ZERO,
         levels: list | None = None,
     ) -> None:
-        lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0
+        detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
+        execution_lag = max(0.0, float(now) - job.detected_at)
+        total_lag = max(0.0, float(now) - job.trade_ts) if job.trade_ts else 0.0
         self.ledger.record_copy(
             mode=self.mode, slug=job.slug, tx=job.tx, event_id=job.event_id,
-            wallet_ts=job.trade_ts, detected_at=job.detected_at, lag_s=lag,
+            wallet_ts=job.trade_ts, detected_at=job.detected_at,
+            lag_s=detection_lag, execution_at=float(now),
+            execution_lag_s=execution_lag, total_lag_s=total_lag,
             side=job.side, outcome=job.outcome,
             wallet_size=job.wallet_size, wallet_price=job.wallet_price,
             scale=scale, scaled_size=scaled, carry=carry,
@@ -1867,7 +1926,7 @@ class TradingEngine:
 
     @staticmethod
     def _page_cursor(payload) -> tuple[str, bool]:
-        """``(next_cursor, has_more)`` for cursor endpoints, else ``("", False)``."""
+        """Return the v2 cursor and its explicit has-more flag."""
         if not isinstance(payload, dict):
             return "", False
         for blob in (payload.get("pagination"), payload):
@@ -1875,8 +1934,8 @@ class TradingEngine:
                 continue
             cursor = blob.get("next_cursor") or blob.get("nextCursor") or ""
             more = blob.get("has_more", blob.get("hasMore"))
-            if cursor:
-                return str(cursor), (True if more is None else bool(more))
+            if cursor or more is not None:
+                return str(cursor or ""), bool(more) if more is not None else bool(cursor)
         return "", False
 
     async def _wallet_pages(
@@ -1898,85 +1957,66 @@ class TradingEngine:
             return []
         label = "Лента кошелька" if kind == "trades" else "Активность кошелька"
         endpoints = TRADE_ENDPOINTS if kind == "trades" else ACTIVITY_ENDPOINTS
-        chosen = self._feed_endpoint.get(kind, "")
-        ordered = ((chosen,) if chosen else ()) + tuple(url for url in endpoints if url != chosen)
+        base = endpoints[0]
         pages = 1 if not seeded else COPY_API_MAX_PAGES
-        collected: list[dict] = []
-        for base in ordered:
-            page_rows: list[dict] = []
-            cursor = ""
-            offset = 0
-            style = ""
-            first_ok = False
-            for page_number in range(pages):
-                params = {
-                    "user": self.cfg.copy_wallet.lower(),
-                    "limit": "200",
-                }
-                if kind == "trades":
-                    params["takerOnly"] = "true" if taker_only else "false"
-                if style == "cursor" and cursor:
-                    params["cursor"] = cursor
-                elif style != "cursor" and offset:
-                    params["offset"] = str(offset)
-                payload = await self._wallet_api_page(base, params, label)
-                if payload is None:
-                    if not first_ok:
-                        break
-                    # Keep the rows already read; the next poll resumes.
-                    self._note_once(
-                        f"{kind}-deep-page", "ERROR",
-                        f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
-                        60,
-                    )
-                    return page_rows
-                first_ok = True
-                if not style:
-                    style = "cursor" if self._page_cursor(payload)[0] else "offset"
-                page = self._page_rows(payload)
-                if not page:
-                    break
-                known = all(
-                    (event_key(row) in seen)
-                    or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
-                    for row in page
+        page_rows: list[dict] = []
+        cursor = ""
+        first_ok = False
+        for page_number in range(pages):
+            params = {
+                "user": self.cfg.copy_wallet.lower(),
+                "limit": "200",
+            }
+            if kind == "trades":
+                params["takerOnly"] = "true" if taker_only else "false"
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._wallet_api_page(base, params, label)
+            if payload is None:
+                if not first_ok:
+                    return None
+                # Keep the rows already read; the next poll resumes.
+                self._note_once(
+                    f"{kind}-deep-page", "ERROR",
+                    f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
+                    60,
                 )
-                if known:
-                    break
-                fresh = [
-                    row for row in page
-                    if event_key(row) not in seen
-                    and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
-                ]
-                page_rows.extend(fresh)
-                seen.update(key for row in page if (key := event_key(row)))
-                cursor, has_more = self._page_cursor(payload)
-                if style == "cursor":
-                    if not has_more or not cursor:
-                        break
-                else:
-                    offset += len(page)
-                    explicit = None
-                    if isinstance(payload, dict):
-                        for blob in (payload.get("pagination"), payload):
-                            if isinstance(blob, dict) and blob.get("has_more") is not None:
-                                explicit = bool(blob.get("has_more"))
-                                break
-                    if explicit is False:
-                        break
-                    # The endpoint may cap ``limit`` below what was asked for.
-                    # A short page means the end; a full one may still have a
-                    # tail, so it is followed up to the page cap.
-                    if explicit is None and len(page) < 100:
-                        break
-            if first_ok:
-                if self._feed_endpoint.get(kind) != base:
-                    self._feed_endpoint[kind] = base
-                    self._note("INFO", f"{label}: используется {base}")
-                collected = page_rows
+                return page_rows
+            first_ok = True
+            page = self._page_rows(payload)
+            if not page:
                 break
-        else:
+            known = all(
+                (event_key(row) in seen)
+                or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
+                for row in page
+            )
+            if known:
+                break
+            fresh = [
+                row for row in page
+                if event_key(row) not in seen
+                and str(row.get("transaction_hash") or row.get("transactionHash") or "") not in seen
+            ]
+            page_rows.extend(fresh)
+            seen.update(key for row in page if (key := event_key(row)))
+            next_cursor, has_more = self._page_cursor(payload)
+            if not has_more:
+                break
+            if not next_cursor:
+                self._note_once(
+                    f"{kind}-cursor-missing", "ERROR",
+                    f"{label}: API сообщил has_more без next_cursor; хвост отложен",
+                    60,
+                )
+                break
+            cursor = next_cursor
+        if not first_ok:
             return None
+        if self._feed_endpoint.get(kind) != base:
+            self._feed_endpoint[kind] = base
+            self._note("INFO", f"{label}: используется {base}")
+        collected = page_rows
         named = [row for row in collected if wallet_of(row)]
         if collected and not named:
             # The endpoint answered but the rows carry no wallet field, so the
@@ -2052,7 +2092,10 @@ class TradingEngine:
             "activity_seeded": bool(self.copy.seeded_activity),
             "counters": counters,
             "last_lag_s": round(self._copy_last_lag, 3),
+            "last_detection_lag_s": round(self._copy_detection_lag, 3),
+            "last_execution_lag_s": round(self._copy_execution_lag, 3),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)),
+            "shadow_basis": "since_tracking_started",
             "our_pnl": str(usdc(self.portfolio.equity(self.marks) - self.portfolio.initial_cash)),
             "windows": windows,
             "copies": rows,
@@ -2823,6 +2866,7 @@ class TradingEngine:
             "strategy_title": _strategy_title(self.cfg.strategy),
             "strategy_lines": _strategy_lines(self.cfg),
             "shadow_pnl": str(self.copy.shadow.cumulative(self.marks)) if self.cfg.strategy == "copy_wallet" else None,
+            "shadow_basis": "since_tracking_started" if self.cfg.strategy == "copy_wallet" else None,
             "copy_scale": self._scale_label() if self.cfg.strategy == "copy_wallet" else None,
             "copy_max_slip": self.cfg.copy_max_slip if self.cfg.strategy == "copy_wallet" else None,
             "copy": (
@@ -2842,6 +2886,8 @@ class TradingEngine:
                     "pending": sum(1 for job in self.copy.jobs if not job.done),
                     "counters": dict(self.copy.counters),
                     "last_lag_s": round(self._copy_last_lag, 3),
+                    "last_detection_lag_s": round(self._copy_detection_lag, 3),
+                    "last_execution_lag_s": round(self._copy_execution_lag, 3),
                     "last_event_at": self._copy_last_seen_at,
                     "window_cap_usd": self.cfg.copy_window_cap_usd,
                     "exposure_cap_usd": self.cfg.copy_exposure_cap_usd,

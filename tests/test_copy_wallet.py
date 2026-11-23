@@ -24,7 +24,7 @@ from bot.copy_wallet import (
     scale_size,
     walk_book,
 )
-from bot.engine import TradingEngine, Window
+from bot.engine import OrderBookNotFound, TradingEngine, Window
 from bot.fees import taker_fee_usdc
 
 
@@ -109,6 +109,26 @@ class WalletFilterTests(unittest.TestCase):
         book = CopyBook.from_dict({"seen_tx": ["0xlegacy"]})
         self.assertIsNone(book.observe(_buy("0xlegacy"), now=1_000_120, cfg=_cfg()))
 
+    def test_data_api_v2_cursor_parser_preserves_has_more(self) -> None:
+        self.assertEqual(
+            TradingEngine._page_cursor({
+                "pagination": {"next_cursor": "cursor-2", "has_more": True},
+            }),
+            ("cursor-2", True),
+        )
+        self.assertEqual(
+            TradingEngine._page_cursor({
+                "pagination": {"next_cursor": None, "has_more": True},
+            }),
+            ("", True),
+        )
+        self.assertEqual(
+            TradingEngine._page_cursor({
+                "pagination": {"next_cursor": None, "has_more": False},
+            }),
+            ("", False),
+        )
+
     def test_wallet_address_validation(self) -> None:
         self.assertTrue(is_valid_wallet_address(DEFAULT_WALLET))
         self.assertFalse(is_valid_wallet_address("0x1234"))
@@ -130,6 +150,21 @@ class WalletFilterTests(unittest.TestCase):
         job = book.observe(_buy("0xabc"), now=5_000, cfg=cfg)
         self.assertEqual(job.execute_at, 5_000)
         self.assertEqual(book.due(5_000), [job])
+
+    def test_copy_ledger_records_detection_execution_and_total_latency(self) -> None:
+        cfg = _cfg()
+        engine = TradingEngine(cfg)
+        job = engine.copy.observe(_buy("0xlatency", ts=1_000), now=1_005, cfg=cfg)
+        asyncio.run(engine._record_copy(
+            job, 1_012, Decimal("0.1"), status="SKIPPED", reason="test",
+            scaled=Decimal("0"), carry=Decimal("0"),
+        ))
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["lag_s"], 5.0)
+        self.assertEqual(row["execution_at"], 1_012.0)
+        self.assertEqual(row["execution_lag_s"], 7.0)
+        self.assertEqual(row["total_lag_s"], 12.0)
+
 
 
 class ScaleAndBookTests(unittest.TestCase):
@@ -251,7 +286,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(report["slip"], "0.03")
         self.assertEqual(report["copies"][0]["wallet_tx"], "0xfill")
 
-    def test_missing_token_does_not_consume_size_carry_or_shadow(self) -> None:
+    def test_missing_token_does_not_consume_size_carry_but_keeps_wallet_shadow(self) -> None:
         cfg = _cfg(copy_scale=0.1)
         engine = TradingEngine(cfg)
         window = self._window(engine)
@@ -264,10 +299,51 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(job.done)
         self.assertEqual(engine.copy.carry, {})
         self.assertEqual(engine.copy.sized, {})
-        self.assertEqual(engine.copy.shadow.cumulative(), Decimal("0"))
+        self.assertEqual(engine.copy.shadow.lots[window.slug]["Up"][0], "10.0")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
         recorded = engine.ledger.copies("paper")[0]
         self.assertEqual(recorded["status"], "SKIPPED")
         self.assertEqual(recorded["reason"], "missing token")
+
+    def test_paused_event_still_updates_shadow_accounting(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        job = engine.copy.observe(_buy("0xpaused-shadow", size="100"), now=1_000_050, cfg=cfg)
+        asyncio.run(engine._skip_copy(job, "paused", 1_000_051))
+        self.assertEqual(engine.copy.shadow.lots[window.slug]["Up"][0], "100")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
+
+    def test_missing_order_book_is_recorded_as_terminal_skip(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xbook-404", size="10"), now=1_000_050, cfg=cfg)
+        engine._cached_book = lambda _token: ([], [])  # type: ignore[method-assign]
+
+        async def missing(_token: str):
+            raise OrderBookNotFound("order book HTTP 404")
+
+        engine._book_for = missing  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        self.assertTrue(job.done)
+        row = engine.ledger.copies("paper")[0]
+        self.assertEqual(row["status"], "SKIPPED")
+        self.assertEqual(row["reason"], "order book HTTP 404")
+
+    def test_paused_losing_redeem_still_closes_shadow_lot_once(self) -> None:
+        cfg = _cfg(copy_size_mode="exact")
+        engine = TradingEngine(cfg)
+        window = self._window(engine)
+        engine.copy.shadow.buy(window.slug, "Down", Decimal("12"), Decimal("0.70"))
+        row = _buy("0xpaused-redeem", outcome="Down", size="0")
+        row["type"] = "REDEEM"
+        row["usdc_size"] = "0"
+        job = engine.copy.observe(row, now=1_000_050, cfg=cfg)
+        asyncio.run(engine._skip_copy(job, "paused", 1_000_051))
+        self.assertEqual(engine.copy.shadow.lots[window.slug]["Down"], ["0", "0"])
+        self.assertEqual(engine.copy.shadow.realized[window.slug], "-8.40")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
 
     def test_copy_fee_uses_the_market_fee_schedule(self) -> None:
         cfg = _cfg(copy_scale=0.1, bankroll_usd=100)
@@ -452,6 +528,27 @@ class ExecuteTests(unittest.TestCase):
         self.assertTrue(engine.manual_pause)
         self.assertIn("дневной лимит", engine.halt_reason)
 
+    def test_shadow_tracks_wallet_fill_even_when_copy_is_filtered(self) -> None:
+        cfg = _cfg(copy_min_price=0.90)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xshadow-filter", size="100"), now=1_000_051, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        self.assertTrue(job.done)
+        self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
+        self.assertTrue(engine.copy.was_shadowed(job.event_id))
+        restored = CopyBook.from_dict(engine.copy.to_dict())
+        self.assertTrue(restored.was_shadowed(job.event_id))
+
+    def test_shadow_is_not_double_counted_when_copy_job_retries(self) -> None:
+        cfg = _cfg(copy_min_price=0.90)
+        engine = TradingEngine(cfg)
+        self._window(engine)
+        job = engine.copy.observe(_buy("0xshadow-once", size="100"), now=1_000_051, cfg=cfg)
+        asyncio.run(engine._execute_copy(job, 1_000_052))
+        asyncio.run(engine._execute_copy(job, 1_000_053))
+        self.assertEqual(engine.copy.shadow.lots[job.slug]["Up"][0], "10.0")
+
     def test_manual_pause_survives_restart_and_the_daily_reset(self) -> None:
         cfg = _cfg(strategy="maker_ladder", auto_start=True, copy_scale=None)
         engine = TradingEngine(cfg)
@@ -494,6 +591,7 @@ class _FakeSession:
     def get(self, url, params=None):
         self.calls.append((url, dict(params or {})))
         return self.responses.pop(0)
+
 
 
 class WalletApiTests(unittest.TestCase):
