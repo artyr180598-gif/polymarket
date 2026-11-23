@@ -1823,6 +1823,22 @@ class TradingEngine:
                 f"skip:{job.event_id[:16]}:{reason}", "INFO",
                 f"SKIPPED {job.slug} {job.side} {job.outcome}: {reason}", 10,
             )
+        elif job.kind == "TRADE" and status in ("FILLED", "PARTIAL"):
+            asset, timeframe = _asset_timeframe(job.slug)
+            direction = "ПОКУПКА" if job.side == "BUY" else "ПРОДАЖА"
+            outcome = "ВВЕРХ" if job.outcome.lower() in ("up", "yes") else (
+                "ВНИЗ" if job.outcome.lower() in ("down", "no") else job.outcome
+            )
+            notional = usdc(our_size * our_price)
+            result_word = "СКОПИРОВАНО" if status == "FILLED" else "СКОПИРОВАНО ЧАСТИЧНО"
+            self._note(
+                "INFO",
+                f"{result_word} · {direction} {outcome} {asset} {timeframe} · "
+                f"{our_size} шт. × {our_price} = ${notional} · "
+                f"кошелёк {job.wallet_size} шт. × {job.wallet_price} · "
+                f"задержка {total_lag:.2f} с · комиссия ${fee}",
+                notify=True,
+            )
 
     async def _copy_scale(self, now: float) -> Decimal | None:
         if getattr(self.cfg, "copy_size_mode", "scale") in ("exact", "fixed"):
