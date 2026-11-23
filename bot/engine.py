@@ -1628,13 +1628,6 @@ class TradingEngine:
                 winner = next(name for name in tokens if name != job.outcome)
             else:
                 winner = ""
-        had = job.event_id in self.copy.sized
-        if not had:
-            self.copy.sized[job.event_id] = ["0", "0"]
-            if job.payout > 0 and winner:
-                self.copy.shadow.redeem(job.slug, winner)
-            else:
-                self.copy.shadow.drop(job.slug, job.outcome)
         book = self.portfolio.markets.get(job.slug)
         if not winner or book is None or book.resolved:
             self.copy.bump("redeem_ignored")
@@ -1765,23 +1758,30 @@ class TradingEngine:
         return ""
 
     def _shadow_event(self, job, scale: Decimal | None = None) -> None:
-        if job.kind not in ("TRADE", "MERGE", "SPLIT") or self.copy.was_shadowed(job.event_id):
+        if job.kind not in ("TRADE", "MERGE", "SPLIT", "REDEEM") or self.copy.was_shadowed(job.event_id):
             return
-        if self.cfg.copy_size_mode != "scale":
-            shadow_scale = D("1")
-        elif scale is not None:
-            shadow_scale = scale
-        elif not self.cfg.copy_scale_auto:
-            shadow_scale = D(str(self.cfg.copy_scale))
+        if job.kind == "REDEEM":
+            if job.payout > 0:
+                self.copy.shadow.redeem(job.slug, job.outcome)
+            else:
+                # A zero-payout redeem is the losing outcome's burn.
+                self.copy.shadow.drop(job.slug, job.outcome)
         else:
-            # Use today's already measured auto-scale, but never invent one
-            # when the wallet-value endpoint has not answered yet.
-            cached = getattr(self, "_copy_scale_value", None)
-            day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
-            shadow_scale = cached if cached is not None and getattr(self, "_copy_scale_day", "") == day else None
-        if shadow_scale is None:
-            return
-        self._shadow_trade(job, job.wallet_size * shadow_scale)
+            if self.cfg.copy_size_mode != "scale":
+                shadow_scale = D("1")
+            elif scale is not None:
+                shadow_scale = scale
+            elif not self.cfg.copy_scale_auto:
+                shadow_scale = D(str(self.cfg.copy_scale))
+            else:
+                # Use today's already measured auto-scale, but never invent one
+                # when the wallet-value endpoint has not answered yet.
+                cached = getattr(self, "_copy_scale_value", None)
+                day = time.strftime("%Y-%m-%d", time.gmtime(self._clock()))
+                shadow_scale = cached if cached is not None and getattr(self, "_copy_scale_day", "") == day else None
+            if shadow_scale is None:
+                return
+            self._shadow_trade(job, job.wallet_size * shadow_scale)
         self.copy.mark_shadowed(job.event_id, limit=int(self.cfg.copy_seen_limit))
         self._persist_copy()
 
