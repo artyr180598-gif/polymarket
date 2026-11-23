@@ -98,7 +98,7 @@ def _size_mode_text(cfg) -> str:
         if getattr(cfg, "copy_scale_auto", False):
             return "размер = размер кошелька × (наш капитал / стоимость кошелька)"
         return f"размер = размер кошелька × {cfg.copy_scale:g}"
-    return "размер 1:1, как у кошелька (шаг 0.01, остаток переносится)"
+    return "размер 1:1 по каждой сделке отдельно (шаг 0.01, остаток не переносится)"
 
 
 def _scope_text(cfg) -> str:
@@ -1412,7 +1412,7 @@ class TradingEngine:
         desired, carry = self._size_once(job, scale, key, min_shares)
         if desired <= 0:
             await self._record_copy(
-                job, now, scale, status="SKIPPED", reason="below minimum, carried",
+                job, now, scale, status="SKIPPED", reason="below minimum; source event skipped without carry",
                 scaled=job.wallet_size * scale, carry=carry,
             )
             job.done = True
