@@ -2066,6 +2066,8 @@ class TradingEngine:
         cursor = ""
         first_ok = False
         occurrence_counts: dict[str, int] = {}
+        catching_up = bool(self.copy.feed_catchup.get(kind, False))
+        has_more = False
         for page_number in range(pages):
             # Data API /v2/trades can be served from a 300s CloudFront cache.
             # A unique query key is essential: polling every 500ms without it
@@ -2083,7 +2085,9 @@ class TradingEngine:
             if payload is None:
                 if not first_ok:
                     return None
-                # Keep the rows already read; the next poll resumes.
+                # Keep rows already read and remember that older pages
+                # still need draining on a later poll (including after restart).
+                self.copy.feed_catchup[kind] = True
                 self._note_once(
                     f"{kind}-deep-page", "ERROR",
                     f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
@@ -2102,13 +2106,29 @@ class TradingEngine:
                 occurrence_counts[base_event_id] = occurrence + 1
                 if occurrence:
                     row["_copy_occurrence"] = occurrence
+            next_cursor, has_more = self._page_cursor(payload)
             known = all(
                 (event_key(row) in seen)
                 or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
                 for row in page
             )
-            if known:
+            if known and not catching_up:
+                self.copy.feed_catchup[kind] = False
                 break
+            if known and catching_up:
+                if not has_more:
+                    self.copy.feed_catchup[kind] = False
+                    break
+                if not next_cursor:
+                    self.copy.feed_catchup[kind] = True
+                    self._note_once(
+                        f"{kind}-cursor-missing", "ERROR",
+                        f"{label}: API сообщил has_more без next_cursor; хвост отложен",
+                        60,
+                    )
+                    break
+                cursor = next_cursor
+                continue
             fresh = [
                 row for row in page
                 if event_key(row) not in seen
@@ -2116,10 +2136,11 @@ class TradingEngine:
             ]
             page_rows.extend(fresh)
             seen.update(key for row in page if (key := event_key(row)))
-            next_cursor, has_more = self._page_cursor(payload)
             if not has_more:
+                self.copy.feed_catchup[kind] = False
                 break
             if not next_cursor:
+                self.copy.feed_catchup[kind] = True
                 self._note_once(
                     f"{kind}-cursor-missing", "ERROR",
                     f"{label}: API сообщил has_more без next_cursor; хвост отложен",
@@ -2127,6 +2148,10 @@ class TradingEngine:
                 )
                 break
             cursor = next_cursor
+        else:
+            # The page cap was reached. Continue scanning past known leading
+            # pages on the next poll rather than stranding an oversized burst.
+            self.copy.feed_catchup[kind] = bool(has_more)
         if not first_ok:
             return None
         if self._feed_endpoint.get(kind) != base:
