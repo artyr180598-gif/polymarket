@@ -2097,6 +2097,7 @@ class TradingEngine:
             first_ok = True
             page = self._page_rows(payload)
             if not page:
+                self.copy.feed_catchup[kind] = False
                 break
             # Preserve multiplicity when a tx contains byte-for-byte identical
             # fills. The first occurrence retains its legacy event identity.
