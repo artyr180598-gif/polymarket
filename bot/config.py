@@ -215,13 +215,11 @@ class BotConfig:
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "BotConfig":
         load_dotenv(env_file or ".env", override=False)
-        mode = os.getenv("TRADING_MODE", "paper").strip().lower()
-        if mode not in ("paper", "live"):
-            mode = "paper"
+        # This production bot is PAPER-only. Ignore environment attempts to
+        # select LIVE or another strategy; this is a hard safety boundary.
+        mode = "paper"
         preset = os.getenv("STRATEGY_PRESET", "mo_money").strip().lower() or "mo_money"
-        strategy = os.getenv("STRATEGY", "copy_wallet").strip().lower() or "copy_wallet"
-        if strategy not in STRATEGIES:
-            strategy = "copy_wallet"
+        strategy = "copy_wallet"
         # Production copy mode is fail-closed: environment variables cannot expand
         # the supported asset allowlist. ETH/SOL remain management-only for legacy inventory.
         assets = ["BTC"]
