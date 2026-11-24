@@ -86,7 +86,7 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
 
 def _strategy_title(strategy: str) -> str:
     if strategy == "copy_wallet":
-        return "copy-wallet: все сделки кошелька, бумага"
+        return "copy-wallet: BTC-only PAPER"
     return "mo-money: лестница мейкер-бидов"
 
 
@@ -104,8 +104,8 @@ def _size_mode_text(cfg) -> str:
 def _scope_text(cfg) -> str:
     prefixes = list(getattr(cfg, "copy_slug_prefixes", []) or [])
     if not prefixes:
-        return "все рынки кошелька, включая BTC/ETH/SOL/XRP и любые окна"
-    return "рынки: " + ", ".join(prefixes)
+        return "новые TRADE/SPLIT только BTC; MERGE/REDEEM — для закрытия старых позиций"
+    return "только BTC; дополнительные фильтры рынков: " + ", ".join(prefixes)
 
 
 def _strategy_lines(cfg) -> list[str]:
@@ -116,7 +116,7 @@ def _strategy_lines(cfg) -> list[str]:
             f"{_size_mode_text(cfg)}. {_scope_text(cfg)}.",
             f"Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск; тейкерская комиссия списывается.",
             "Это PAPER-копия после публичного исполнения: наши сделки проходят как TAKER. Maker-очередь кошелька из публичной ленты не видна.",
-            "MERGE, SPLIT и REDEEM кошелька повторяются отдельно; остаток гасится только по официальному итогу рынка.",
+            "Новые TRADE/SPLIT разрешены только для BTC. MERGE/REDEEM других активов допускаются лишь для закрытия уже существующего инвентаря.",
             "Недобранный остаток пишется как PARTIAL или SKIPPED. Теневой PnL считается с начала наблюдения и не включает позиции, открытые до старта бота.",
         ]
     return [
