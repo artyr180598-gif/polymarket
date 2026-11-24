@@ -841,3 +841,44 @@ class FeedCatchupPersistenceTests(unittest.TestCase):
         self.assertEqual([row["transaction_hash"] for row in rows], ["0xolder-unseen"])
         self.assertEqual(len(calls), 2)
         self.assertFalse(engine.copy.feed_catchup["trades"])
+
+    def test_catchup_without_saved_cursor_continues_after_known_page(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        engine.copy.feed_catchup["trades"] = True
+        known = _row("0xknown-no-cursor", ts=1_000_103)
+        older = _row("0xolder-after-known", ts=1_000_101)
+        engine.copy.remember(event_key(known))
+        calls = []
+
+        async def page(_url, params, _label):
+            calls.append(dict(params))
+            if not params.get("cursor"):
+                return {"data": [known], "pagination": {"has_more": True, "next_cursor": "page-two"}}
+            return {"data": [older], "pagination": {"has_more": False}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(engine.copy._seen), taker_only=False,
+        ))
+        self.assertEqual([row["transaction_hash"] for row in rows], ["0xolder-after-known"])
+        self.assertEqual(calls[1].get("cursor"), "page-two")
+        self.assertFalse(engine.copy.feed_catchup["trades"])
+
+    def test_catchup_flag_is_not_cleared_when_api_omits_required_cursor(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        engine.copy.feed_catchup["trades"] = True
+        known = _row("0xknown-no-next-cursor", ts=1_000_103)
+        engine.copy.remember(event_key(known))
+
+        async def page(_url, _params, _label):
+            return {"data": [known], "pagination": {"has_more": True}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(engine.copy._seen), taker_only=False,
+        ))
+        self.assertEqual(rows, [])
+        self.assertTrue(engine.copy.feed_catchup["trades"])
+        self.assertNotIn("trades", engine.copy.feed_cursor)
