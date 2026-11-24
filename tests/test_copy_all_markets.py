@@ -582,28 +582,22 @@ class EventKeyTests(unittest.TestCase):
 
 
 class FeedEndpointTests(unittest.TestCase):
-    def test_a_dead_first_endpoint_falls_back_to_the_second(self) -> None:
+    def test_uses_only_the_current_v2_feed_endpoint(self) -> None:
         cfg = _cfg()
         engine = TradingEngine(cfg)
         engine._session = object()
         row = _row("0xfeed")
         tried: list[str] = []
-        dead, alive = TRADE_ENDPOINTS[0], TRADE_ENDPOINTS[1]
 
         async def page(url, params, label):
             tried.append(url)
-            return [row] if url == alive else None
+            return {"data": [row], "pagination": {"has_more": False}}
 
         engine._wallet_api_page = page  # type: ignore[method-assign]
         rows = asyncio.run(engine._fetch_wallet_trades(False))
         self.assertEqual([event_key(r) for r in rows or []], [event_key(row)])
-        self.assertEqual(engine._feed_endpoint["trades"], alive)
-        self.assertIn(dead, tried)
-
-        # The working endpoint is remembered and tried first next time.
-        tried.clear()
-        asyncio.run(engine._fetch_wallet_trades(False))
-        self.assertEqual(tried[0], alive)
+        self.assertEqual(tried, [TRADE_ENDPOINTS[0]])
+        self.assertEqual(engine._feed_endpoint["trades"], TRADE_ENDPOINTS[0])
 
     def test_cursor_pagination_is_followed(self) -> None:
         cfg = _cfg()
