@@ -110,6 +110,17 @@ class MarketCoverageTests(unittest.TestCase):
             self.assertIsNone(job, slug)
         self.assertEqual(len(book.jobs), 1)
 
+    def test_disabled_asset_sell_is_allowed_to_reduce_legacy_inventory(self) -> None:
+        cfg = _cfg(enabled_assets=["BTC"])
+        book = CopyBook()
+        sell = book.observe(
+            _row("0xeth-sell", slug="eth-updown-5m-1000000", side="SELL"),
+            now=1_000_050,
+            cfg=cfg,
+        )
+        self.assertIsNotNone(sell)
+        self.assertEqual(sell.side, "SELL")
+
     def test_disabled_asset_management_events_can_close_legacy_inventory(self) -> None:
         cfg = _cfg(enabled_assets=["BTC"])
         book = CopyBook()
