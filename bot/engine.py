@@ -381,6 +381,9 @@ class TradingEngine:
         self._copy_execution_lag = 0.0
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
+        # Consecutive transient Data API failures back off per endpoint so a
+        # degraded upstream is not hammered again on every fast poll.
+        self._copy_api_failures: dict[str, int] = {}
         # One clock for the latency-critical copy path. Tests freeze it; in
         # production it is wall time.
         self._clock: Callable[[], float] = time.time
@@ -1175,7 +1178,9 @@ class TradingEngine:
                 )
         if trades is None and activity is None:
             self.copy.bump("feed_errors")
-            self._copy_backoff_until = time.monotonic() + 2.0
+            self._copy_backoff_until = max(
+                self._copy_backoff_until, time.monotonic() + 2.0,
+            )
             return
 
         incoming: list[dict] = []
@@ -1978,25 +1983,37 @@ class TradingEngine:
             try:
                 async with self._session.get(url, params=params) as response:
                     if response.status == 200:
+                        self._copy_api_failures.pop(url, None)
                         return await response.json(content_type=None)
                     retryable = response.status == 429 or 500 <= response.status <= 599
                     headers = getattr(response, "headers", {}) or {}
                     retry_after = headers.get("Retry-After")
                     if retry_after:
                         try:
-                            retry_delay = min(5.0, max(0.1, float(retry_after)))
+                            retry_delay = min(60.0, max(0.1, float(retry_after)))
                         except (TypeError, ValueError):
                             pass
                     message = f"{label} HTTP {response.status}"
                     if not retryable or attempt + 1 >= COPY_API_ATTEMPTS:
                         self._note_once(f"{label}-{response.status}", "ERROR", message, 20)
-                        if response.status == 429:
-                            self._copy_backoff_until = time.monotonic() + max(1.0, retry_delay)
+                        if retryable:
+                            failures = self._copy_api_failures.get(url, 0) + 1
+                            self._copy_api_failures[url] = failures
+                            backoff = min(60.0, max(2.0, retry_delay, float(2 ** min(failures, 6))))
+                            self._copy_backoff_until = max(
+                                self._copy_backoff_until, time.monotonic() + backoff,
+                            )
                         return None
                     self._note_once(f"{label}-retry", "INFO", f"{message}; повтор", 15)
             except Exception as exc:  # noqa: BLE001
                 if attempt + 1 >= COPY_API_ATTEMPTS:
                     self._note_once(f"{label}-net", "ERROR", f"{label}: {exc}", 20)
+                    failures = self._copy_api_failures.get(url, 0) + 1
+                    self._copy_api_failures[url] = failures
+                    backoff = min(60.0, max(2.0, float(2 ** min(failures, 6))))
+                    self._copy_backoff_until = max(
+                        self._copy_backoff_until, time.monotonic() + backoff,
+                    )
                     return None
                 self._note_once(f"{label}-retry", "INFO", f"{label}: {exc}; повтор", 15)
             await asyncio.sleep(retry_delay)
