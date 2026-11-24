@@ -1993,7 +1993,20 @@ class TradingEngine:
                             retry_delay = min(60.0, max(0.1, float(retry_after)))
                         except (TypeError, ValueError):
                             pass
+                    error_payload = {}
+                    try:
+                        body = await response.json(content_type=None)
+                        if isinstance(body, dict):
+                            error_payload = body
+                    except Exception:  # noqa: BLE001
+                        pass
+                    trace_id = headers.get("x-trace-id") or error_payload.get("trace_id")
+                    code = error_payload.get("code")
                     message = f"{label} HTTP {response.status}"
+                    if code:
+                        message += f" code={code}"
+                    if trace_id:
+                        message += f" trace_id={trace_id}"
                     if not retryable or attempt + 1 >= COPY_API_ATTEMPTS:
                         self._note_once(f"{label}-{response.status}", "ERROR", message, 20)
                         if retryable:
