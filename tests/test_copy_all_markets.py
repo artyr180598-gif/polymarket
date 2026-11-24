@@ -180,7 +180,13 @@ class MarketCoverageTests(unittest.TestCase):
         self.assertEqual(config.trading_mode, "paper")
         self.assertEqual(config.strategy, "copy_wallet")
         self.assertEqual(config.enabled_assets, ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"])
+        self.assertTrue(config.auto_start)
+
+    def test_paper_auto_start_is_opt_in(self) -> None:
+        with patch.dict(os.environ, {"AUTO_START": "false"}, clear=True):
+            config = BotConfig.from_env()
         self.assertFalse(config.auto_start)
+        self.assertEqual(config.trading_mode, "paper")
 
     def test_scope_filter_is_optional(self) -> None:
         cfg = _cfg(copy_slug_prefixes=["eth-updown"], enabled_assets=["ETH"])
