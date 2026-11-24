@@ -213,10 +213,10 @@ class Portfolio:
         lots = [lot for lot in book.outcomes.values() if lot.shares > 0]
         if qty <= 0 or len(lots) < 2 or any(lot.shares < qty for lot in lots):
             raise ValueError("not enough of every outcome to merge")
-        taken = [_take(lot, qty) for lot in lots]
         gas_usdc = usdc(D(gas))
         if gas_usdc > usdc(self.cash + qty):
             raise ValueError("not enough cash for gas")
+        taken = [_take(lot, qty) for lot in lots]
         self.cash = usdc(self.cash + qty - gas_usdc)  # qty complete sets × $1
         self.gas_paid = usdc(self.gas_paid + gas_usdc)
         pnl = usdc(qty - sum((cost + fee for cost, fee in taken), _ZERO) - gas_usdc)
@@ -246,11 +246,11 @@ class Portfolio:
         if lot is None or lot.shares + SHARE < qty:
             raise ValueError("not enough shares to sell")
         qty = min(qty, lot.shares)
-        cost, released_fee = _take(lot, qty)
         proceeds = usdc(qty * px)
         fee_usdc = usdc(D(fee))
         if fee_usdc > usdc(self.cash + proceeds):
             raise ValueError("not enough cash for the sell fee")
+        cost, released_fee = _take(lot, qty)
         self.cash = usdc(self.cash + proceeds - fee_usdc)
         self.fees_paid = usdc(self.fees_paid + fee_usdc)
         pnl = usdc(proceeds - cost - released_fee - fee_usdc)
@@ -299,6 +299,32 @@ class Portfolio:
         down.cost = usdc(down.cost + (cost - half))
         return cost
 
+    def redeem_outcome(self, slug: str, outcome: str, shares: Decimal, payout_per_share: Decimal, gas: Decimal = _ZERO) -> Decimal:
+        """Burn only the copied quantity of one outcome, at the reported payout."""
+        book = self.markets.get(slug)
+        lot = book.outcomes.get(outcome) if book else None
+        qty = shares_q(D(shares))
+        rate = D(payout_per_share)
+        gas_usdc = usdc(D(gas))
+        if not lot or qty <= 0 or qty > lot.shares or rate < 0 or rate > 1 or gas_usdc < 0:
+            raise ValueError("invalid redeem quantity or payout")
+        payout = usdc(qty * rate)
+        if gas_usdc > usdc(self.cash + payout):
+            raise ValueError("not enough cash for redeem gas")
+        cost, fee = _take(lot, qty)
+        pnl = usdc(payout - cost - fee - gas_usdc)
+        self.cash = usdc(self.cash + payout - gas_usdc)
+        self.gas_paid = usdc(self.gas_paid + gas_usdc)
+        self.realized = usdc(self.realized + pnl)
+        book.realized = usdc(book.realized + pnl)
+        if book.open_shares() <= 0:
+            book.closed = True
+            book.closed_ts = _time.time()
+            book.resolved = True
+            if rate == 1:
+                book.winner = outcome
+        return pnl
+
     def redeem(self, slug: str, winner: str, gas: Decimal = _ZERO) -> Decimal:
         """Settle every remaining share. Winner pays $1, every other outcome pays $0."""
         book = self.markets.get(slug)
@@ -314,13 +340,14 @@ class Portfolio:
                 payout += lot.shares  # $1 per share
             released_cost += lot.cost
             released_fees += lot.fees
-            lot.shares = _ZERO
-            lot.cost = _ZERO
-            lot.fees = _ZERO
         payout = usdc(payout)
         gas_usdc = usdc(D(gas))
         if gas_usdc > usdc(self.cash + payout):
             raise ValueError("not enough cash for redeem gas")
+        for lot in book.outcomes.values():
+            lot.shares = _ZERO
+            lot.cost = _ZERO
+            lot.fees = _ZERO
         self.cash = usdc(self.cash + payout - gas_usdc)
         self.gas_paid = usdc(self.gas_paid + gas_usdc)
         pnl = usdc(payout - released_cost - released_fees - gas_usdc)

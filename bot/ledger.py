@@ -293,6 +293,17 @@ class Ledger:
             )
             self.conn.commit()
 
+    def save_copy_checkpoint(self, mode: str, portfolio: dict, copy: dict, pending: list[dict]) -> None:
+        """Commit related snapshots together, so a restart cannot mix generations."""
+        values = ((f"portfolio:{mode}", portfolio), (f"copy:{mode}", copy),
+                  (f"copy_pending:{mode}", pending))
+        with self._lock, self.conn:
+            for key, value in values:
+                self.conn.execute(
+                    "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    (key, json.dumps(value, ensure_ascii=False)),
+                )
+
     def load_portfolio(self, mode: str) -> dict | None:
         with self._lock:
             row = self.conn.execute("SELECT v FROM kv WHERE k = ?", (f"portfolio:{mode}",)).fetchone()
@@ -443,7 +454,7 @@ class Ledger:
             self.conn.commit()
 
     def record_copy(self, **row: Any) -> None:
-        with self._lock:
+        with self._lock, self.conn:
             self._insert(
                 "copies",
                 {
@@ -474,14 +485,38 @@ class Ledger:
                     "levels": row.get("levels", ""),
                 },
             )
+            for fill in row.get("detail_fills") or []:
+                self._insert("fills", fill)
+            if row.get("detail_merge"):
+                self._insert("merges", row["detail_merge"])
+            if row.get("detail_resolution"):
+                self._insert("resolutions", row["detail_resolution"], """
+                    ON CONFLICT(mode, slug) DO UPDATE SET ts=excluded.ts,
+                    winner=excluded.winner, pnl=excluded.pnl, payout=excluded.payout,
+                    condition_id=excluded.condition_id
+                """)
+            checkpoint = row.get("checkpoint")
+            if checkpoint is not None:
+                for key, value in checkpoint.items():
+                    self.conn.execute(
+                        "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                        (key, json.dumps(value, ensure_ascii=False)),
+                    )
             self.conn.commit()
+
+    def copied_redemptions(self, mode: str, slug: str) -> list[tuple[str, str]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT our_size, our_price FROM copies WHERE mode=? AND slug=? AND side='REDEEM' AND status IN ('FILLED','PARTIAL')",
+                (mode, slug),
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
 
     def applied_events(self, mode: str, limit: int = 4000) -> list[str]:
         """Wallet events that already produced a copied fill.
 
-        Returning these at startup closes the crash window between applying a
-        fill and the throttled copy-state flush: the ledger row is committed
-        with the fill, so the event can never be applied twice.
+        Used for compatibility with snapshots written by older versions.
+        New copy results commit their portfolio checkpoint with the copy row.
         """
         with self._lock:
             rows = self.conn.execute(

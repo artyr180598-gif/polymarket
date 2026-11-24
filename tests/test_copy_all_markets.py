@@ -221,7 +221,7 @@ class ExactSizingTests(unittest.TestCase):
         self.assertEqual(lot.shares, Decimal("7.5"))
         self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
 
-    def test_a_fill_below_the_market_minimum_is_carried(self) -> None:
+    def test_exact_fill_below_market_minimum_is_not_carried(self) -> None:
         cfg = _cfg(bankroll_usd=1000)
         engine = TradingEngine(cfg)
         window = _window(engine, min_shares=Decimal("5"))
@@ -234,14 +234,14 @@ class ExactSizingTests(unittest.TestCase):
 
         engine._book = book  # type: ignore[method-assign]
         asyncio.run(engine._execute_copy(first, 1_000_051))
-        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("3"))
+        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
         self.assertNotIn(window.slug, engine.portfolio.markets)
 
         second = engine.copy.observe(
             _row("0xsmall-2", size="2.5", ts=1_000_101), now=1_000_052, cfg=cfg,
         )
         asyncio.run(engine._execute_copy(second, 1_000_053))
-        self.assertEqual(engine.portfolio.markets[window.slug].lot("Up").shares, Decimal("5.5"))
+        self.assertNotIn(window.slug, engine.portfolio.markets)
         self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
 
     def test_scale_mode_is_still_available(self) -> None:
@@ -279,7 +279,7 @@ class SeedingAndDedupeTests(unittest.TestCase):
         return engine, calls
 
     def test_first_poll_is_history_and_is_not_copied(self) -> None:
-        rows = [_row("0xold-1"), _row("0xold-2", ts=1_000_099)]
+        rows = [_row("0xold-1", ts=1_000_040), _row("0xold-2", ts=1_000_049)]
         engine, _calls = self._engine_with_feeds(rows)
         asyncio.run(engine._copy_wallet_tick())
         self.assertTrue(engine.copy.seeded)
@@ -519,8 +519,8 @@ class DualFeedTests(unittest.TestCase):
 
             def get(self, url, params=None):
                 params = dict(params or {})
-                self.views.append(params.get("takerOnly"))
-                rows = [maker, taker_only] if params.get("takerOnly") == "false" else [maker]
+                self.views.append(params.get("taker_only"))
+                rows = [maker, taker_only] if params.get("taker_only") == "false" else [maker]
                 return FakeResponse({"data": rows, "pagination": {"has_more": False}})
 
         session = Session()
@@ -580,28 +580,14 @@ class EventKeyTests(unittest.TestCase):
 
 
 class FeedEndpointTests(unittest.TestCase):
-    def test_a_dead_first_endpoint_falls_back_to_the_second(self) -> None:
-        cfg = _cfg()
-        engine = TradingEngine(cfg)
+    def test_feed_error_is_not_treated_as_an_empty_success(self) -> None:
+        engine = TradingEngine(_cfg())
         engine._session = object()
-        row = _row("0xfeed")
-        tried: list[str] = []
-        dead, alive = TRADE_ENDPOINTS[0], TRADE_ENDPOINTS[1]
-
         async def page(url, params, label):
-            tried.append(url)
-            return [row] if url == alive else None
-
-        engine._wallet_api_page = page  # type: ignore[method-assign]
-        rows = asyncio.run(engine._fetch_wallet_trades(False))
-        self.assertEqual([event_key(r) for r in rows or []], [event_key(row)])
-        self.assertEqual(engine._feed_endpoint["trades"], alive)
-        self.assertIn(dead, tried)
-
-        # The working endpoint is remembered and tried first next time.
-        tried.clear()
-        asyncio.run(engine._fetch_wallet_trades(False))
-        self.assertEqual(tried[0], alive)
+            return None
+        engine._wallet_api_page = page
+        self.assertIsNone(asyncio.run(engine._fetch_wallet_trades(False)))
+        self.assertFalse(engine.copy.seeded)
 
     def test_cursor_pagination_is_followed(self) -> None:
         cfg = _cfg()
@@ -624,7 +610,7 @@ class FeedEndpointTests(unittest.TestCase):
         got = asyncio.run(engine._fetch_wallet_trades(True))
         self.assertEqual(len(got or []), 2)
         self.assertEqual(calls[1]["cursor"], "c1")
-        self.assertEqual(calls[0]["takerOnly"], "true")
+        self.assertEqual(calls[0]["taker_only"], "true")
 
 
 class PendingRestoreTests(unittest.TestCase):
