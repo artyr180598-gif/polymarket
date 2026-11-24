@@ -138,9 +138,9 @@ class BotConfig:
     # after the market closed. Allow this much lateness while the book is
     # still answerable, otherwise those trades would always be skipped.
     copy_late_grace_s: float = 5.0
-    enabled_assets: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
+    enabled_assets: list[str] = field(default_factory=lambda: ["BTC"])
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
-    auto_start: bool = True
+    auto_start: bool = False
 
     order_clip_usd: float = 16.0
     # Several windows are open at once (wallet median 4, sometimes 12).
@@ -222,9 +222,9 @@ class BotConfig:
         strategy = os.getenv("STRATEGY", "copy_wallet").strip().lower() or "copy_wallet"
         if strategy not in STRATEGIES:
             strategy = "copy_wallet"
-        assets = [a.upper() for a in _list("ENABLED_ASSETS", "BTC,ETH,SOL,XRP") if a.upper() in ASSETS]
-        if not assets:
-            assets = ["BTC", "ETH", "SOL", "XRP"]
+        # Production copy mode is fail-closed: environment variables cannot expand
+        # the supported asset allowlist. ETH/SOL remain management-only for legacy inventory.
+        assets = ["BTC"]
         frames = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m,15m,1h,4h") if t.lower() in TIMEFRAMES]
         if not frames:
             frames = ["5m", "15m", "1h", "4h"]
@@ -274,7 +274,7 @@ class BotConfig:
             copy_late_grace_s=_float("COPY_LATE_GRACE_S", 5.0, 0.0, 120.0),
             enabled_assets=assets,
             enabled_timeframes=frames,
-            auto_start=_flag("AUTO_START", "true"),
+            auto_start=False,
             order_clip_usd=_float("ORDER_CLIP_USD", 16.0, 1.0),
             max_window_risk_usd=_float("MAX_WINDOW_RISK_USD", 80.0, 5.0),
             max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 640.0, 10.0),
