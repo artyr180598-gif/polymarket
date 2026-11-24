@@ -1,7 +1,7 @@
 """Environment configuration. Existing variable names keep working.
 
-The default strategy copies the target wallet: every public fill, merge and
-split it makes is mirrored in the paper account. ``STRATEGY=maker_ladder``
+The default strategy mirrors BTC trade events in PAPER. MERGE/REDEEM remain
+available for legacy inventory in disabled markets; new non-BTC exposure is blocked. ``STRATEGY=maker_ladder``
 still selects the measured maker ladder described in
 docs/STRATEGY_ANALYSIS.md.
 
