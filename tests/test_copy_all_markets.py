@@ -547,6 +547,20 @@ class FakeResponse:
         return self.payload
 
 
+class PaperResetSafetyTests(unittest.TestCase):
+    def test_reset_aborts_before_backup_when_volume_space_is_insufficient(self) -> None:
+        cfg = _cfg()
+        engine = TradingEngine(cfg)
+        with patch("bot.ledger.shutil.disk_usage") as disk_usage:
+            disk_usage.return_value = type("DiskUsage", (), {"free": 1})()
+            with self.assertRaisesRegex(RuntimeError, "insufficient free space"):
+                engine.ledger.backup_and_reset_paper_history("reset-space-test")
+
+        self.assertEqual(engine.ledger.paper_history_reset_at(), 0.0)
+        parent = os.path.dirname(cfg.db_path)
+        self.assertFalse(any("pre-reset" in name for name in os.listdir(parent)))
+
+
 if __name__ == "__main__":
     unittest.main()
 
