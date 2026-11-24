@@ -618,7 +618,10 @@ class TradingEngine:
             self.cfg.max_window_risk_usd = max(5.0, float(max_window_risk_usd))
         if max_daily_loss_usd is not None:
             self.cfg.max_daily_loss_usd = max(5.0, float(max_daily_loss_usd))
-        if enabled_assets:
+        if self.cfg.strategy == "copy_wallet":
+            # Dashboard settings cannot widen the production copier beyond BTC.
+            self.cfg.enabled_assets = ["BTC"]
+        elif enabled_assets:
             from .config import ASSETS
             self.cfg.enabled_assets = [a.upper() for a in enabled_assets if a.upper() in ASSETS] or self.cfg.enabled_assets
         self._note("INFO", "Лимиты обновлены", notify=False)
@@ -683,10 +686,9 @@ class TradingEngine:
     async def _discover(self) -> None:
         await self._recover_open_books()
         if self.cfg.strategy == "copy_wallet":
-            # The copier does not need a market calendar. Every market is
-            # created on demand from the wallet row (Gamma, then CLOB). This
-            # is what makes ETH/SOL/XRP/DOGE, 15m, 1h and non up/down markets
-            # copyable without touching ENABLED_ASSETS.
+            # Markets are created on demand from wallet rows, but CopyBook.observe
+            # and _execute_copy enforce the BTC allowlist before any new exposure.
+            # Legacy disabled-asset positions remain available for MERGE/REDEEM.
             return
         now = time.time()
         for asset in self.cfg.enabled_assets:
@@ -1299,6 +1301,18 @@ class TradingEngine:
             # The fill landed before a restart but the job row survived. Never
             # apply the same wallet event twice.
             job.done = True
+            return
+        asset, _timeframe = _asset_timeframe(job.slug)
+        allowed_assets = {
+            str(value).strip().upper()
+            for value in (self.cfg.enabled_assets or [])
+            if str(value).strip()
+        }
+        if job.kind in ("TRADE", "SPLIT") and (
+            not allowed_assets or asset not in allowed_assets
+        ):
+            # Also reject legacy pending jobs restored from a pre-allowlist queue.
+            await self._skip_copy(job, "asset disabled", now)
             return
         # Ask the book and the metadata at the same time. Two sequential
         # round trips would put the fill a full RTT behind the wallet for no
