@@ -88,29 +88,29 @@ def _window(engine: TradingEngine, **overrides) -> Window:
 
 
 class MarketCoverageTests(unittest.TestCase):
-    def test_new_trades_are_limited_to_the_configured_asset_allowlist(self) -> None:
+    def test_new_trades_follow_wallet_across_assets_and_market_types(self) -> None:
         book = CopyBook()
+        # Even a stale BTC-only dashboard setting must not filter wallet rows.
         cfg = _cfg(enabled_assets=["BTC"])
-        btc = book.observe(
-            _row("0xbtc", slug="btc-updown-5m-1000000"),
-            now=1_000_050,
-            cfg=cfg,
-        )
-        self.assertIsNotNone(btc)
-        for slug in (
+        slugs = (
+            "btc-updown-5m-1000000",
             "eth-updown-1h-1000000",
             "sol-updown-15m-1000000",
+            "xrp-updown-5m-1000000",
+            "doge-updown-4h-1000000",
+            "bnb-updown-1h-1000000",
             "will-the-fed-cut-rates-in-december",
-        ):
+        )
+        for index, slug in enumerate(slugs):
             job = book.observe(
-                _row(f"0x{slug}", slug=slug, outcome="Up" if "updown" in slug else "Yes"),
+                _row(f"0xwallet-{index}", slug=slug, outcome="Up" if "updown" in slug else "Yes"),
                 now=1_000_050,
                 cfg=cfg,
             )
-            self.assertIsNone(job, slug)
-        self.assertEqual(len(book.jobs), 1)
+            self.assertIsNotNone(job, slug)
+        self.assertEqual(len(book.jobs), len(slugs))
 
-    def test_disabled_asset_sell_is_allowed_to_reduce_legacy_inventory(self) -> None:
+    def test_sell_and_wallet_management_events_are_not_asset_filtered(self) -> None:
         cfg = _cfg(enabled_assets=["BTC"])
         book = CopyBook()
         sell = book.observe(
@@ -118,63 +118,68 @@ class MarketCoverageTests(unittest.TestCase):
             now=1_000_050,
             cfg=cfg,
         )
-        self.assertIsNotNone(sell)
-        self.assertEqual(sell.side, "SELL")
-
-    def test_disabled_asset_management_events_can_close_legacy_inventory(self) -> None:
-        cfg = _cfg(enabled_assets=["BTC"])
-        book = CopyBook()
         merge = book.observe(
-            _row("0xeth-merge", slug="eth-updown-5m-1000000", kind="MERGE"),
+            _row("0xsol-merge", slug="sol-updown-5m-1000000", kind="MERGE"),
             now=1_000_050,
             cfg=cfg,
         )
         redeem = book.observe(
-            _row("0xeth-redeem", slug="eth-updown-5m-1000000", kind="REDEEM", outcome="Up", size="0"),
+            _row("0xxrp-redeem", slug="xrp-updown-5m-1000000", kind="REDEEM", outcome="Up", size="0"),
             now=1_000_050,
             cfg=cfg,
         )
         split = book.observe(
-            _row("0xeth-split", slug="eth-updown-5m-1000000", kind="SPLIT"),
+            _row("0xdoge-split", slug="doge-updown-5m-1000000", kind="SPLIT"),
             now=1_000_050,
             cfg=cfg,
         )
+        self.assertIsNotNone(sell)
         self.assertIsNotNone(merge)
         self.assertIsNotNone(redeem)
-        self.assertIsNone(split)
+        self.assertIsNotNone(split)
 
-    def test_restored_non_btc_trade_is_skipped_before_market_lookup(self) -> None:
-        legacy_cfg = _cfg(enabled_assets=["BTC", "ETH"])
-        legacy_book = CopyBook()
-        job = legacy_book.observe(
+    def test_restored_non_btc_pending_trade_can_execute(self) -> None:
+        cfg = _cfg(enabled_assets=["BTC"])
+        book = CopyBook()
+        job = book.observe(
             _row("0xlegacy-eth", slug="eth-updown-5m-1000000"),
             now=1_000_050,
-            cfg=legacy_cfg,
+            cfg=cfg,
         )
-        engine = TradingEngine(_cfg(enabled_assets=["BTC"]))
-        engine.copy = legacy_book
+        self.assertIsNotNone(job)
+        engine = TradingEngine(cfg)
+        engine.copy = book
+        window = _window(
+            engine,
+            slug="eth-updown-5m-1000000",
+            asset="ETH",
+            tokens={"Up": "tok-Up", "Down": "tok-Down"},
+        )
 
-        async def forbidden_market_lookup(*_args, **_kwargs):
-            raise AssertionError("disabled-asset job must not reach market lookup")
+        async def ensure_window(*_args, **_kwargs):
+            return window
 
-        engine._ensure_window = forbidden_market_lookup  # type: ignore[method-assign]
+        async def market_book(_token: str):
+            return [], [{"price": "0.70", "size": "100"}]
+
+        engine._ensure_window = ensure_window  # type: ignore[method-assign]
+        engine._book = market_book  # type: ignore[method-assign]
         asyncio.run(engine._execute_copy(job, 1_000_051))
         rows = engine.ledger.copies("paper")
         self.assertTrue(job.done)
-        self.assertEqual(rows[0]["status"], "SKIPPED")
-        self.assertEqual(rows[0]["reason"], "asset disabled")
+        self.assertEqual(rows[0]["status"], "FILLED")
 
-    def test_environment_cannot_enable_live_or_non_btc_assets(self) -> None:
+    def test_environment_cannot_enable_live_but_copy_includes_all_assets(self) -> None:
         with patch.dict(os.environ, {
             "TRADING_MODE": "live",
             "STRATEGY": "maker_ladder",
-            "ENABLED_ASSETS": "ETH,SOL",
+            "ENABLED_ASSETS": "BTC",
             "AUTO_START": "true",
         }):
             config = BotConfig.from_env()
         self.assertEqual(config.trading_mode, "paper")
         self.assertEqual(config.strategy, "copy_wallet")
-        self.assertEqual(config.enabled_assets, ["BTC"])
+        self.assertEqual(config.enabled_assets, ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"])
         self.assertFalse(config.auto_start)
 
     def test_scope_filter_is_optional(self) -> None:
