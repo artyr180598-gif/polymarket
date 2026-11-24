@@ -86,7 +86,7 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
 
 def _strategy_title(strategy: str) -> str:
     if strategy == "copy_wallet":
-        return "copy-wallet: все сделки кошелька, бумага"
+        return "copy-wallet: all target-wallet markets · PAPER"
     return "mo-money: лестница мейкер-бидов"
 
 
@@ -104,8 +104,8 @@ def _size_mode_text(cfg) -> str:
 def _scope_text(cfg) -> str:
     prefixes = list(getattr(cfg, "copy_slug_prefixes", []) or [])
     if not prefixes:
-        return "все рынки кошелька, включая BTC/ETH/SOL/XRP и любые окна"
-    return "рынки: " + ", ".join(prefixes)
+        return "все рынки и активы целевого кошелька"
+    return "все активы; дополнительные фильтры рынков: " + ", ".join(prefixes)
 
 
 def _strategy_lines(cfg) -> list[str]:
@@ -116,7 +116,7 @@ def _strategy_lines(cfg) -> list[str]:
             f"{_size_mode_text(cfg)}. {_scope_text(cfg)}.",
             f"Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск; тейкерская комиссия списывается.",
             "Это PAPER-копия после публичного исполнения: наши сделки проходят как TAKER. Maker-очередь кошелька из публичной ленты не видна.",
-            "MERGE, SPLIT и REDEEM кошелька повторяются отдельно; остаток гасится только по официальному итогу рынка.",
+            "Копируются все наблюдаемые TRADE, SPLIT, MERGE и REDEEM целевого кошелька во всех активах и рынках.",
             "Недобранный остаток пишется как PARTIAL или SKIPPED. Теневой PnL считается с начала наблюдения и не включает позиции, открытые до старта бота.",
         ]
     return [
@@ -618,7 +618,12 @@ class TradingEngine:
             self.cfg.max_window_risk_usd = max(5.0, float(max_window_risk_usd))
         if max_daily_loss_usd is not None:
             self.cfg.max_daily_loss_usd = max(5.0, float(max_daily_loss_usd))
-        if enabled_assets:
+        if self.cfg.strategy == "copy_wallet":
+            # Copy markets are discovered from the wallet feed; keep all known
+            # assets visible and do not use dashboard selection as a copy filter.
+            from .config import ASSETS
+            self.cfg.enabled_assets = list(ASSETS)
+        elif enabled_assets:
             from .config import ASSETS
             self.cfg.enabled_assets = [a.upper() for a in enabled_assets if a.upper() in ASSETS] or self.cfg.enabled_assets
         self._note("INFO", "Лимиты обновлены", notify=False)
@@ -683,10 +688,8 @@ class TradingEngine:
     async def _discover(self) -> None:
         await self._recover_open_books()
         if self.cfg.strategy == "copy_wallet":
-            # The copier does not need a market calendar. Every market is
-            # created on demand from the wallet row (Gamma, then CLOB). This
-            # is what makes ETH/SOL/XRP/DOGE, 15m, 1h and non up/down markets
-            # copyable without touching ENABLED_ASSETS.
+            # Every market is created on demand from the target wallet feed.
+            # No asset or timeframe allowlist is applied in copy mode.
             return
         now = time.time()
         for asset in self.cfg.enabled_assets:

@@ -422,6 +422,9 @@ class CopyBook:
         if not slug or not slug_allowed(slug, getattr(cfg, "copy_slug_prefixes", None)):
             self.bump("filtered")
             return None
+        # Copy mode follows the target wallet's actual feed, not a static
+        # asset allowlist: newly listed currencies and non-crypto markets are
+        # eligible too, subject to market metadata, sizing and execution checks.
         side = str(row.get("side") or "").upper()
         outcome = str(row.get("outcome") or "")
         if kind == "TRADE":

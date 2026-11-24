@@ -26,6 +26,7 @@ def _cfg(**overrides) -> BotConfig:
         auto_start=True,
         bankroll_usd=1000,
         strategy="copy_wallet",
+        enabled_assets=["BTC", "ETH", "SOL", "WILL"],
         copy_size_mode="exact",
     )
     raw.update(overrides)
@@ -87,25 +88,102 @@ def _window(engine: TradingEngine, **overrides) -> Window:
 
 
 class MarketCoverageTests(unittest.TestCase):
-    def test_every_market_is_accepted_not_only_btc_five_minutes(self) -> None:
+    def test_new_trades_follow_wallet_across_assets_and_market_types(self) -> None:
         book = CopyBook()
-        cfg = _cfg()
-        for slug in (
+        # Even a stale BTC-only dashboard setting must not filter wallet rows.
+        cfg = _cfg(enabled_assets=["BTC"])
+        slugs = (
             "btc-updown-5m-1000000",
             "eth-updown-1h-1000000",
             "sol-updown-15m-1000000",
+            "xrp-updown-5m-1000000",
+            "doge-updown-4h-1000000",
+            "bnb-updown-1h-1000000",
             "will-the-fed-cut-rates-in-december",
-        ):
+        )
+        for index, slug in enumerate(slugs):
             job = book.observe(
-                _row(f"0x{slug}", slug=slug, outcome="Up" if "updown" in slug else "Yes"),
+                _row(f"0xwallet-{index}", slug=slug, outcome="Up" if "updown" in slug else "Yes"),
                 now=1_000_050,
                 cfg=cfg,
             )
             self.assertIsNotNone(job, slug)
-        self.assertEqual(len(book.jobs), 4)
+        self.assertEqual(len(book.jobs), len(slugs))
+
+    def test_sell_and_wallet_management_events_are_not_asset_filtered(self) -> None:
+        cfg = _cfg(enabled_assets=["BTC"])
+        book = CopyBook()
+        sell = book.observe(
+            _row("0xeth-sell", slug="eth-updown-5m-1000000", side="SELL"),
+            now=1_000_050,
+            cfg=cfg,
+        )
+        merge = book.observe(
+            _row("0xsol-merge", slug="sol-updown-5m-1000000", kind="MERGE"),
+            now=1_000_050,
+            cfg=cfg,
+        )
+        redeem = book.observe(
+            _row("0xxrp-redeem", slug="xrp-updown-5m-1000000", kind="REDEEM", outcome="Up", size="0"),
+            now=1_000_050,
+            cfg=cfg,
+        )
+        split = book.observe(
+            _row("0xdoge-split", slug="doge-updown-5m-1000000", kind="SPLIT"),
+            now=1_000_050,
+            cfg=cfg,
+        )
+        self.assertIsNotNone(sell)
+        self.assertIsNotNone(merge)
+        self.assertIsNotNone(redeem)
+        self.assertIsNotNone(split)
+
+    def test_restored_non_btc_pending_trade_can_execute(self) -> None:
+        cfg = _cfg(enabled_assets=["BTC"])
+        book = CopyBook()
+        job = book.observe(
+            _row("0xlegacy-eth", slug="eth-updown-5m-1000000"),
+            now=1_000_050,
+            cfg=cfg,
+        )
+        self.assertIsNotNone(job)
+        engine = TradingEngine(cfg)
+        engine.copy = book
+        window = _window(
+            engine,
+            slug="eth-updown-5m-1000000",
+            asset="ETH",
+            tokens={"Up": "tok-Up", "Down": "tok-Down"},
+        )
+
+        async def ensure_window(*_args, **_kwargs):
+            return window
+
+        async def market_book(_token: str):
+            return [], [{"price": "0.70", "size": "100"}]
+
+        engine._ensure_window = ensure_window  # type: ignore[method-assign]
+        engine._book = market_book  # type: ignore[method-assign]
+        asyncio.run(engine._execute_copy(job, 1_000_051))
+        rows = engine.ledger.copies("paper")
+        self.assertTrue(job.done)
+        self.assertEqual(rows[0]["status"], "FILLED")
+
+    def test_environment_cannot_enable_live_but_copy_includes_all_assets(self) -> None:
+        with patch.dict(os.environ, {
+            "TRADING_MODE": "live",
+            "STRATEGY": "maker_ladder",
+            "ENABLED_ASSETS": "BTC",
+            "AUTO_START": "true",
+        }):
+            config = BotConfig.from_env()
+        self.assertEqual(config.trading_mode, "paper")
+        self.assertEqual(config.strategy, "copy_wallet")
+        self.assertEqual(config.enabled_assets, ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"])
+        self.assertFalse(config.auto_start)
 
     def test_scope_filter_is_optional(self) -> None:
-        cfg = _cfg(copy_slug_prefixes=["eth-updown"])
+        cfg = _cfg(copy_slug_prefixes=["eth-updown"], enabled_assets=["ETH"])
         book = CopyBook()
         self.assertIsNone(book.observe(_row("0x1"), now=1_000_050, cfg=cfg))
         self.assertIsNotNone(
@@ -428,7 +506,7 @@ def _return_async(value):
 
 
 class DualFeedTests(unittest.TestCase):
-    def test_both_taker_views_are_requested_and_deduplicated(self) -> None:
+    def test_complete_wallet_feed_is_requested_once_without_duplicate_views(self) -> None:
         engine = TradingEngine(_cfg())
         engine.copy.seeded = True
         engine.copy.seeded_activity = True
@@ -448,7 +526,7 @@ class DualFeedTests(unittest.TestCase):
         session = Session()
         engine._session = session
         rows = asyncio.run(engine._fetch_wallet_trades())
-        self.assertEqual(sorted(session.views), ["false", "true"])
+        self.assertEqual(session.views, ["false"])
         self.assertEqual(sorted(row["transaction_hash"] for row in rows), ["0xsame", "0xtaker"])
 
 
