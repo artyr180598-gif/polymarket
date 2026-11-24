@@ -121,10 +121,12 @@ def event_key(row: dict) -> str:
         "size": _num_key(row.get("size")),
         "timestamp": _ts_key(row.get("timestamp")),
         "usdc_size": _num_key(row.get("usdc_size") or row.get("usdcSize")),
-        # Internal ordinal for repeated identical fills; absent on first fill
-        # to keep durable event IDs from earlier versions compatible.
-        "copy_occurrence": str(row.get("_copy_occurrence") or ""),
     }
+    # Add an ordinal only to the second and later identical rows. Omitting
+    # the field on the first occurrence preserves legacy event-key hashes.
+    occurrence = str(row.get("_copy_occurrence") or "")
+    if occurrence:
+        fields["copy_occurrence"] = occurrence
     if not tx and not fields["id"] and not fields["timestamp"]:
         return ""
     encoded = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
