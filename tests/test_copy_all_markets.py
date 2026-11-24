@@ -221,28 +221,30 @@ class ExactSizingTests(unittest.TestCase):
         self.assertEqual(lot.shares, Decimal("7.5"))
         self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
 
-    def test_a_fill_below_the_market_minimum_is_carried(self) -> None:
+    def test_exact_mode_skips_each_below_minimum_event_without_cross_event_carry(self) -> None:
         cfg = _cfg(bankroll_usd=1000)
         engine = TradingEngine(cfg)
         window = _window(engine, min_shares=Decimal("5"))
-        first = engine.copy.observe(
-            _row("0xsmall-1", size="3"), now=1_000_050, cfg=cfg,
-        )
 
         async def book(_token: str):
             return [], [{"price": "0.70", "size": "100"}]
 
         engine._book = book  # type: ignore[method-assign]
-        asyncio.run(engine._execute_copy(first, 1_000_051))
-        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("3"))
-        self.assertNotIn(window.slug, engine.portfolio.markets)
+        for tx, size, ts in (
+            ("0xsmall-1", "3", 1_000_050),
+            ("0xsmall-2", "2.5", 1_000_101),
+        ):
+            job = engine.copy.observe(
+                _row(tx, size=size, ts=ts), now=ts + 1, cfg=cfg,
+            )
+            asyncio.run(engine._execute_copy(job, ts + 1))
+            self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+            self.assertNotIn(window.slug, engine.portfolio.markets)
 
-        second = engine.copy.observe(
-            _row("0xsmall-2", size="2.5", ts=1_000_101), now=1_000_052, cfg=cfg,
-        )
-        asyncio.run(engine._execute_copy(second, 1_000_053))
-        self.assertEqual(engine.portfolio.markets[window.slug].lot("Up").shares, Decimal("5.5"))
-        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+        rows = engine.ledger.copies("paper")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["status"] for row in rows], ["SKIPPED", "SKIPPED"])
+        self.assertTrue(all("below minimum" in row["reason"] for row in rows))
 
     def test_scale_mode_is_still_available(self) -> None:
         cfg = _cfg(copy_size_mode="scale", copy_scale=0.5, bankroll_usd=1000)
