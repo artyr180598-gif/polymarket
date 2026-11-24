@@ -506,7 +506,7 @@ def _return_async(value):
 
 
 class DualFeedTests(unittest.TestCase):
-    def test_both_taker_views_are_requested_and_deduplicated(self) -> None:
+    def test_complete_wallet_feed_is_requested_once_without_duplicate_views(self) -> None:
         engine = TradingEngine(_cfg())
         engine.copy.seeded = True
         engine.copy.seeded_activity = True
@@ -526,7 +526,7 @@ class DualFeedTests(unittest.TestCase):
         session = Session()
         engine._session = session
         rows = asyncio.run(engine._fetch_wallet_trades())
-        self.assertEqual(sorted(session.views), ["false", "true"])
+        self.assertEqual(session.views, ["false"])
         self.assertEqual(sorted(row["transaction_hash"] for row in rows), ["0xsame", "0xtaker"])
 
 
