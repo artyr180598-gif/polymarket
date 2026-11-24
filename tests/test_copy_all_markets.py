@@ -153,9 +153,16 @@ class MarketCoverageTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "SKIPPED")
         self.assertEqual(rows[0]["reason"], "asset disabled")
 
-    def test_environment_cannot_enable_assets_or_auto_start(self) -> None:
-        with patch.dict(os.environ, {"ENABLED_ASSETS": "ETH,SOL", "AUTO_START": "true"}):
+    def test_environment_cannot_enable_live_or_non_btc_assets(self) -> None:
+        with patch.dict(os.environ, {
+            "TRADING_MODE": "live",
+            "STRATEGY": "maker_ladder",
+            "ENABLED_ASSETS": "ETH,SOL",
+            "AUTO_START": "true",
+        }):
             config = BotConfig.from_env()
+        self.assertEqual(config.trading_mode, "paper")
+        self.assertEqual(config.strategy, "copy_wallet")
         self.assertEqual(config.enabled_assets, ["BTC"])
         self.assertFalse(config.auto_start)
 
