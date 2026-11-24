@@ -339,6 +339,9 @@ class CopyBook:
     seeded_activity: bool = False
     per_window: dict[str, int] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
+    # A page cap or transient deep-page failure can leave unseen older rows.
+    # Persist this flag so a restart continues draining beyond known page 1.
+    feed_catchup: dict[str, bool] = field(default_factory=dict)
     _seen: set[str] = field(default_factory=set)
     _applied: set[str] = field(default_factory=set)
     _shadowed: set[str] = field(default_factory=set)
@@ -563,6 +566,7 @@ class CopyBook:
             "seeded_activity": self.seeded_activity,
             "per_window": dict(self.per_window),
             "counters": dict(self.counters),
+            "feed_catchup": {str(k): bool(v) for k, v in self.feed_catchup.items()},
         }
 
     @classmethod
@@ -582,6 +586,7 @@ class CopyBook:
             seeded_activity=bool(raw.get("seeded_activity", bool(raw.get("seen_tx")))),
             per_window={str(k): int(v) for k, v in (raw.get("per_window") or {}).items()},
             counters={str(k): int(v) for k, v in (raw.get("counters") or {}).items()},
+            feed_catchup={str(k): bool(v) for k, v in (raw.get("feed_catchup") or {}).items()},
         )
 
 
