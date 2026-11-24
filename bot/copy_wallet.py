@@ -431,7 +431,11 @@ class CopyBook:
             if str(asset).strip()
         }
         slug_asset = slug.split("-", 1)[0].strip().upper()
-        if kind in ("TRADE", "SPLIT") and (
+        adds_exposure = (
+            kind == "SPLIT"
+            or (kind == "TRADE" and str(row.get("side") or "").upper() == "BUY")
+        )
+        if adds_exposure and (
             not allowed_assets or slug_asset not in allowed_assets
         ):
             self.bump("filtered")
