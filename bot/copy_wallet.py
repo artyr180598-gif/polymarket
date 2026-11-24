@@ -344,6 +344,7 @@ class CopyBook:
     # A page cap or transient deep-page failure can leave unseen older rows.
     # Persist this flag so a restart continues draining beyond known page 1.
     feed_catchup: dict[str, bool] = field(default_factory=dict)
+    feed_cursor: dict[str, str] = field(default_factory=dict)
     _seen: set[str] = field(default_factory=set)
     _applied: set[str] = field(default_factory=set)
     _shadowed: set[str] = field(default_factory=set)
@@ -569,6 +570,7 @@ class CopyBook:
             "per_window": dict(self.per_window),
             "counters": dict(self.counters),
             "feed_catchup": {str(k): bool(v) for k, v in self.feed_catchup.items()},
+            "feed_cursor": {str(k): str(v) for k, v in self.feed_cursor.items()},
         }
 
     @classmethod
@@ -589,6 +591,7 @@ class CopyBook:
             per_window={str(k): int(v) for k, v in (raw.get("per_window") or {}).items()},
             counters={str(k): int(v) for k, v in (raw.get("counters") or {}).items()},
             feed_catchup={str(k): bool(v) for k, v in (raw.get("feed_catchup") or {}).items()},
+            feed_cursor={str(k): str(v) for k, v in (raw.get("feed_cursor") or {}).items()},
         )
 
 
