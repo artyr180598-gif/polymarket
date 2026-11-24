@@ -422,24 +422,9 @@ class CopyBook:
         if not slug or not slug_allowed(slug, getattr(cfg, "copy_slug_prefixes", None)):
             self.bump("filtered")
             return None
-        # New exposure is restricted by the configured asset allowlist. Empty or
-        # unrecognised allowlists fail closed. MERGE/REDEEM remain available to
-        # reduce or settle legacy inventory in disabled markets; SPLIT adds risk.
-        allowed_assets = {
-            str(asset).strip().upper()
-            for asset in (getattr(cfg, "enabled_assets", None) or [])
-            if str(asset).strip()
-        }
-        slug_asset = slug.split("-", 1)[0].strip().upper()
-        adds_exposure = (
-            kind == "SPLIT"
-            or (kind == "TRADE" and str(row.get("side") or "").upper() == "BUY")
-        )
-        if adds_exposure and (
-            not allowed_assets or slug_asset not in allowed_assets
-        ):
-            self.bump("filtered")
-            return None
+        # Copy mode follows the target wallet's actual feed, not a static
+        # asset allowlist: newly listed currencies and non-crypto markets are
+        # eligible too, subject to market metadata, sizing and execution checks.
         side = str(row.get("side") or "").upper()
         outcome = str(row.get("outcome") or "")
         if kind == "TRADE":
