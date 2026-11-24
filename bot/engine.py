@@ -235,8 +235,12 @@ def _enumerate_prints(rows: list[dict]) -> list[tuple[str, dict]]:
 
 
 def _wallet_page_limit(*, seeded: bool, seed_on_start: bool) -> int:
-    """Use deep pagination only for the one-time history/baseline seed."""
-    return COPY_API_MAX_PAGES if (not seeded and seed_on_start) else 1
+    """Drain unseen pages until a fully-known page or the hard safety cap.
+
+    Limiting deep pagination to bootstrap could strand older unseen fills
+    behind a known first page after a burst larger than 200 records.
+    """
+    return COPY_API_MAX_PAGES
 
 
 def _trade_query(
@@ -2061,6 +2065,7 @@ class TradingEngine:
         page_rows: list[dict] = []
         cursor = ""
         first_ok = False
+        occurrence_counts: dict[str, int] = {}
         for page_number in range(pages):
             # Data API /v2/trades can be served from a 300s CloudFront cache.
             # A unique query key is essential: polling every 500ms without it
@@ -2089,6 +2094,14 @@ class TradingEngine:
             page = self._page_rows(payload)
             if not page:
                 break
+            # Preserve multiplicity when a tx contains byte-for-byte identical
+            # fills. The first occurrence retains its legacy event identity.
+            for row in page:
+                base_event_id = event_key(row)
+                occurrence = occurrence_counts.get(base_event_id, 0)
+                occurrence_counts[base_event_id] = occurrence + 1
+                if occurrence:
+                    row["_copy_occurrence"] = occurrence
             known = all(
                 (event_key(row) in seen)
                 or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
