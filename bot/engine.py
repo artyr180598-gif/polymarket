@@ -1308,7 +1308,11 @@ class TradingEngine:
             for value in (self.cfg.enabled_assets or [])
             if str(value).strip()
         }
-        if job.kind in ("TRADE", "SPLIT") and (
+        adds_exposure = (
+            job.kind == "SPLIT"
+            or (job.kind == "TRADE" and str(job.side).upper() == "BUY")
+        )
+        if adds_exposure and (
             not allowed_assets or asset not in allowed_assets
         ):
             # Also reject legacy pending jobs restored from a pre-allowlist queue.
