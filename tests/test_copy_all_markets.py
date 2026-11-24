@@ -556,8 +556,13 @@ class WalletApiBackoffTests(unittest.TestCase):
             status = 503
 
             def get(self, _url, params=None):
-                response = FakeResponse({"data": []})
+                payload = (
+                    {"error": "request timed out", "code": "request_timeout", "trace_id": "trace-test"}
+                    if self.status == 503 else {"data": []}
+                )
+                response = FakeResponse(payload)
                 response.status = self.status
+                response.headers = {"Retry-After": "3", "x-trace-id": "trace-test"} if self.status == 503 else {}
                 return response
 
         session = Session()
@@ -571,6 +576,7 @@ class WalletApiBackoffTests(unittest.TestCase):
                 "https://data-api.polymarket.com/v2/trades", {}, "Лента кошелька",
             )))
             first_deadline = engine._copy_backoff_until
+            self.assertTrue(any("trace-test" in event for event in engine.events))
             self.assertEqual(engine._copy_api_failures[
                 "https://data-api.polymarket.com/v2/trades"
             ], 1)
