@@ -86,7 +86,7 @@ def _window_bases(timeframe: str, sec: int, now: float) -> list[int]:
 
 def _strategy_title(strategy: str) -> str:
     if strategy == "copy_wallet":
-        return "copy-wallet: BTC-only PAPER"
+        return "copy-wallet: all target-wallet markets · PAPER"
     return "mo-money: лестница мейкер-бидов"
 
 
@@ -104,8 +104,8 @@ def _size_mode_text(cfg) -> str:
 def _scope_text(cfg) -> str:
     prefixes = list(getattr(cfg, "copy_slug_prefixes", []) or [])
     if not prefixes:
-        return "новые TRADE/SPLIT только BTC; MERGE/REDEEM — для закрытия старых позиций"
-    return "только BTC; дополнительные фильтры рынков: " + ", ".join(prefixes)
+        return "все рынки и активы целевого кошелька"
+    return "все активы; дополнительные фильтры рынков: " + ", ".join(prefixes)
 
 
 def _strategy_lines(cfg) -> list[str]:
@@ -116,7 +116,7 @@ def _strategy_lines(cfg) -> list[str]:
             f"{_size_mode_text(cfg)}. {_scope_text(cfg)}.",
             f"Допуск цены {cfg.copy_max_slip:g}: покупка до цены кошелька плюс допуск, продажа до цены минус допуск; тейкерская комиссия списывается.",
             "Это PAPER-копия после публичного исполнения: наши сделки проходят как TAKER. Maker-очередь кошелька из публичной ленты не видна.",
-            "Новые TRADE/SPLIT разрешены только для BTC. MERGE/REDEEM других активов допускаются лишь для закрытия уже существующего инвентаря.",
+            "Копируются все наблюдаемые TRADE, SPLIT, MERGE и REDEEM целевого кошелька во всех активах и рынках.",
             "Недобранный остаток пишется как PARTIAL или SKIPPED. Теневой PnL считается с начала наблюдения и не включает позиции, открытые до старта бота.",
         ]
     return [
@@ -619,8 +619,10 @@ class TradingEngine:
         if max_daily_loss_usd is not None:
             self.cfg.max_daily_loss_usd = max(5.0, float(max_daily_loss_usd))
         if self.cfg.strategy == "copy_wallet":
-            # Dashboard settings cannot widen the production copier beyond BTC.
-            self.cfg.enabled_assets = ["BTC"]
+            # Copy markets are discovered from the wallet feed; keep all known
+            # assets visible and do not use dashboard selection as a copy filter.
+            from .config import ASSETS
+            self.cfg.enabled_assets = list(ASSETS)
         elif enabled_assets:
             from .config import ASSETS
             self.cfg.enabled_assets = [a.upper() for a in enabled_assets if a.upper() in ASSETS] or self.cfg.enabled_assets
@@ -686,9 +688,8 @@ class TradingEngine:
     async def _discover(self) -> None:
         await self._recover_open_books()
         if self.cfg.strategy == "copy_wallet":
-            # Markets are created on demand from wallet rows, but CopyBook.observe
-            # and _execute_copy enforce the BTC allowlist before any new exposure.
-            # Legacy disabled-asset positions remain available for MERGE/REDEEM.
+            # Every market is created on demand from the target wallet feed.
+            # No asset or timeframe allowlist is applied in copy mode.
             return
         now = time.time()
         for asset in self.cfg.enabled_assets:
@@ -1301,22 +1302,6 @@ class TradingEngine:
             # The fill landed before a restart but the job row survived. Never
             # apply the same wallet event twice.
             job.done = True
-            return
-        asset, _timeframe = _asset_timeframe(job.slug)
-        allowed_assets = {
-            str(value).strip().upper()
-            for value in (self.cfg.enabled_assets or [])
-            if str(value).strip()
-        }
-        adds_exposure = (
-            job.kind == "SPLIT"
-            or (job.kind == "TRADE" and str(job.side).upper() == "BUY")
-        )
-        if adds_exposure and (
-            not allowed_assets or asset not in allowed_assets
-        ):
-            # Also reject legacy pending jobs restored from a pre-allowlist queue.
-            await self._skip_copy(job, "asset disabled", now)
             return
         # Ask the book and the metadata at the same time. Two sequential
         # round trips would put the fill a full RTT behind the wallet for no
