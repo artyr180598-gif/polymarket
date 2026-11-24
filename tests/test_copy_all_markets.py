@@ -221,28 +221,30 @@ class ExactSizingTests(unittest.TestCase):
         self.assertEqual(lot.shares, Decimal("7.5"))
         self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
 
-    def test_a_fill_below_the_market_minimum_is_carried(self) -> None:
+    def test_exact_mode_skips_each_below_minimum_event_without_cross_event_carry(self) -> None:
         cfg = _cfg(bankroll_usd=1000)
         engine = TradingEngine(cfg)
         window = _window(engine, min_shares=Decimal("5"))
-        first = engine.copy.observe(
-            _row("0xsmall-1", size="3"), now=1_000_050, cfg=cfg,
-        )
 
         async def book(_token: str):
             return [], [{"price": "0.70", "size": "100"}]
 
         engine._book = book  # type: ignore[method-assign]
-        asyncio.run(engine._execute_copy(first, 1_000_051))
-        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("3"))
-        self.assertNotIn(window.slug, engine.portfolio.markets)
+        for tx, size, ts in (
+            ("0xsmall-1", "3", 1_000_050),
+            ("0xsmall-2", "2.5", 1_000_101),
+        ):
+            job = engine.copy.observe(
+                _row(tx, size=size, ts=ts), now=ts + 1, cfg=cfg,
+            )
+            asyncio.run(engine._execute_copy(job, ts + 1))
+            self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+            self.assertNotIn(window.slug, engine.portfolio.markets)
 
-        second = engine.copy.observe(
-            _row("0xsmall-2", size="2.5", ts=1_000_101), now=1_000_052, cfg=cfg,
-        )
-        asyncio.run(engine._execute_copy(second, 1_000_053))
-        self.assertEqual(engine.portfolio.markets[window.slug].lot("Up").shares, Decimal("5.5"))
-        self.assertEqual(engine.copy.carry_of("tok-Up|BUY"), Decimal("0"))
+        rows = engine.ledger.copies("paper")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["status"] for row in rows], ["SKIPPED", "SKIPPED"])
+        self.assertTrue(all("below minimum" in row["reason"] for row in rows))
 
     def test_scale_mode_is_still_available(self) -> None:
         cfg = _cfg(copy_size_mode="scale", copy_scale=0.5, bankroll_usd=1000)
@@ -580,28 +582,22 @@ class EventKeyTests(unittest.TestCase):
 
 
 class FeedEndpointTests(unittest.TestCase):
-    def test_a_dead_first_endpoint_falls_back_to_the_second(self) -> None:
+    def test_uses_only_the_current_v2_feed_endpoint(self) -> None:
         cfg = _cfg()
         engine = TradingEngine(cfg)
         engine._session = object()
         row = _row("0xfeed")
         tried: list[str] = []
-        dead, alive = TRADE_ENDPOINTS[0], TRADE_ENDPOINTS[1]
 
         async def page(url, params, label):
             tried.append(url)
-            return [row] if url == alive else None
+            return {"data": [row], "pagination": {"has_more": False}}
 
         engine._wallet_api_page = page  # type: ignore[method-assign]
         rows = asyncio.run(engine._fetch_wallet_trades(False))
         self.assertEqual([event_key(r) for r in rows or []], [event_key(row)])
-        self.assertEqual(engine._feed_endpoint["trades"], alive)
-        self.assertIn(dead, tried)
-
-        # The working endpoint is remembered and tried first next time.
-        tried.clear()
-        asyncio.run(engine._fetch_wallet_trades(False))
-        self.assertEqual(tried[0], alive)
+        self.assertEqual(tried, [TRADE_ENDPOINTS[0]])
+        self.assertEqual(engine._feed_endpoint["trades"], TRADE_ENDPOINTS[0])
 
     def test_cursor_pagination_is_followed(self) -> None:
         cfg = _cfg()
@@ -841,3 +837,44 @@ class FeedCatchupPersistenceTests(unittest.TestCase):
         self.assertEqual([row["transaction_hash"] for row in rows], ["0xolder-unseen"])
         self.assertEqual(len(calls), 2)
         self.assertFalse(engine.copy.feed_catchup["trades"])
+
+    def test_catchup_without_saved_cursor_continues_after_known_page(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        engine.copy.feed_catchup["trades"] = True
+        known = _row("0xknown-no-cursor", ts=1_000_103)
+        older = _row("0xolder-after-known", ts=1_000_101)
+        engine.copy.remember(event_key(known))
+        calls = []
+
+        async def page(_url, params, _label):
+            calls.append(dict(params))
+            if not params.get("cursor"):
+                return {"data": [known], "pagination": {"has_more": True, "next_cursor": "page-two"}}
+            return {"data": [older], "pagination": {"has_more": False}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(engine.copy._seen), taker_only=False,
+        ))
+        self.assertEqual([row["transaction_hash"] for row in rows], ["0xolder-after-known"])
+        self.assertEqual(calls[1].get("cursor"), "page-two")
+        self.assertFalse(engine.copy.feed_catchup["trades"])
+
+    def test_catchup_flag_is_not_cleared_when_api_omits_required_cursor(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        engine.copy.feed_catchup["trades"] = True
+        known = _row("0xknown-no-next-cursor", ts=1_000_103)
+        engine.copy.remember(event_key(known))
+
+        async def page(_url, _params, _label):
+            return {"data": [known], "pagination": {"has_more": True}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(engine.copy._seen), taker_only=False,
+        ))
+        self.assertEqual(rows, [])
+        self.assertTrue(engine.copy.feed_catchup["trades"])
+        self.assertNotIn("trades", engine.copy.feed_cursor)
