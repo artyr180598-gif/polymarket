@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -165,6 +166,20 @@ class Ledger:
             if marker and str(marker["v"]) == reset_id:
                 return {"reset": False, "already_applied": True, "backup_path": None, "counts": {}}
 
+            # The backup is stored beside the live database on the same
+            # persistent volume. Refuse the reset before creating a partial
+            # backup if the volume cannot hold a full SQLite snapshot.
+            page_count = int(self.conn.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(self.conn.execute("PRAGMA page_size").fetchone()[0])
+            backup_bytes = page_count * page_size
+            free_bytes = shutil.disk_usage(os.path.dirname(os.path.abspath(self.db_path))).free
+            reserve_bytes = 16 * 1024 * 1024
+            if free_bytes < backup_bytes + reserve_bytes:
+                raise RuntimeError(
+                    "insufficient free space for safe PAPER backup: "
+                    f"need at least {backup_bytes + reserve_bytes} bytes, have {free_bytes}"
+                )
+
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             backup_path = f"{self.db_path}.pre-reset-{stamp}.sqlite3"
             suffix = 1
@@ -180,7 +195,16 @@ class Ledger:
                 integrity = backup_conn.execute("PRAGMA integrity_check").fetchone()
                 if not integrity or integrity[0] != "ok":
                     raise RuntimeError(f"backup integrity check failed: {integrity[0] if integrity else 'no result'}")
-            finally:
+            except Exception:
+                backup_conn.close()
+                # A failed/incomplete backup is not a valid recovery point and
+                # must not consume the remaining volume space on the next boot.
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+                raise
+            else:
                 backup_conn.close()
 
             tables = ("fills", "merges", "resolutions", "copies", "equity_points")
