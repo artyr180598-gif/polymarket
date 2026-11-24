@@ -547,6 +547,53 @@ class FakeResponse:
         return self.payload
 
 
+class WalletApiBackoffTests(unittest.TestCase):
+    def test_repeated_503_increases_backoff_and_success_resets_failure_streak(self) -> None:
+        cfg = _cfg()
+        engine = TradingEngine(cfg)
+
+        class Session:
+            status = 503
+
+            def get(self, _url, params=None):
+                response = FakeResponse({"data": []})
+                response.status = self.status
+                return response
+
+        session = Session()
+        engine._session = session
+
+        async def no_sleep(_delay):
+            return None
+
+        with patch("bot.engine.asyncio.sleep", new=no_sleep):
+            self.assertIsNone(asyncio.run(engine._wallet_api_page(
+                "https://data-api.polymarket.com/v2/trades", {}, "Лента кошелька",
+            )))
+            first_deadline = engine._copy_backoff_until
+            self.assertEqual(engine._copy_api_failures[
+                "https://data-api.polymarket.com/v2/trades"
+            ], 1)
+
+            self.assertIsNone(asyncio.run(engine._wallet_api_page(
+                "https://data-api.polymarket.com/v2/trades", {}, "Лента кошелька",
+            )))
+            second_deadline = engine._copy_backoff_until
+            self.assertGreater(second_deadline, first_deadline)
+            self.assertEqual(engine._copy_api_failures[
+                "https://data-api.polymarket.com/v2/trades"
+            ], 2)
+
+            session.status = 200
+            self.assertEqual(asyncio.run(engine._wallet_api_page(
+                "https://data-api.polymarket.com/v2/trades", {}, "Лента кошелька",
+            )), {"data": []})
+            self.assertNotIn(
+                "https://data-api.polymarket.com/v2/trades",
+                engine._copy_api_failures,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
 
