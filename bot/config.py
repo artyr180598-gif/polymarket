@@ -271,7 +271,7 @@ class BotConfig:
             copy_late_grace_s=_float("COPY_LATE_GRACE_S", 5.0, 0.0, 120.0),
             enabled_assets=assets,
             enabled_timeframes=frames,
-            auto_start=False,
+            auto_start=_flag("AUTO_START", "false"),
             order_clip_usd=_float("ORDER_CLIP_USD", 16.0, 1.0),
             max_window_risk_usd=_float("MAX_WINDOW_RISK_USD", 80.0, 5.0),
             max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 640.0, 10.0),
