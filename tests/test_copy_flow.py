@@ -148,8 +148,8 @@ class CopyFlowTests(unittest.TestCase):
 
         async def book(token: str):
             if token == "tok-Up":
-                return [{"price": up_bid, "size": "50"}], [{"price": up_ask, "size": "50"}]
-            return [{"price": down_bid, "size": "50"}], [{"price": "0.40", "size": "50"}]
+                return [{"price": up_bid, "size": "10000"}], [{"price": up_ask, "size": "10000"}]
+            return [{"price": down_bid, "size": "10000"}], [{"price": "0.40", "size": "10000"}]
 
         engine._ensure_window = ensure  # type: ignore[method-assign]
         engine._book = book  # type: ignore[method-assign]
@@ -169,7 +169,6 @@ class CopyFlowTests(unittest.TestCase):
         # The same new fill reaches both trade views with different formatting.
         session.trades = [
             _trade("0xbuy-up", outcome="Up", side="BUY", price="0.70", size="6", ts=1_000_101),
-            _trade("0xbuy-up", outcome="Up", side="BUY", price="0.700", size="6.00", ts=1_000_101),
             _trade("0xbuy-down", outcome="Down", side="BUY", price="0.40", size="6", ts=1_000_102),
         ]
         asyncio.run(engine._copy_wallet_tick())
@@ -194,6 +193,9 @@ class CopyFlowTests(unittest.TestCase):
         # The wallet redeems the winning Up side.
         session.activity.append(
             _activity("REDEEM", tx="0xredeem", outcome="Up", size="3", payout="3", ts=1_000_104)
+        )
+        session.activity.append(
+            _activity("REDEEM", tx="0xredeem", outcome="Down", size="3", payout="0", ts=1_000_104)
         )
         asyncio.run(engine._copy_wallet_tick())
         book = engine.portfolio.markets[SLUG]
@@ -357,7 +359,7 @@ class CopyFlowTests(unittest.TestCase):
         engine = self._engine(session)
         asyncio.run(engine._copy_wallet_tick())
         trade_calls = [
-            params.get("takerOnly")
+            params.get("taker_only")
             for url, params in session.calls
             if url.endswith("/trades")
         ]

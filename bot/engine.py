@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import math
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -250,7 +251,7 @@ def _trade_query(
     params = {
         "condition": condition_id,
         "limit": "200",
-        "takerOnly": "true" if taker_only else "false",
+        "taker_only": "true" if taker_only else "false",
         "_": str(now_ms),
     }
     if cursor:
@@ -336,6 +337,7 @@ class TradingEngine:
         stored_copy = self.ledger.load_copy(self.mode)
         if stored_copy is not None:
             self.copy = CopyBook.from_dict(stored_copy)
+        self._copy_seed_after_ts = max(self._copy_seed_after_ts, self.copy.seed_cutoff)
         for event_id in self.ledger.applied_events(self.mode):
             self.copy.mark_applied(event_id)
         self._restored_pending = self.copy.restore_pending(
@@ -1033,6 +1035,24 @@ class TradingEngine:
             return None
         return bids, asks
 
+    def _consume_cached_book(self, token_id: str, side: str, taken: list[tuple[Decimal, Decimal]]) -> None:
+        """Don't simulate using the same snapshot liquidity twice within its TTL."""
+        cached = self._book_cache.get(token_id)
+        if cached is None:
+            return
+        bids, asks, stored = cached
+        remaining: dict[Decimal, Decimal] = {}
+        for price, size in taken:
+            remaining[price] = remaining.get(price, _ZERO) + size
+        source = asks if side == "BUY" else bids
+        updated = []
+        for price, size in parse_levels(source):
+            used = min(size, remaining.get(price, _ZERO))
+            remaining[price] = remaining.get(price, _ZERO) - used
+            if size > used:
+                updated.append({"price": str(price), "size": str(size - used)})
+        self._book_cache[token_id] = (bids, updated, stored) if side == "BUY" else (updated, asks, stored)
+
     async def _prefetch_books(self, token_ids: set[str]) -> None:
         """One book request per token for a burst of wallet fills.
 
@@ -1116,6 +1136,8 @@ class TradingEngine:
             stamp = float(row.get("timestamp") or 0)
         except (TypeError, ValueError):
             return 0.0
+        if not math.isfinite(stamp):
+            return 0.0
         if stamp > 1e11:
             stamp /= 1000.0
         return stamp
@@ -1153,6 +1175,17 @@ class TradingEngine:
         if not is_valid_wallet_address(self.cfg.copy_wallet) or self._session is None:
             return
         now = self._clock()
+        if self.cfg.copy_seed_on_start and not self.copy.seeded and not self._copy_seed_after_ts:
+            # Establish a durable baseline even when bootstrap spans many pages
+            # or the first request fails. Late pages cannot replay old history.
+            self._copy_seed_after_ts = float(int(now))
+            self.copy.seed_cutoff = self._copy_seed_after_ts
+            self.ledger.save_copy_checkpoint(
+                self.mode,
+                {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
+                 "manual_pause": self.manual_pause},
+                self.copy.to_dict(), self.copy.pending_rows(),
+            )
         monotonic_now = time.monotonic()
         # One complete trade feed is enough: takerOnly=false includes
         # maker and taker fills. Polling both views duplicates requests and
@@ -1176,7 +1209,7 @@ class TradingEngine:
         if trades is None and activity is None:
             self.copy.bump("feed_errors")
             self._copy_backoff_until = time.monotonic() + 2.0
-            return
+            # Continue with the durable queue even when both feeds fail.
 
         incoming: list[dict] = []
         if trades is not None:
@@ -1227,7 +1260,7 @@ class TradingEngine:
         # Chronological order matters: the wallet's later fill may sell what
         # its earlier fill bought, and the carry must follow the same order.
         incoming.sort(key=lambda row: (
-            float(row.get("timestamp") or 0),
+            self._copy_row_timestamp(row),
             str(row.get("transaction_hash") or row.get("transactionHash") or ""),
         ))
         queued = 0
@@ -1237,10 +1270,15 @@ class TradingEngine:
                 self._copy_last_seen_at = now
                 self.copy.bump("observed")
                 queued += 1
-        if queued:
-            # The queue survives a crash; a wallet fill must never be lost
-            # because the process died between seeing and executing it.
-            self._persist_copy()
+        # Persist the seed, cursors, seen IDs and queue together before execution.
+        # Do not execute if SQLite cannot durably save the observed events.
+        self.ledger.save_copy_checkpoint(
+            self.mode,
+            {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
+             "manual_pause": self.manual_pause},
+            self.copy.to_dict(), self.copy.pending_rows(),
+        )
+        self._last_copy_persist = time.monotonic()
 
         # A market that never publishes metadata must not sit in the queue forever.
         for job in list(self.copy.jobs):
@@ -1268,6 +1306,21 @@ class TradingEngine:
             try:
                 await self._execute_copy(job, self._clock())
             except asyncio.CancelledError:
+                raise
+            except sqlite3.Error:
+                saved = self.ledger.load_portfolio(self.mode)
+                copy_saved = self.ledger.load_copy(self.mode)
+                if saved and copy_saved is not None:
+                    self.portfolio = Portfolio.from_dict(saved["portfolio"])
+                    self.paper.portfolio = self.portfolio
+                    self.copy = CopyBook.from_dict(copy_saved)
+                    self.copy.restore_pending(self.ledger.load_copy_pending(self.mode))
+                    # Resolution flags may have been changed before the failed commit.
+                    for slug, win in self.windows.items():
+                        restored_book = self.portfolio.markets.get(slug)
+                        win.resolved = bool(restored_book and restored_book.resolved)
+                        if not win.resolved:
+                            win.reported = False
                 raise
             except Exception as exc:  # noqa: BLE001
                 job.attempts += 1
@@ -1488,7 +1541,7 @@ class TradingEngine:
             return
         fee = fee_for_lifts(taken, fee_rate, fee_exp)
         cost = sum((usdc(px * sz) for px, sz in taken), _ZERO)
-        spend = fee if job.side == "SELL" else usdc(cost + fee)
+        spend = max(_ZERO, fee - cost) if job.side == "SELL" else usdc(cost + fee)
         blocked = self._copy_block_reason(job.slug, spend, cost if job.side == "BUY" else _ZERO)
         if blocked:
             await self._record_copy(
@@ -1517,48 +1570,31 @@ class TradingEngine:
             ensure_ascii=False,
         )
         applied: list[tuple[Decimal, Decimal]] = []
+        detail_fills: list[dict] = []
         applied_fee = _ZERO
         fill_error = ""
         for index, (px, sz) in enumerate(taken):
             level_fee = fee_for_lifts([(px, sz)], fee_rate, fee_exp)
             order_id = f"copy-{(job.event_id or job.tx)[:16]}-{index}"
             try:
+                kwargs = dict(slug=window.slug, condition_id=window.condition_id,
+                              asset=window.asset, timeframe=window.timeframe, outcome=job.outcome,
+                              shares=sz, price=px, fee=level_fee)
                 if job.side == "SELL":
-                    self.portfolio.sell_fill(
-                        slug=window.slug, condition_id=window.condition_id,
-                        asset=window.asset, timeframe=window.timeframe,
-                        outcome=job.outcome, shares=sz, price=px, fee=level_fee,
-                    )
-                    self.ledger.record_fill(
-                        mode=self.mode, slug=window.slug, condition_id=window.condition_id,
-                        asset=window.asset, timeframe=window.timeframe, outcome=job.outcome,
-                        role="TAKER", shares=sz, price=px, notional=usdc(sz * px),
-                        fee=level_fee, order_id=order_id,
-                        placed_at=job.detected_at, book=snapshot,
-                    )
+                    self.portfolio.sell_fill(**kwargs)
                 else:
-                    self._apply_fill(
-                        window,
-                        Fill(
-                            order_id=order_id,
-                            outcome=job.outcome,
-                            shares=sz,
-                            price=px,
-                            fee=level_fee,
-                            role="TAKER",
-                            placed_at=job.detected_at,
-                            book=snapshot,
-                        ),
-                        persist=False,
-                        raise_on_error=True,
-                    )
+                    self.portfolio.buy_fill(**kwargs, order_id=order_id)
             except ValueError as exc:
                 fill_error = str(exc)
-                self._note_once(
-                    f"copy-fill:{job.event_id[:12]}", "ERROR",
-                    f"Филл не записан ({job.slug} {job.side}): {exc}", 30,
-                )
                 break
+            detail_fills.append({
+                "ts": time.time(), "mode": self.mode, "slug": window.slug,
+                "condition_id": window.condition_id, "asset": window.asset,
+                "timeframe": window.timeframe, "outcome": job.outcome, "role": "TAKER",
+                "shares": str(sz), "price": str(px), "notional": str(usdc(sz * px)),
+                "fee": str(level_fee), "order_id": order_id, "placed_at": str(job.detected_at),
+                "queue_ahead": "", "book": snapshot,
+            })
             applied.append((px, sz))
             applied_fee += level_fee
         if not applied:
@@ -1569,6 +1605,7 @@ class TradingEngine:
             )
             job.done = True
             return
+        self._consume_cached_book(job.token_id, job.side, applied)
         got = sum((sz for _px, sz in applied), _ZERO)
         cost = sum((usdc(px * sz) for px, sz in applied), _ZERO)
         avg = (cost / got) if got else _ZERO
@@ -1596,6 +1633,7 @@ class TradingEngine:
             job, now, scale, status=status, reason="; ".join(notes),
             scaled=desired, carry=carry, our_size=got, our_price=avg, fee=applied_fee,
             slip=slippage(job.side, avg, job.wallet_price), levels=applied,
+            detail_fills=detail_fills,
         )
         job.done = True
 
@@ -1641,14 +1679,15 @@ class TradingEngine:
                 )
                 job.done = True
                 return
-            self.ledger.record_merge(mode=self.mode, slug=job.slug, pairs=pairs, pnl=pnl, tx=job.tx)
+            detail_merge = {"ts": time.time(), "mode": self.mode, "slug": job.slug,
+                            "pairs": str(pairs), "pnl": str(pnl), "tx": job.tx}
             partial = pairs + Decimal("0.000001") < desired
             self.copy.bump("merged")
             self.copy.mark_applied(job.event_id)
             await self._record_copy(
                 job, now, scale, status="PARTIAL" if partial else "FILLED",
                 reason="inventory shorter than wallet merge" if partial else "",
-                scaled=desired, carry=carry, our_size=pairs, our_price=D("1"),
+                scaled=desired, carry=carry, our_size=pairs, our_price=D("1"), detail_merge=detail_merge,
             )
             job.done = True
             return
@@ -1687,72 +1726,52 @@ class TradingEngine:
         job.done = True
 
     async def _mirror_redeem(self, job, now: float, scale: Decimal, window: Window | None) -> None:
-        """Settle our paper position when the wallet redeems an outcome."""
-        tokens = dict(window.tokens) if window else {}
-        winner = job.outcome
-        if job.payout <= 0:
-            if len(tokens) == 2 and job.outcome in tokens:
-                winner = next(name for name in tokens if name != job.outcome)
-            else:
-                winner = ""
+        """Data API v2 reports each redeemed outcome and burned size separately."""
+        if not job.payout_known or job.wallet_size <= 0:
+            await self._skip_copy(job, "redeem payout or size unknown", now, scale=scale)
+            return
+        rate = job.payout / job.wallet_size
+        if rate < 0 or rate > 1:
+            await self._skip_copy(job, "invalid redeem payout", now, scale=scale)
+            return
+        desired = job.wallet_size * scale
+        if self.cfg.copy_size_mode == "fixed":
+            desired = D(str(self.cfg.copy_shares))
         book = self.portfolio.markets.get(job.slug)
-        if not winner or book is None or book.resolved:
-            self.copy.bump("redeem_ignored")
-            self.copy.mark_applied(job.event_id)
-            await self._record_copy(
-                job, now, scale, status="SKIPPED",
-                reason="nothing to settle" if book is None or book.resolved else "winner unknown",
-                scaled=job.wallet_size * scale, carry=_ZERO,
-            )
-            job.done = True
+        held = self._held_shares(job.slug, job.outcome)
+        qty = min(desired, held)
+        if book is None or qty <= 0:
+            await self._skip_copy(job, "no inventory to redeem", now, scale=scale)
             return
-        shares = book.open_shares()
-        winning_lot = book.outcomes.get(winner)
-        payout_shares = winning_lot.shares if winning_lot is not None else _ZERO
         try:
-            self.portfolio.redeem(job.slug, winner, gas=self._gas())
+            self.portfolio.redeem_outcome(job.slug, job.outcome, qty, rate, gas=self._gas())
         except ValueError as exc:
-            await self._record_copy(
-                job, now, scale, status="SKIPPED", reason=str(exc),
-                scaled=job.wallet_size * scale, carry=_ZERO,
-            )
-            job.done = True
+            await self._skip_copy(job, str(exc), now, scale=scale)
             return
-        book.closed = True
-        book.closed_ts = time.time()
-        if window is not None:
-            window.resolved = True
-            window.reported = True
-        # ``resolutions.pnl`` is the window's whole realized result (merges,
-        # sells and the redeem itself), exactly like the official resolution
-        # path writes it. Storing only the redeem leg would double count the
-        # merge leg once the window also has a merge row.
-        total = book.realized
-        if total < 0:
-            self.consecutive_losses += 1
+        if rate == 1:
+            book.winner = job.outcome
+        if book.closed:
+            if window is not None:
+                window.resolved = True
+                window.reported = True
+            previous_payout = sum((D(size) * D(price) for size, price in
+                                   self.ledger.copied_redemptions(self.mode, job.slug)), _ZERO)
+            detail_resolution = {
+                "ts": time.time(), "mode": self.mode, "slug": job.slug,
+                "condition_id": window.condition_id if window else job.condition_id,
+                "asset": window.asset if window else _asset_timeframe(job.slug)[0],
+                "timeframe": window.timeframe if window else _asset_timeframe(job.slug)[1],
+                "winner": book.winner, "pnl": str(book.realized), "payout": str(usdc(previous_payout + qty * rate)),
+            }
         else:
-            self.consecutive_losses = 0
-        self.ledger.record_resolution(
-            mode=self.mode, slug=job.slug, condition_id=window.condition_id if window else job.condition_id,
-            asset=window.asset if window else _asset_timeframe(job.slug)[0],
-            timeframe=window.timeframe if window else _asset_timeframe(job.slug)[1],
-            winner=winner, pnl=total, payout=str(usdc(payout_shares)),
-            overwrite=True,
-        )
+            detail_resolution = None
+        partial = qty + Decimal("0.000001") < desired
         self.copy.bump("redeemed")
         self.copy.mark_applied(job.event_id)
         await self._record_copy(
-            job, now, scale, status="FILLED", reason="wallet redeem",
-            scaled=job.wallet_size * scale, carry=_ZERO,
-            our_size=shares, our_price=D("1"),
-        )
-        word = "Вверх" if winner == "Up" else ("Вниз" if winner == "Down" else winner)
-        wallet_shadow_pnl = self.copy.shadow.window_pnl(job.slug, self.marks)
-        self._note(
-            "INFO",
-            f"REDEEM кошелька · {job.slug} · победил {word} · "
-            f"PAPER PnL ${total} · shadow кошелька ${wallet_shadow_pnl}",
-            notify=True,
+            job, now, scale, status="PARTIAL" if partial else "FILLED",
+            reason="inventory shorter than wallet redeem" if partial else "wallet redeem",
+            scaled=desired, carry=_ZERO, our_size=qty, our_price=rate, detail_resolution=detail_resolution,
         )
         job.done = True
 
@@ -1840,11 +1859,9 @@ class TradingEngine:
         if job.kind not in ("TRADE", "MERGE", "SPLIT", "REDEEM") or self.copy.was_shadowed(job.event_id):
             return
         if job.kind == "REDEEM":
-            if job.payout > 0:
-                self.copy.shadow.redeem(job.slug, job.outcome)
-            else:
-                # A zero-payout redeem is the losing outcome's burn.
-                self.copy.shadow.drop(job.slug, job.outcome)
+            if job.payout_known and job.wallet_size > 0 and 0 <= job.payout <= job.wallet_size:
+                shadow_scale = scale if self.cfg.copy_size_mode == "scale" and scale is not None else D("1")
+                self.copy.shadow.sell(job.slug, job.outcome, job.wallet_size * shadow_scale, job.payout / job.wallet_size)
         else:
             if self.cfg.copy_size_mode != "scale":
                 shadow_scale = D("1")
@@ -1881,12 +1898,26 @@ class TradingEngine:
         status: str, reason: str, scaled: Decimal, carry: Decimal,
         our_size: Decimal = _ZERO, our_price: Decimal = _ZERO,
         fee: Decimal = _ZERO, slip: Decimal = _ZERO,
-        levels: list | None = None,
+        levels: list | None = None, detail_fills: list | None = None,
+        detail_merge: dict | None = None, detail_resolution: dict | None = None,
     ) -> None:
         detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
         execution_lag = max(0.0, float(now) - job.detected_at)
         total_lag = max(0.0, float(now) - job.trade_ts) if job.trade_ts else 0.0
+        # Commit the result and corresponding portfolio/copy snapshots in the
+        # same transaction. The completed job must not reappear after restart.
+        copy_snapshot = self.copy.to_dict()
+        pending = [item for item in self.copy.pending_rows() if item.get("event_id") != job.event_id]
+        copy_snapshot["jobs"] = pending
+        checkpoint = {
+            f"portfolio:{self.mode}": {"portfolio": self.portfolio.to_dict(),
+                "consecutive_losses": self.consecutive_losses, "manual_pause": self.manual_pause},
+            f"copy:{self.mode}": copy_snapshot,
+            f"copy_pending:{self.mode}": pending,
+        }
         self.ledger.record_copy(
+            checkpoint=checkpoint, detail_fills=detail_fills or [], detail_merge=detail_merge,
+            detail_resolution=detail_resolution,
             mode=self.mode, slug=job.slug, tx=job.tx, event_id=job.event_id,
             wallet_ts=job.trade_ts, detected_at=job.detected_at,
             lag_s=detection_lag, execution_at=float(now),
@@ -2080,7 +2111,7 @@ class TradingEngine:
                 "_": str(time.time_ns() // 1_000_000),
             }
             if kind == "trades":
-                params["takerOnly"] = "true" if taker_only else "false"
+                params["taker_only"] = "true" if taker_only else "false"
             if cursor:
                 params["cursor"] = cursor
             payload = await self._wallet_api_page(base, params, label)
@@ -2098,11 +2129,32 @@ class TradingEngine:
                     60,
                 )
                 return page_rows
+            # A 200 error envelope or changed schema is not an empty feed.
+            # In particular, never establish a seed from an invalid response.
+            raw_rows = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(raw_rows, list) or any(not isinstance(item, dict) for item in raw_rows):
+                self._note_once(f"{kind}-schema", "ERROR", f"{label}: неверный формат ответа", 30)
+                if not first_ok:
+                    return None
+                self.copy.feed_catchup[kind] = True
+                if cursor:
+                    self.copy.feed_cursor[kind] = cursor
+                return page_rows
             first_ok = True
-            page = self._page_rows(payload)
+            page = raw_rows
+            next_cursor, has_more = self._page_cursor(payload)
             if not page:
-                self.copy.feed_catchup[kind] = False
-                self.copy.feed_cursor.pop(kind, None)
+                if has_more and next_cursor and next_cursor != cursor:
+                    cursor = next_cursor
+                    continue
+                if has_more:
+                    self.copy.feed_catchup[kind] = True
+                    if cursor:
+                        self.copy.feed_cursor[kind] = cursor
+                    self._note_once(f"{kind}-cursor-missing", "ERROR", f"{label}: пустая страница без следующего курсора", 60)
+                else:
+                    self.copy.feed_catchup[kind] = False
+                    self.copy.feed_cursor.pop(kind, None)
                 break
             # Preserve multiplicity when a tx contains byte-for-byte identical
             # fills. The first occurrence retains its legacy event identity.
@@ -2112,7 +2164,6 @@ class TradingEngine:
                 occurrence_counts[base_event_id] = occurrence + 1
                 if occurrence:
                     row["_copy_occurrence"] = occurrence
-            next_cursor, has_more = self._page_cursor(payload)
             known = all(
                 (event_key(row) in seen)
                 or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
@@ -2146,6 +2197,11 @@ class TradingEngine:
                     f"{label}: API сообщил has_more без next_cursor; хвост отложен",
                     60,
                 )
+                break
+            if next_cursor == cursor:
+                self.copy.feed_catchup[kind] = True
+                self.copy.feed_cursor[kind] = cursor
+                self._note_once(f"{kind}-cursor-loop", "ERROR", f"{label}: повторяющийся курсор", 60)
                 break
             cursor = next_cursor
         else:
@@ -2271,23 +2327,10 @@ class TradingEngine:
                 best_bid, _, _ = touch(bids, asks)
                 if best_bid is not None:
                     self.marks[(window.slug, outcome)] = best_bid
-        if window.end_ts <= 0:
-            # A market without a published close: only settle when something
-            # is actually held, and do not hammer the resolution endpoints.
-            if book is not None and book.open_shares() > 0 and now - window.resolve_at >= 60.0:
-                window.resolve_at = now
-                await self._resolve(window)
-            return
-        if now < window.end_ts:
-            return
-        if book is not None and book.open_shares() <= 0 and book.cost_basis() <= _ZERO:
-            window.resolved = True
-            self.portfolio.close_if_finished(window.slug, ended=True)
-            self._report_if_closed(window)
-            return
-        if now - window.resolve_at >= 15.0:
-            window.resolve_at = now
-            await self._resolve(window)
+        # In copy mode settlement is driven by the wallet's REDEEM events.
+        # Automatic settlement on oracle resolution would release cash and
+        # burn positions before the target wallet actually redeems them.
+        return
 
     async def _on_window(self, window: Window) -> None:
         if self.cfg.strategy == "copy_wallet":

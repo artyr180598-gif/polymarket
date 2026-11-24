@@ -138,6 +138,9 @@ class OldLedgerMigrationTests(unittest.TestCase):
                 "resolutions.pnl",
                 "resolutions.payout",
                 "equity_points.realized",
+                "copies.execution_at",
+                "copies.execution_lag_s",
+                "copies.total_lag_s",
             ],
         )
         for table, column in (

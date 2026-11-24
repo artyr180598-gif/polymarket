@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import hashlib
 import json
+import math
 
 from .accounting import D, floor_to_step, usdc
 from .books import parse_levels
@@ -164,6 +165,7 @@ class CopyJob:
     execute_at: float
     done: bool = False
     payout: Decimal = _ZERO
+    payout_known: bool = False
     event_id: str = ""
     attempts: int = 0
 
@@ -180,6 +182,7 @@ class CopyJob:
             "wallet_price": str(self.wallet_price),
             "wallet_size": str(self.wallet_size),
             "payout": str(self.payout),
+            "payout_known": self.payout_known,
             "trade_ts": self.trade_ts,
             "detected_at": self.detected_at,
             "execute_at": self.execute_at,
@@ -201,6 +204,7 @@ class CopyJob:
             wallet_price=D(raw.get("wallet_price") or 0),
             wallet_size=D(raw.get("wallet_size") or 0),
             payout=D(raw.get("payout") or 0),
+            payout_known=bool(raw.get("payout_known", "payout" in raw)),
             trade_ts=float(raw.get("trade_ts") or 0),
             detected_at=float(raw.get("detected_at") or 0),
             execute_at=float(raw.get("execute_at") or 0),
@@ -339,6 +343,7 @@ class CopyBook:
     # history, not a signal.
     seeded: bool = False
     seeded_activity: bool = False
+    seed_cutoff: float = 0.0
     per_window: dict[str, int] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
     # A page cap or transient deep-page failure can leave unseen older rows.
@@ -459,6 +464,9 @@ class CopyBook:
             trade_ts = float(row.get("timestamp") or 0)
         except (TypeError, ValueError, ArithmeticError):
             return None
+        if not price.is_finite() or not size.is_finite() or not math.isfinite(trade_ts):
+            self.bump("invalid")
+            return None
         if trade_ts > 1e11:
             # Milliseconds. The lag shown in the panel is in seconds.
             trade_ts /= 1000.0
@@ -485,6 +493,7 @@ class CopyBook:
             wallet_price=price,
             wallet_size=size,
             payout=D(row.get("usdc_size") or row.get("usdcSize") or 0) if kind == "REDEEM" else _ZERO,
+            payout_known=kind == "REDEEM" and (row.get("usdc_size") is not None or row.get("usdcSize") is not None),
             trade_ts=trade_ts,
             detected_at=float(now),
             execute_at=float(now),
@@ -567,6 +576,7 @@ class CopyBook:
             "jobs": [job.to_dict() for job in self.jobs if not job.done],
             "seeded": self.seeded,
             "seeded_activity": self.seeded_activity,
+            "seed_cutoff": self.seed_cutoff,
             "per_window": dict(self.per_window),
             "counters": dict(self.counters),
             "feed_catchup": {str(k): bool(v) for k, v in self.feed_catchup.items()},
@@ -588,6 +598,7 @@ class CopyBook:
             # must not replay that history as new trades.
             seeded=bool(raw.get("seeded", bool(raw.get("seen_tx")))),
             seeded_activity=bool(raw.get("seeded_activity", bool(raw.get("seen_tx")))),
+            seed_cutoff=float(raw.get("seed_cutoff") or 0),
             per_window={str(k): int(v) for k, v in (raw.get("per_window") or {}).items()},
             counters={str(k): int(v) for k, v in (raw.get("counters") or {}).items()},
             feed_catchup={str(k): bool(v) for k, v in (raw.get("feed_catchup") or {}).items()},

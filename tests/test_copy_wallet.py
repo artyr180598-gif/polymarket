@@ -35,6 +35,7 @@ def _cfg(**overrides) -> BotConfig:
         bankroll_usd=1000,
         strategy="copy_wallet",
         copy_scale=0.1,
+        copy_size_mode="scale",
         copy_delay_s=1,
     )
     raw.update(overrides)
@@ -378,13 +379,13 @@ class ExecuteTests(unittest.TestCase):
         engine = TradingEngine(cfg)
         window = self._window(engine)
         engine.copy.shadow.buy(window.slug, "Down", Decimal("12"), Decimal("0.70"))
-        row = _buy("0xpaused-redeem", outcome="Down", size="0")
+        row = _buy("0xpaused-redeem", outcome="Down", size="12")
         row["type"] = "REDEEM"
         row["usdc_size"] = "0"
         job = engine.copy.observe(row, now=1_000_050, cfg=cfg)
         asyncio.run(engine._skip_copy(job, "paused", 1_000_051))
-        self.assertEqual(engine.copy.shadow.lots[window.slug]["Down"], ["0", "0"])
-        self.assertEqual(engine.copy.shadow.realized[window.slug], "-8.40")
+        self.assertEqual([Decimal(v) for v in engine.copy.shadow.lots[window.slug]["Down"]], [Decimal("0"), Decimal("0")])
+        self.assertEqual(Decimal(engine.copy.shadow.realized[window.slug]), Decimal("-8.40"))
         self.assertTrue(engine.copy.was_shadowed(job.event_id))
 
     def test_copy_fee_uses_the_market_fee_schedule(self) -> None:

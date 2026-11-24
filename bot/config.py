@@ -121,7 +121,7 @@ class BotConfig:
     copy_slug_prefixes: list[str] = field(default_factory=list)
     # Seconds between wallet-feed polls. 0.5 keeps our lag near the data API.
     copy_poll_s: float = 0.5
-    copy_activity_poll_s: float = 5.0
+    copy_activity_poll_s: float = 0.5
     # A job whose market metadata never arrives is dropped after this long.
     copy_pending_timeout_s: float = 120.0
     # Bootstrap: the first successful poll is history, never a trade signal.
@@ -260,7 +260,7 @@ class BotConfig:
             copy_max_slip=_float("COPY_MAX_SLIP", 0.03, 0.0, 0.50),
             copy_slug_prefixes=prefixes,
             copy_poll_s=_float("COPY_POLL_S", 0.5, 0.2, 10.0),
-            copy_activity_poll_s=_float("COPY_ACTIVITY_POLL_S", 5.0, 1.0, 120.0),
+            copy_activity_poll_s=_float("COPY_ACTIVITY_POLL_S", 0.5, 0.2, 120.0),
             copy_pending_timeout_s=_float("COPY_PENDING_TIMEOUT_S", 120.0, 10.0, 3600.0),
             copy_seed_on_start=_flag("COPY_SEED_ON_START", "true"),
             copy_use_risk_limits=_flag("COPY_USE_RISK_LIMITS", "false"),

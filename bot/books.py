@@ -27,7 +27,7 @@ def parse_levels(levels: list) -> list[tuple[Decimal, Decimal]]:
                 sz = D(level[1])
         except (TypeError, ValueError, ArithmeticError):
             continue
-        if px > 0 and sz > 0:
+        if px.is_finite() and sz.is_finite() and 0 < px < 1 and sz > 0:
             out.append((px, sz))
     return out
 

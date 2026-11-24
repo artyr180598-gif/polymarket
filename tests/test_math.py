@@ -340,8 +340,8 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(second["_"], "222")
         self.assertEqual(second["cursor"], "cursor-1")
         self.assertNotIn("cursor", first)
-        self.assertEqual(first["takerOnly"], "false")
-        self.assertEqual(second["takerOnly"], "true")
+        self.assertEqual(first["taker_only"], "false")
+        self.assertEqual(second["taker_only"], "true")
 
     def test_print_keys_keep_twins_and_repeat_fetches(self) -> None:
         from bot.engine import _enumerate_prints
@@ -876,7 +876,7 @@ class BookTests(unittest.TestCase):
         ))
         self.assertEqual(len(session.calls), 2)
         self.assertEqual([row["transaction_hash"] for row in rows], ["a", "b", "c", "d"])
-        self.assertTrue(all(call["takerOnly"] == "true" and "_" in call for call in session.calls))
+        self.assertTrue(all(call["taker_only"] == "true" and "_" in call for call in session.calls))
 
 
 class ResolutionTests(unittest.TestCase):
@@ -1041,7 +1041,7 @@ class PersistenceAndTelegramTests(unittest.TestCase):
             engine._persist()
             again = TradingEngine(cfg)
             self.assertEqual(again.portfolio.markets["m"].lot("Up").shares, Decimal("5"))
-            self.assertTrue(any("не стирается" in line for line in again.events))
+            self.assertEqual(again.ledger.paper_history_reset_at(), engine.ledger.paper_history_reset_at())
         finally:
             os.environ.pop("PAPER_RESET_ONCE", None)
             os.environ.pop("PAPER_RESET_ID", None)
