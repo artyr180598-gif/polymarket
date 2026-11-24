@@ -808,15 +808,20 @@ class WalletIdentityAndPaginationTests(unittest.TestCase):
 
 class FeedCatchupPersistenceTests(unittest.TestCase):
     def test_catchup_flag_survives_copybook_restart(self) -> None:
-        book = CopyBook(feed_catchup={"trades": True, "activity": False})
+        book = CopyBook(
+            feed_catchup={"trades": True, "activity": False},
+            feed_cursor={"trades": "resume-token"},
+        )
         restored = CopyBook.from_dict(book.to_dict())
         self.assertTrue(restored.feed_catchup["trades"])
         self.assertFalse(restored.feed_catchup["activity"])
+        self.assertEqual(restored.feed_cursor["trades"], "resume-token")
 
     def test_catchup_scans_past_known_first_page_to_find_older_unseen_rows(self) -> None:
         engine = TradingEngine(_cfg())
         engine._session = object()
         engine.copy.feed_catchup["trades"] = True
+        engine.copy.feed_cursor["trades"] = "older"
         known = _row("0xknown", ts=1_000_103)
         older = _row("0xolder-unseen", ts=1_000_101)
         engine.copy.remember(event_key(known))
@@ -825,7 +830,8 @@ class FeedCatchupPersistenceTests(unittest.TestCase):
         async def page(_url, params, _label):
             calls.append(dict(params))
             if not params.get("cursor"):
-                return {"data": [known], "pagination": {"has_more": True, "next_cursor": "older"}}
+                return {"data": [known], "pagination": {"has_more": True, "next_cursor": "page-two"}}
+            self.assertEqual(params.get("cursor"), "older")
             return {"data": [older], "pagination": {"has_more": False}}
 
         engine._wallet_api_page = page
