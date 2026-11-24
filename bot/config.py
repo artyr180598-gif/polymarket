@@ -1,7 +1,6 @@
 """Environment configuration. Existing variable names keep working.
 
-The default strategy mirrors BTC trade events in PAPER. MERGE/REDEEM remain
-available for legacy inventory in disabled markets; new non-BTC exposure is blocked. ``STRATEGY=maker_ladder``
+The default strategy mirrors all observed target-wallet markets in PAPER, across supported and newly listed assets. ``STRATEGY=maker_ladder``
 still selects the measured maker ladder described in
 docs/STRATEGY_ANALYSIS.md.
 
@@ -138,7 +137,7 @@ class BotConfig:
     # after the market closed. Allow this much lateness while the book is
     # still answerable, otherwise those trades would always be skipped.
     copy_late_grace_s: float = 5.0
-    enabled_assets: list[str] = field(default_factory=lambda: ["BTC"])
+    enabled_assets: list[str] = field(default_factory=lambda: list(ASSETS))
     enabled_timeframes: list[str] = field(default_factory=lambda: ["5m", "15m", "1h", "4h"])
     auto_start: bool = False
 
@@ -220,9 +219,9 @@ class BotConfig:
         mode = "paper"
         preset = os.getenv("STRATEGY_PRESET", "mo_money").strip().lower() or "mo_money"
         strategy = "copy_wallet"
-        # Production copy mode is fail-closed: environment variables cannot expand
-        # the supported asset allowlist. ETH/SOL remain management-only for legacy inventory.
-        assets = ["BTC"]
+        # Copy mode discovers markets from the target wallet feed, so this list
+        # is informational/dashboard metadata, not a trading allowlist.
+        assets = list(ASSETS)
         frames = [t.lower() for t in _list("ENABLED_TIMEFRAMES", "5m,15m,1h,4h") if t.lower() in TIMEFRAMES]
         if not frames:
             frames = ["5m", "15m", "1h", "4h"]
