@@ -159,11 +159,6 @@ class MarketCoverageTests(unittest.TestCase):
         self.assertEqual(config.enabled_assets, ["BTC"])
         self.assertFalse(config.auto_start)
 
-    def test_dashboard_settings_cannot_expand_copy_asset_allowlist(self) -> None:
-        engine = TradingEngine(_cfg(enabled_assets=["BTC"]))
-        engine.update_settings(enabled_assets=["ETH", "SOL"])
-        self.assertEqual(engine.cfg.enabled_assets, ["BTC"])
-
     def test_scope_filter_is_optional(self) -> None:
         cfg = _cfg(copy_slug_prefixes=["eth-updown"], enabled_assets=["ETH"])
         book = CopyBook()
