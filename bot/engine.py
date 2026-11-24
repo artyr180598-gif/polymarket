@@ -2118,13 +2118,33 @@ class TradingEngine:
                 or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
                 for row in page
             )
-            if known and catching_up and saved_cursor and not using_saved_cursor:
-                # We have already scanned the recent pages in an earlier
-                # capped/failed poll. Jump straight to the persisted older page.
-                cursor = saved_cursor
-                using_saved_cursor = True
-                continue
             if known:
+                if catching_up and not using_saved_cursor:
+                    if saved_cursor:
+                        # We have already scanned the recent pages in an earlier
+                        # capped/failed poll. Jump straight to the persisted older page.
+                        cursor = saved_cursor
+                        using_saved_cursor = True
+                        continue
+                    if has_more and next_cursor:
+                        # Catch-up state survived, but its saved cursor did not.
+                        # Continue sequentially rather than treating page 1 as the
+                        # end of the backlog and silently clearing the catch-up flag.
+                        cursor = next_cursor
+                        using_saved_cursor = True
+                        continue
+                    if has_more:
+                        # The API says more rows exist but supplied no cursor.
+                        # Preserve the unresolved state for the next poll.
+                        self.copy.feed_catchup[kind] = True
+                        self.copy.feed_cursor.pop(kind, None)
+                        self._note_once(
+                            f"{kind}-cursor-missing",
+                            "ERROR",
+                            f"{label}: API сообщил has_more без next_cursor; хвост отложен",
+                            60,
+                        )
+                        break
                 self.copy.feed_catchup[kind] = False
                 self.copy.feed_cursor.pop(kind, None)
                 break
