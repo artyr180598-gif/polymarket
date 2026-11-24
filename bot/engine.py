@@ -235,8 +235,12 @@ def _enumerate_prints(rows: list[dict]) -> list[tuple[str, dict]]:
 
 
 def _wallet_page_limit(*, seeded: bool, seed_on_start: bool) -> int:
-    """Use deep pagination only for the one-time history/baseline seed."""
-    return COPY_API_MAX_PAGES if (not seeded and seed_on_start) else 1
+    """Drain unseen pages until a fully-known page or the hard safety cap.
+
+    Limiting deep pagination to bootstrap could strand older unseen fills
+    behind a known first page after a burst larger than 200 records.
+    """
+    return COPY_API_MAX_PAGES
 
 
 def _trade_query(
@@ -2061,6 +2065,11 @@ class TradingEngine:
         page_rows: list[dict] = []
         cursor = ""
         first_ok = False
+        occurrence_counts: dict[str, int] = {}
+        catching_up = bool(self.copy.feed_catchup.get(kind, False))
+        saved_cursor = str(self.copy.feed_cursor.get(kind) or "")
+        using_saved_cursor = False
+        has_more = False
         for page_number in range(pages):
             # Data API /v2/trades can be served from a 300s CloudFront cache.
             # A unique query key is essential: polling every 500ms without it
@@ -2078,7 +2087,11 @@ class TradingEngine:
             if payload is None:
                 if not first_ok:
                     return None
-                # Keep the rows already read; the next poll resumes.
+                # Keep rows already read and remember that older pages
+                # still need draining on a later poll (including after restart).
+                self.copy.feed_catchup[kind] = True
+                if cursor:
+                    self.copy.feed_cursor[kind] = cursor
                 self._note_once(
                     f"{kind}-deep-page", "ERROR",
                     f"{label}: страница {page_number + 1} не прочитана, хвост отложен",
@@ -2088,13 +2101,32 @@ class TradingEngine:
             first_ok = True
             page = self._page_rows(payload)
             if not page:
+                self.copy.feed_catchup[kind] = False
+                self.copy.feed_cursor.pop(kind, None)
                 break
+            # Preserve multiplicity when a tx contains byte-for-byte identical
+            # fills. The first occurrence retains its legacy event identity.
+            for row in page:
+                base_event_id = event_key(row)
+                occurrence = occurrence_counts.get(base_event_id, 0)
+                occurrence_counts[base_event_id] = occurrence + 1
+                if occurrence:
+                    row["_copy_occurrence"] = occurrence
+            next_cursor, has_more = self._page_cursor(payload)
             known = all(
                 (event_key(row) in seen)
                 or (str(row.get("transaction_hash") or row.get("transactionHash") or "") in seen)
                 for row in page
             )
+            if known and catching_up and saved_cursor and not using_saved_cursor:
+                # We have already scanned the recent pages in an earlier
+                # capped/failed poll. Jump straight to the persisted older page.
+                cursor = saved_cursor
+                using_saved_cursor = True
+                continue
             if known:
+                self.copy.feed_catchup[kind] = False
+                self.copy.feed_cursor.pop(kind, None)
                 break
             fresh = [
                 row for row in page
@@ -2103,10 +2135,12 @@ class TradingEngine:
             ]
             page_rows.extend(fresh)
             seen.update(key for row in page if (key := event_key(row)))
-            next_cursor, has_more = self._page_cursor(payload)
             if not has_more:
+                self.copy.feed_catchup[kind] = False
+                self.copy.feed_cursor.pop(kind, None)
                 break
             if not next_cursor:
+                self.copy.feed_catchup[kind] = True
                 self._note_once(
                     f"{kind}-cursor-missing", "ERROR",
                     f"{label}: API сообщил has_more без next_cursor; хвост отложен",
@@ -2114,6 +2148,12 @@ class TradingEngine:
                 )
                 break
             cursor = next_cursor
+        else:
+            # The page cap was reached. Persist the next cursor so the next
+            # poll can continue beyond already-scanned leading pages.
+            self.copy.feed_catchup[kind] = bool(has_more)
+            if has_more and next_cursor:
+                self.copy.feed_cursor[kind] = next_cursor
         if not first_ok:
             return None
         if self._feed_endpoint.get(kind) != base:

@@ -759,3 +759,85 @@ class ActivityRowShapeTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job.kind, "REDEEM")
         self.assertEqual(job.payout, Decimal("12"))
+
+
+class WalletIdentityAndPaginationTests(unittest.TestCase):
+    def test_identical_fills_in_one_transaction_get_distinct_occurrence_ids(self) -> None:
+        row = _row("0xduplicate", size="5", ts=1_000_101)
+        self.assertNotEqual(event_key(row), event_key(dict(row, _copy_occurrence=1)))
+        self.assertEqual(event_key(row), event_key(dict(row)))
+
+    def test_live_poll_drains_more_than_one_page_until_known_boundary(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        row1 = _row("0xpage-one", ts=1_000_101)
+        row2 = _row("0xpage-two", ts=1_000_102)
+        known = _row("0xalready-seen", ts=1_000_100)
+        engine.copy.remember(event_key(known))
+        calls = []
+
+        async def page(_url, params, _label):
+            calls.append(dict(params))
+            if not params.get("cursor"):
+                return {"data": [row1], "pagination": {"has_more": True, "next_cursor": "next"}}
+            return {"data": [row2, known], "pagination": {"has_more": False}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(engine.copy._seen), taker_only=False,
+        ))
+        self.assertEqual([row["transaction_hash"] for row in rows], ["0xpage-one", "0xpage-two"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].get("cursor"), "next")
+
+    def test_second_identical_row_is_not_collapsed_by_wallet_page_dedupe(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        row = _row("0xduplicate", size="5", ts=1_000_101)
+
+        async def page(_url, _params, _label):
+            return {"data": [dict(row), dict(row)], "pagination": {"has_more": False}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(), taker_only=False,
+        ))
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(event_key(rows[0]), event_key(rows[1]))
+
+
+class FeedCatchupPersistenceTests(unittest.TestCase):
+    def test_catchup_flag_survives_copybook_restart(self) -> None:
+        book = CopyBook(
+            feed_catchup={"trades": True, "activity": False},
+            feed_cursor={"trades": "resume-token"},
+        )
+        restored = CopyBook.from_dict(book.to_dict())
+        self.assertTrue(restored.feed_catchup["trades"])
+        self.assertFalse(restored.feed_catchup["activity"])
+        self.assertEqual(restored.feed_cursor["trades"], "resume-token")
+
+    def test_catchup_scans_past_known_first_page_to_find_older_unseen_rows(self) -> None:
+        engine = TradingEngine(_cfg())
+        engine._session = object()
+        engine.copy.feed_catchup["trades"] = True
+        engine.copy.feed_cursor["trades"] = "older"
+        known = _row("0xknown", ts=1_000_103)
+        older = _row("0xolder-unseen", ts=1_000_101)
+        engine.copy.remember(event_key(known))
+        calls = []
+
+        async def page(_url, params, _label):
+            calls.append(dict(params))
+            if not params.get("cursor"):
+                return {"data": [known], "pagination": {"has_more": True, "next_cursor": "page-two"}}
+            self.assertEqual(params.get("cursor"), "older")
+            return {"data": [older], "pagination": {"has_more": False}}
+
+        engine._wallet_api_page = page
+        rows = asyncio.run(engine._wallet_pages(
+            "trades", seeded=True, seen=set(engine.copy._seen), taker_only=False,
+        ))
+        self.assertEqual([row["transaction_hash"] for row in rows], ["0xolder-unseen"])
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(engine.copy.feed_catchup["trades"])
