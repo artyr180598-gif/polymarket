@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -381,6 +382,7 @@ class TradingEngine:
         self._copy_last_lag = 0.0
         self._copy_detection_lag = 0.0
         self._copy_execution_lag = 0.0
+        self._copy_latency_samples: list[dict[str, float]] = []
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
         # One clock for the latency-critical copy path. Tests freeze it; in
@@ -1365,7 +1367,11 @@ class TradingEngine:
         # Ask the book and the metadata at the same time. Two sequential
         # round trips would put the fill a full RTT behind the wallet for no
         # reason: the token id is already in the wallet row.
-        if job.kind == "TRADE" and job.token_id and self._cached_book(job.token_id) is None:
+        if (
+            job.kind == "TRADE" and job.token_id
+            and int(getattr(self.cfg, "copy_exec_latency_ms", 0)) == 0
+            and self._cached_book(job.token_id) is None
+        ):
             self._book_task(job.token_id)
         window = await self._ensure_window(
             job.slug,
@@ -1492,7 +1498,16 @@ class TradingEngine:
         else:
             want = desired
         try:
-            bids, asks = await self._book_for(job.token_id)
+            latency_ms = int(getattr(self.cfg, "copy_exec_latency_ms", 0) or 0)
+            if latency_ms > 0:
+                # Do not use the signal-time prefetch: after the configured
+                # delay request a new public CLOB snapshot for simulated send time.
+                await asyncio.sleep(latency_ms / 1000.0)
+                self._book_cache.pop(job.token_id, None)
+                bids, asks = await self._book(job.token_id)
+                self._book_cache[job.token_id] = (bids, asks, time.monotonic())
+            else:
+                bids, asks = await self._book_for(job.token_id)
         except OrderBookNotFound as exc:
             # A 404 is a token/book lookup failure, not a transient network
             # timeout. Retrying the same event five times only adds latency.
@@ -1906,6 +1921,11 @@ class TradingEngine:
         detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
         execution_lag = max(0.0, float(now) - job.detected_at)
         total_lag = max(0.0, float(now) - job.trade_ts) if job.trade_ts else 0.0
+        self._copy_latency_samples.append({
+            "detection": detection_lag, "execution": execution_lag, "total": total_lag,
+        })
+        if len(self._copy_latency_samples) > 1000:
+            del self._copy_latency_samples[:-1000]
         # Commit the result and corresponding portfolio/copy snapshots in the
         # same transaction. The completed job must not reappear after restart.
         copy_snapshot = self.copy.to_dict()
@@ -2032,7 +2052,7 @@ class TradingEngine:
                     self._note_once(f"{label}-net", "ERROR", f"{label}: {exc}", 20)
                     return None
                 self._note_once(f"{label}-retry", "INFO", f"{label}: {exc}; повтор", 15)
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(retry_delay * random.uniform(0.8, 1.2))
         return None
 
     @staticmethod
@@ -2971,6 +2991,16 @@ class TradingEngine:
         if dropped:
             self._persist(copy=False)
 
+    def _latency_percentile(self, metric: str, percentile: float) -> float | None:
+        values = sorted(
+            sample[metric] for sample in self._copy_latency_samples
+            if metric in sample and math.isfinite(sample[metric])
+        )
+        if not values:
+            return None
+        index = max(0, min(len(values) - 1, math.ceil(percentile * len(values)) - 1))
+        return round(values[index], 3)
+
     def snapshot(self) -> dict[str, Any]:
         equity = self.portfolio.equity(self.marks)
         self.portfolio.roll_day(equity)
@@ -3079,6 +3109,14 @@ class TradingEngine:
                     "last_detection_lag_s": round(self._copy_detection_lag, 3),
                     "last_execution_lag_s": round(self._copy_execution_lag, 3),
                     "last_event_at": self._copy_last_seen_at,
+                    "latency_percentiles": {
+                        name: {
+                            "p50": self._latency_percentile(name, 0.50),
+                            "p95": self._latency_percentile(name, 0.95),
+                        }
+                        for name in ("detection", "execution", "total")
+                    },
+                    "exec_latency_ms": int(getattr(self.cfg, "copy_exec_latency_ms", 0)),
                     "window_cap_usd": self.cfg.copy_window_cap_usd,
                     "exposure_cap_usd": self.cfg.copy_exposure_cap_usd,
                 }
