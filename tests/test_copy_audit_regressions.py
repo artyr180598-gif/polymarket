@@ -224,6 +224,7 @@ def test_positions_snapshot_follows_cursor_and_verifies_wallet(tmp_path):
             "outcome": "Up",
             "current_size": 10,
             "current_value": 4.25,
+            "last_event_at": 1795266601,
         }
         if not params.get("cursor"):
             return {"data": [row], "pagination": {"has_more": True, "next_cursor": "next"}}
@@ -295,6 +296,7 @@ def test_wallet_position_import_commits_opening_equity_once(tmp_path):
             "outcome": "Up",
             "current_size": 10,
             "current_value": 4.25,
+            "last_event_at": 1795266601,
         }]
     engine._fetch_wallet_positions = positions
     try:
@@ -327,6 +329,7 @@ def test_incomplete_wallet_position_snapshot_does_not_partially_import(tmp_path)
                 "outcome": "Up",
                 "current_size": 10,
                 "current_value": 4.25,
+            "last_event_at": 1795266601,
             },
             {
                 "proxy_wallet": DEFAULT_WALLET,
@@ -384,3 +387,27 @@ def test_wallet_feed_silence_alerts_once_and_notifies_on_recovery(tmp_path):
     assert not engine._copy_feed_alerted
     assert sum("восстановилась" in event for event in engine.events) == 2
     engine.ledger.close()
+
+
+def test_copy_event_cutoff_uses_per_market_position_watermark(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(db_path=str(tmp_path / "market-watermark.db")))
+    engine._copy_seed_after_ts = 100.0
+    engine._copy_position_seed_at_by_slug = {"eth-updown-5m-1795266600": 150.0}
+    try:
+        eth = {"slug": "eth-updown-5m-1795266600"}
+        sol = {"slug": "sol-updown-5m-1795266600"}
+        assert engine._copy_event_cutoff(eth) == 150.0
+        assert engine._copy_event_cutoff(sol) == 100.0
+        assert engine._copy_rows_after_reset([
+            {**eth, "timestamp": 125},
+            {**eth, "timestamp": 151},
+            {**sol, "timestamp": 125},
+        ]) == [
+            {**eth, "timestamp": 151},
+            {**sol, "timestamp": 125},
+        ]
+    finally:
+        engine.ledger.close()
