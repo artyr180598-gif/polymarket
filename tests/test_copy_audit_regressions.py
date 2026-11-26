@@ -490,3 +490,31 @@ def test_imported_positions_over_bankroll_fail_without_partial_mutation():
         )
     assert p.cash == D("5")
     assert p.markets == {}
+
+
+def test_wallet_position_without_last_event_uses_snapshot_watermark(tmp_path):
+    import asyncio
+    from bot.config import BotConfig
+    from bot.copy_wallet import DEFAULT_WALLET
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(db_path=str(tmp_path / "position-watermark-fallback.db")))
+    async def positions():
+        return [{
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "eth-updown-5m-1795266600",
+            "condition_id": "0xcondition",
+            "outcome": "Up",
+            "current_size": 10,
+            "current_value": 4.25,
+            "last_event_at": None,
+        }]
+    engine._fetch_wallet_positions = positions
+    try:
+        assert asyncio.run(engine._import_wallet_positions()) is True
+        saved = engine.ledger.load_portfolio("paper")
+        assert saved["copy_position_seed_at_by_slug"]["eth-updown-5m-1795266600|Up"] == saved["copy_snapshot_at"]
+        marker = engine.ledger.wallet_positions_imported("paper", DEFAULT_WALLET)
+        assert marker
+    finally:
+        engine.ledger.close()
