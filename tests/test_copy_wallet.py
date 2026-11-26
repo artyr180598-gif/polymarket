@@ -691,6 +691,44 @@ class TapeReplayTests(unittest.TestCase):
         os.getenv("POLYBOT_RUN_NETWORK_TESTS") == "1",
         "live Data API replay is opt-in; default test suite must run offline",
     )
+    def test_live_open_positions_snapshot_schema(self) -> None:
+        url = (
+            "https://data-api.polymarket.com/v2/positions"
+            f"?user={DEFAULT_WALLET}&status=OPEN&filter_type=TOKENS"
+            "&filter_amount=0.01&include_archived=true&limit=1000"
+            f"&_={int(time.time()*1000)}"
+        )
+        request = urllib.request.Request(url, headers={"User-Agent": "PolyBot/2 read-only audit"})
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                payload = json.load(response)
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"open positions API unavailable: {exc}") from exc
+        self.assertIsInstance(payload, dict)
+        rows = payload.get("data")
+        pagination = payload.get("pagination")
+        self.assertIsInstance(rows, list)
+        self.assertIsInstance(pagination, dict)
+        fallback_watermarks = 0
+        for row in rows:
+            self.assertEqual(str(row.get("proxy_wallet") or "").lower(), DEFAULT_WALLET)
+            self.assertTrue(row.get("slug"))
+            self.assertTrue(row.get("condition_id"))
+            self.assertTrue(row.get("outcome"))
+            self.assertGreater(float(row.get("current_size") or 0), 0)
+            self.assertGreaterEqual(float(row.get("current_value") or 0), 0)
+            if row.get("last_event_at") in (None, "", 0, "0"):
+                fallback_watermarks += 1
+        print(
+            f"live opening snapshot: {len(rows)} rows, "
+            f"{fallback_watermarks} snapshot-time watermark fallbacks, "
+            f"has_more={pagination.get('has_more')}"
+        )
+
+    @unittest.skipUnless(
+        os.getenv("POLYBOT_RUN_NETWORK_TESTS") == "1",
+        "live Data API replay is opt-in; default test suite must run offline",
+    )
     def test_last_six_hours_are_the_wallets_own_rows(self) -> None:
         """Tape-approximated: real trades, no historical book, so no fill prices."""
         now = time.time()
