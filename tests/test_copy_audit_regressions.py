@@ -338,6 +338,7 @@ def test_incomplete_wallet_position_snapshot_does_not_partially_import(tmp_path)
                 "outcome": "Down",
                 "current_size": 5,
                 "current_value": 1.5,
+                "last_event_at": 1795266602,
             },
         ]
     engine._fetch_wallet_positions = positions
@@ -395,15 +396,16 @@ def test_copy_event_cutoff_uses_per_market_position_watermark(tmp_path):
 
     engine = TradingEngine(BotConfig(db_path=str(tmp_path / "market-watermark.db")))
     engine._copy_seed_after_ts = 100.0
-    engine._copy_position_seed_at_by_slug = {"eth-updown-5m-1795266600": 150.0}
+    engine._copy_position_seed_at_by_slug = {"eth-updown-5m-1795266600|Up": 150.0}
     try:
         eth = {"slug": "eth-updown-5m-1795266600"}
         sol = {"slug": "sol-updown-5m-1795266600"}
-        assert engine._copy_event_cutoff(eth) == 150.0
+        assert engine._copy_event_cutoff({**eth, "outcome": "Up"}) == 150.0
+        assert engine._copy_event_cutoff({**eth, "outcome": "Down"}) == 100.0
         assert engine._copy_event_cutoff(sol) == 100.0
         assert engine._copy_rows_after_reset([
-            {**eth, "timestamp": 125},
-            {**eth, "timestamp": 151},
+            {**eth, "outcome": "Up", "timestamp": 125},
+            {**eth, "outcome": "Up", "timestamp": 151},
             {**sol, "timestamp": 125},
         ]) == [
             {**eth, "timestamp": 151},
