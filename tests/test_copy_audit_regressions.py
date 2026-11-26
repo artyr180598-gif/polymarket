@@ -367,3 +367,20 @@ def test_latency_samples_survive_engine_restart(tmp_path):
         assert second._latency_percentile("total", 0.50) == 0.5
     finally:
         second.ledger.close()
+
+
+def test_wallet_feed_silence_alerts_once_and_notifies_on_recovery(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(db_path=str(tmp_path / "feed-health.db")))
+    engine._copy_feed_started_at = 10.0
+    engine._check_copy_feed_health(False, False, now=41.0)
+    assert engine._copy_feed_alerted == {"trades", "activity"}
+    first_count = len(engine.events)
+    engine._check_copy_feed_health(False, False, now=42.0)
+    assert len(engine.events) == first_count
+    engine._check_copy_feed_health(True, True, now=43.0)
+    assert not engine._copy_feed_alerted
+    assert sum("восстановилась" in event for event in engine.events) == 2
+    engine.ledger.close()
