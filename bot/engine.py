@@ -438,6 +438,8 @@ class TradingEngine:
         latency-critical path down. The portfolio snapshot is small and is
         written immediately; ``copy`` state is flushed a few times a minute.
         """
+        if self.cfg.strategy == "copy_wallet" and self.cfg.copy_import_positions and not self._copy_positions_ready:
+            return
         try:
             self.ledger.save_portfolio(
                 self.mode,
@@ -454,6 +456,8 @@ class TradingEngine:
 
     def _persist_copy(self, *, force: bool = False) -> None:
         if self.cfg.strategy != "copy_wallet":
+            return
+        if self.cfg.copy_import_positions and not self._copy_positions_ready:
             return
         now = time.monotonic()
         if not force and now - self._last_copy_persist < 20.0:
@@ -2342,7 +2346,9 @@ class TradingEngine:
             return False
         imported = 0
         total_value = _ZERO
+        parsed: list[tuple[str, str, str, str, str, Decimal, Decimal]] = []
         try:
+            # Validate the entire snapshot before mutating the in-memory ledger.
             for row in rows:
                 slug = str(row.get("slug") or "")
                 condition_id = str(row.get("condition_id") or "")
@@ -2357,6 +2363,8 @@ class TradingEngine:
                 if not slug or not condition_id or not outcome:
                     raise ValueError("position identity is incomplete")
                 asset, timeframe = _asset_timeframe(slug)
+                parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value))
+            for slug, condition_id, asset, timeframe, outcome, shares, value in parsed:
                 self.portfolio.import_open_position(
                     slug=slug,
                     condition_id=condition_id,
@@ -3094,6 +3102,8 @@ class TradingEngine:
             await asyncio.sleep(15)
 
     def _housekeep_once(self) -> None:
+        if self.cfg.strategy == "copy_wallet" and self.cfg.copy_import_positions and not self._copy_positions_ready:
+            return
         now = time.time()
         if now - self._last_equity_ts > 30:
             try:
