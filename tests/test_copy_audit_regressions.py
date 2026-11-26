@@ -256,3 +256,17 @@ def test_btc_scope_allows_only_non_btc_position_closures():
     assert split is None
     merge = book.observe({**base, "transaction_hash": "merge", "type": "MERGE"}, now=1, cfg=cfg)
     assert merge is not None and merge.side == "MERGE"
+
+
+def test_paper_reset_clears_open_position_import_marker(tmp_path):
+    ledger = Ledger(str(tmp_path / "reset-import.db"))
+    ledger.save_wallet_positions_import(
+        "paper", "0xabc", {"portfolio": {"cash": "2750"}},
+        {"imported_positions": 2},
+    )
+    assert ledger.wallet_positions_imported("paper", "0xabc")
+    result = ledger.backup_and_reset_paper_history("new-run")
+    assert result["reset"] is True
+    assert not ledger.wallet_positions_imported("paper", "0xabc")
+    assert ledger.load_portfolio("paper") is None
+    ledger.close()
