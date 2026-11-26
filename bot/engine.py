@@ -482,6 +482,7 @@ class TradingEngine:
                     "consecutive_losses": self.consecutive_losses,
                     "manual_pause": self.manual_pause,
                     "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                    "copy_snapshot_at": self._copy_snapshot_at,
                 },
             )
         except Exception as exc:  # noqa: BLE001
