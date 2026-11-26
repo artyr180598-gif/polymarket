@@ -1221,7 +1221,7 @@ class TradingEngine:
     def _seed_copy_stream(self, rows: list[dict], stream: str) -> tuple[int, list[dict]]:
         """Seed pre-reset events, but keep post-reset events for real copying."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0 and not self._copy_position_seed_at_by_slug and not self._copy_snapshot_at:
+        if cutoff <= 0 and not getattr(self, "_copy_position_seed_at_by_slug", {}) and not getattr(self, "_copy_snapshot_at", 0.0):
             old_rows, new_rows = rows, []
         else:
             old_rows, new_rows = [], []
@@ -1237,20 +1237,22 @@ class TradingEngine:
         """Combine reset time with the per-market snapshot watermark."""
         reset_cutoff = float(getattr(self, "_copy_reset_after_ts", 0.0) or 0.0)
         seed_cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
+        snapshot_at = float(getattr(self, "_copy_snapshot_at", 0.0) or 0.0)
+        position_map = getattr(self, "_copy_position_seed_at_by_slug", {}) or {}
         slug = str(row.get("slug") or "")
         outcome = str(row.get("outcome") or "")
         if outcome:
             key = f"{slug}|{outcome}"
-            position_cutoff = self._copy_position_seed_at_by_slug.get(key)
+            position_cutoff = position_map.get(key)
             if position_cutoff is None:
-                position_cutoff = self._copy_snapshot_at or seed_cutoff
+                position_cutoff = snapshot_at or seed_cutoff
         else:
             market_cutoff = [
                 float(stamp or 0.0)
-                for key, stamp in self._copy_position_seed_at_by_slug.items()
+                for key, stamp in position_map.items()
                 if key.startswith(f"{slug}|")
             ]
-            position_cutoff = max(market_cutoff) if market_cutoff else (self._copy_snapshot_at or seed_cutoff)
+            position_cutoff = max(market_cutoff) if market_cutoff else (snapshot_at or seed_cutoff)
         return max(reset_cutoff, float(position_cutoff or 0.0))
 
     def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
