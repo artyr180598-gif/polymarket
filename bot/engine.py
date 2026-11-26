@@ -2505,7 +2505,7 @@ class TradingEngine:
                 redeemable = (
                     redeemable_raw is True
                     or str(redeemable_raw).strip().lower() in ("true", "1", "yes")
-                    or str(row.get("status") or "").upper() == "REDEEMABLE"
+                    or str(row.get("status") or "").upper() in ("REDEEMABLE", "REDEEMABLE_LOST")
                 )
                 if (
                     not shares.is_finite() or not value.is_finite()
