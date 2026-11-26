@@ -104,3 +104,36 @@ def test_result_and_details_rollback_as_one_transaction(tmp_path):
                              'shares': '1', 'price': '.5', 'notional': '.5', 'fee': '0'}])
     assert ledger.copies('paper') == []
     assert ledger.load_portfolio('paper') is None
+
+
+
+def test_ledger_process_lock_rejects_a_second_owner(tmp_path):
+    first = Ledger(str(tmp_path / "single-owner.db"))
+    second = Ledger(str(tmp_path / "single-owner.db"))
+    first.acquire_process_lock()
+    try:
+        with pytest.raises(RuntimeError, match="another PolyBot process"):
+            second.acquire_process_lock()
+    finally:
+        first.release_process_lock()
+    second.acquire_process_lock()
+    second.release_process_lock()
+
+
+def test_wallet_snapshot_never_contains_hardcoded_roi(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(strategy="copy_wallet", db_path=str(tmp_path / "snapshot.db")))
+    assert engine.snapshot()["wallet_edge"] == []
+
+
+def test_exec_latency_configuration_is_bounded(monkeypatch, tmp_path):
+    from bot.config import BotConfig
+
+    monkeypatch.setenv("COPY_EXEC_LATENCY_MS", "900")
+    cfg = BotConfig.from_env(env_file=str(tmp_path / "missing.env"))
+    assert cfg.copy_exec_latency_ms == 900
+    monkeypatch.setenv("COPY_EXEC_LATENCY_MS", "-5")
+    cfg = BotConfig.from_env(env_file=str(tmp_path / "missing.env"))
+    assert cfg.copy_exec_latency_ms == 0
