@@ -394,6 +394,16 @@ class TradingEngine:
         self._copy_detection_lag = 0.0
         self._copy_execution_lag = 0.0
         self._copy_latency_samples: list[dict[str, float]] = []
+        if isinstance(stored_copy, dict):
+            for sample in (stored_copy.get("latency_samples") or [])[-1000:]:
+                if not isinstance(sample, dict):
+                    continue
+                try:
+                    values = {key: float(sample[key]) for key in ("detection", "execution", "total")}
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if all(math.isfinite(value) and value >= 0 for value in values.values()):
+                    self._copy_latency_samples.append(values)
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
         # One clock for the latency-critical copy path. Tests freeze it; in
@@ -459,6 +469,11 @@ class TradingEngine:
         if copy:
             self._persist_copy()
 
+    def _copy_state_blob(self) -> dict:
+        blob = self.copy.to_dict()
+        blob["latency_samples"] = list(self._copy_latency_samples[-1000:])
+        return blob
+
     def _persist_copy(self, *, force: bool = False) -> None:
         if self.cfg.strategy != "copy_wallet":
             return
@@ -475,7 +490,7 @@ class TradingEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("persist copy pending: %s", exc)
         try:
-            self.ledger.save_copy(self.mode, self.copy.to_dict())
+            self.ledger.save_copy(self.mode, self._copy_state_blob())
             self._last_copy_persist = now
             self._copy_dirty = False
         except Exception as exc:  # noqa: BLE001
@@ -1224,7 +1239,7 @@ class TradingEngine:
                 self.mode,
                 {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
                  "manual_pause": self.manual_pause},
-                self.copy.to_dict(), self.copy.pending_rows(),
+                self._copy_state_blob(), self.copy.pending_rows(),
             )
         monotonic_now = time.monotonic()
         # One complete trade feed is enough: takerOnly=false includes
@@ -1316,7 +1331,7 @@ class TradingEngine:
             self.mode,
             {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
              "manual_pause": self.manual_pause},
-            self.copy.to_dict(), self.copy.pending_rows(),
+            self._copy_state_blob(), self.copy.pending_rows(),
         )
         self._last_copy_persist = time.monotonic()
 
@@ -1964,7 +1979,7 @@ class TradingEngine:
             del self._copy_latency_samples[:-1000]
         # Commit the result and corresponding portfolio/copy snapshots in the
         # same transaction. The completed job must not reappear after restart.
-        copy_snapshot = self.copy.to_dict()
+        copy_snapshot = self._copy_state_blob()
         pending = [item for item in self.copy.pending_rows() if item.get("event_id") != job.event_id]
         copy_snapshot["jobs"] = pending
         checkpoint = {
@@ -2402,7 +2417,7 @@ class TradingEngine:
                 "portfolio": self.portfolio.to_dict(),
                 "consecutive_losses": self.consecutive_losses,
                 "manual_pause": self.manual_pause,
-                "copy": self.copy.to_dict(),
+                "copy": self._copy_state_blob(),
             },
             summary,
         )
