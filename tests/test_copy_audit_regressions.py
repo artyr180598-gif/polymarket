@@ -518,3 +518,97 @@ def test_wallet_position_without_last_event_uses_snapshot_watermark(tmp_path):
         assert marker
     finally:
         engine.ledger.close()
+
+
+def test_opening_import_settles_redeemable_positions_at_snapshot_payout(tmp_path):
+    import asyncio
+    from bot.config import BotConfig
+    from bot.copy_wallet import DEFAULT_WALLET
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(
+        db_path=str(tmp_path / "redeemable-import.db"),
+        copy_import_positions=True,
+        bankroll_usd=2750,
+    ))
+    rows = [
+        {
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "eth-updown-5m-1795266600",
+            "condition_id": "0xeth",
+            "outcome": "Up",
+            "current_size": 10,
+            "current_value": 10,
+            "last_event_at": 1795266601,
+            "redeemable": True,
+            "status": "REDEEMABLE",
+        },
+        {
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "eth-updown-5m-1795266600",
+            "condition_id": "0xeth",
+            "outcome": "Down",
+            "current_size": 5,
+            "current_value": 0,
+            "last_event_at": 1795266602,
+            "redeemable": True,
+            "status": "REDEEMABLE",
+        },
+        {
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "btc-updown-5m-1795266600",
+            "condition_id": "0xbtc",
+            "outcome": "Up",
+            "current_size": 10,
+            "current_value": 5,
+            "last_event_at": 1795266603,
+            "redeemable": False,
+            "status": "OPEN",
+        },
+    ]
+    async def positions():
+        return rows
+    engine._fetch_wallet_positions = positions
+    try:
+        assert asyncio.run(engine._import_wallet_positions()) is True
+        assert engine.portfolio.cash == Decimal("2745")
+        assert engine.portfolio.equity() == Decimal("2750")
+        assert engine.portfolio.realized == Decimal("0")
+        eth = engine.portfolio.markets["eth-updown-5m-1795266600"]
+        assert eth.resolved is True and eth.closed is True
+        btc = engine.portfolio.markets["btc-updown-5m-1795266600"]
+        assert btc.resolved is False and btc.open_shares() == Decimal("10")
+    finally:
+        engine.ledger.close()
+
+
+def test_mixed_redeemable_flags_for_one_market_fail_closed(tmp_path):
+    import asyncio
+    from bot.config import BotConfig
+    from bot.copy_wallet import DEFAULT_WALLET
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(
+        db_path=str(tmp_path / "mixed-redeemable.db"),
+        copy_import_positions=True,
+    ))
+    async def positions():
+        base = {
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "eth-updown-5m-1795266600",
+            "condition_id": "0xeth",
+            "current_size": 5,
+            "current_value": 2,
+            "last_event_at": 1795266601,
+        }
+        return [
+            {**base, "outcome": "Up", "redeemable": True, "status": "REDEEMABLE"},
+            {**base, "outcome": "Down", "redeemable": False, "status": "OPEN"},
+        ]
+    engine._fetch_wallet_positions = positions
+    try:
+        assert asyncio.run(engine._import_wallet_positions()) is False
+        assert engine.portfolio.markets == {}
+        assert engine.ledger.load_portfolio("paper") is None
+    finally:
+        engine.ledger.close()
