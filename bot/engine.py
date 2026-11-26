@@ -1229,8 +1229,10 @@ class TradingEngine:
         priority = {"SPLIT": 0, "TRADE": 1, "MERGE": 2, "REDEEM": 3}.get(kind, 4)
         log_index_present = any(row.get(name) is not None for name in ("log_index", "logIndex"))
         log_index = integer("log_index", "logIndex") if log_index_present else priority
+        sequence_id = integer("sequence_id", "sequenceId")
         return (
             cls._copy_row_timestamp(row),
+            sequence_id,
             integer("block_number", "blockNumber"),
             integer("transaction_index", "transactionIndex"),
             str(row.get("transaction_hash") or row.get("transactionHash") or ""),
