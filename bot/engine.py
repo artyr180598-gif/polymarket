@@ -1206,7 +1206,6 @@ class TradingEngine:
                 delay = max(delay, self._copy_backoff_until - time.monotonic())
             await asyncio.sleep(delay)
 
-    @staticmethod
     @classmethod
     def _copy_event_order(cls, row: dict) -> tuple:
         """Order same-block events by chain indexes when available.
@@ -1239,6 +1238,7 @@ class TradingEngine:
             log_index,
         )
 
+    @staticmethod
     def _copy_row_timestamp(row: dict) -> float:
         try:
             stamp = float(row.get("timestamp") or 0)
