@@ -411,9 +411,10 @@ def test_copy_event_cutoff_uses_per_market_position_watermark(tmp_path):
             {**eth, "outcome": "Up", "timestamp": 125},
             {**eth, "outcome": "Up", "timestamp": 151},
             {**sol, "timestamp": 125},
+            {**sol, "timestamp": 201},
         ]) == [
-            {**eth, "timestamp": 151},
-            {**sol, "timestamp": 125},
+            {**eth, "outcome": "Up", "timestamp": 151},
+            {**sol, "timestamp": 201},
         ]
     finally:
         engine.ledger.close()
