@@ -304,8 +304,7 @@ function edgeCard(s){
     const roi = row.roi_pct == null ? "—" : row.roi_pct + "%";
     return '<div class="row"><span>'+title+'</span><span>'+roi+' на $'+Number(row.notional||0).toFixed(0)+'</span></div>';
   }
-  const ref = (s.wallet_edge||[]).map(x => '<div class="row"><span>'+x.label+'</span><span>'+x.roi+'</span></div>').join("");
-  return card("Отдача на оборот", line("Наши 7 дней", e.d7)+line("Наши 14 дней", e.d14)+line("Наши 30 дней", e.d30)+'<p><small>У кошелька-образца отдача снижалась. Это не прогноз.</small></p>'+ref);
+  return card("Отдача на оборот", line("Наши 7 дней", e.d7)+line("Наши 14 дней", e.d14)+line("Наши 30 дней", e.d30));
 }
 function metric(k,v,c){ return '<div class="card"><div class="k">'+k+'</div><div class="v '+c+'">'+v+'</div></div>'; }
 async function act(path){
