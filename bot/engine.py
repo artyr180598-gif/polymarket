@@ -2396,7 +2396,7 @@ class TradingEngine:
         self._note(
             "INFO",
             f"Открытые позиции кошелька импортированы: {imported} шт. · "
-            f"текущая стоимость \${usdc(total_value)} · прошлый PnL исключён из новой истории.",
+            "текущая стоимость $" + str(usdc(total_value)) + " · прошлый PnL исключён из новой истории.",
             notify=True,
         )
         return True
