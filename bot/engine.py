@@ -3099,13 +3099,9 @@ class TradingEngine:
             "taker_rebates": str(self.portfolio.taker_rebates),
             "liquidity_rewards": str(self.portfolio.liquidity_rewards),
             "edge": edge,
-            "wallet_edge": [
-                {"label": "июль–август 2026", "roi": "4.1%"},
-                {"label": "сентябрь 2026", "roi": "3.3%"},
-                {"label": "октябрь 2026", "roi": "2.6%"},
-                {"label": "ноябрь 2026", "roi": "2.4%"},
-                {"label": "последние 14 дней", "roi": "1.9%"},
-            ],
+            # Never display hard-coded target-wallet returns. Historical wallet
+            # PnL is not derivable from the current public trade tape alone.
+            "wallet_edge": [],
             "exposure": str(self.portfolio.exposure_cost()),
             "consecutive_losses": self.consecutive_losses,
             "stats": stats,
