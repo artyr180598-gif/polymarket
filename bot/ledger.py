@@ -51,18 +51,26 @@ _BACKFILL: tuple[tuple[str, str, str], ...] = (
 
 
 class Ledger:
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, acquire_process_lock: bool = False) -> None:
         self.db_path = db_path
         parent = os.path.dirname(os.path.abspath(db_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._process_lock_file = None
         self._process_lock_path = os.path.abspath(db_path) + ".lock"
-        self.added_columns: list[str] = []
-        self._init()
+        # Engine instances acquire this before any schema migration, snapshot
+        # load, or one-time PAPER reset. Standalone Ledger tests/tools can opt out.
+        if acquire_process_lock:
+            self.acquire_process_lock()
+        try:
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self.added_columns: list[str] = []
+            self._init()
+        except Exception:
+            self.release_process_lock()
+            raise
 
     def _init(self) -> None:
         with self._lock:
