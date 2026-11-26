@@ -2511,6 +2511,12 @@ class TradingEngine:
                     last_event_at /= 1000.0
                 asset, timeframe = _asset_timeframe(slug)
                 parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at))
+            requested_opening_value = sum((item[6] for item in parsed), _ZERO)
+            if requested_opening_value > self.portfolio.cash:
+                raise ValueError(
+                    f"open positions value {requested_opening_value} exceeds "
+                    f"available PAPER bankroll {self.portfolio.cash}"
+                )
             for slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at in parsed:
                 self.portfolio.import_open_position(
                     slug=slug,
