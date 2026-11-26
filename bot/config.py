@@ -117,11 +117,16 @@ class BotConfig:
     # Legacy setting; wallet-copy fills are no longer artificially delayed.
     copy_delay_s: float = 0.0
     copy_max_slip: float = 0.03
+    # Artificial delay between observing a wallet fill and requesting a fresh book.
+    copy_exec_latency_ms: int = 0
+    # Import the target wallet's current open positions once on a fresh PAPER account.
+    copy_import_positions: bool = False
     # Slug prefixes such as "btc-updown-5m,eth-updown". Empty = all markets.
     copy_slug_prefixes: list[str] = field(default_factory=list)
     # Seconds between wallet-feed polls. 0.5 keeps our lag near the data API.
     copy_poll_s: float = 0.5
     copy_activity_poll_s: float = 0.5
+    copy_feed_stale_s: float = 30.0
     # A job whose market metadata never arrives is dropped after this long.
     copy_pending_timeout_s: float = 120.0
     # Bootstrap: the first successful poll is history, never a trade signal.
@@ -258,9 +263,12 @@ class BotConfig:
             copy_scale_auto=scale_auto,
             copy_delay_s=_float("COPY_DELAY_S", 0.0, 0.0),
             copy_max_slip=_float("COPY_MAX_SLIP", 0.03, 0.0, 0.50),
+            copy_exec_latency_ms=_int("COPY_EXEC_LATENCY_MS", 0, 0, 30000),
+            copy_import_positions=_flag("COPY_IMPORT_POSITIONS", "false"),
             copy_slug_prefixes=prefixes,
             copy_poll_s=_float("COPY_POLL_S", 0.5, 0.2, 10.0),
             copy_activity_poll_s=_float("COPY_ACTIVITY_POLL_S", 0.5, 0.2, 120.0),
+            copy_feed_stale_s=_float("COPY_FEED_STALE_S", 30.0, 5.0, 600.0),
             copy_pending_timeout_s=_float("COPY_PENDING_TIMEOUT_S", 120.0, 10.0, 3600.0),
             copy_seed_on_start=_flag("COPY_SEED_ON_START", "true"),
             copy_use_risk_limits=_flag("COPY_USE_RISK_LIMITS", "false"),
@@ -271,7 +279,7 @@ class BotConfig:
             copy_late_grace_s=_float("COPY_LATE_GRACE_S", 5.0, 0.0, 120.0),
             enabled_assets=assets,
             enabled_timeframes=frames,
-            auto_start=False,
+            auto_start=_flag("AUTO_START", "false"),
             order_clip_usd=_float("ORDER_CLIP_USD", 16.0, 1.0),
             max_window_risk_usd=_float("MAX_WINDOW_RISK_USD", 80.0, 5.0),
             max_total_exposure_usd=_float("MAX_TOTAL_EXPOSURE_USD", 640.0, 10.0),

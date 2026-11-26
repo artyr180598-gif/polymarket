@@ -178,7 +178,10 @@ function copyCard(s){
     ["Не копируется", (n.unsupported || 0) + " тип · " + (n.filtered || 0) + " вне фильтра"],
     ["Ошибки ленты", String(n.feed_errors || 0)],
     ["В очереди", String(c.pending || 0)],
-    ["Задержка", (c.last_lag_s || 0) + " с"],
+    ["Задержка обнаружения p50 / p95", (c.latency_percentiles?.detection?.p50 ?? "—") + " / " + (c.latency_percentiles?.detection?.p95 ?? "—") + " с"],
+    ["Задержка исполнения p50 / p95", (c.latency_percentiles?.execution?.p50 ?? "—") + " / " + (c.latency_percentiles?.execution?.p95 ?? "—") + " с"],
+    ["Общая задержка p50 / p95", (c.latency_percentiles?.total?.p50 ?? "—") + " / " + (c.latency_percentiles?.total?.p95 ?? "—") + " с"],
+    ["Искусственная задержка", (c.exec_latency_ms || 0) + " мс"],
   ].map(function (pair) { return '<div class="row"><span>'+pair[0]+'</span><span>'+pair[1]+'</span></div>'; }).join("");
   return card("Копирование кошелька", bits);
 }
@@ -304,8 +307,7 @@ function edgeCard(s){
     const roi = row.roi_pct == null ? "—" : row.roi_pct + "%";
     return '<div class="row"><span>'+title+'</span><span>'+roi+' на $'+Number(row.notional||0).toFixed(0)+'</span></div>';
   }
-  const ref = (s.wallet_edge||[]).map(x => '<div class="row"><span>'+x.label+'</span><span>'+x.roi+'</span></div>').join("");
-  return card("Отдача на оборот", line("Наши 7 дней", e.d7)+line("Наши 14 дней", e.d14)+line("Наши 30 дней", e.d30)+'<p><small>У кошелька-образца отдача снижалась. Это не прогноз.</small></p>'+ref);
+  return card("Отдача на оборот", line("Наши 7 дней", e.d7)+line("Наши 14 дней", e.d14)+line("Наши 30 дней", e.d30));
 }
 function metric(k,v,c){ return '<div class="card"><div class="k">'+k+'</div><div class="v '+c+'">'+v+'</div></div>'; }
 async function act(path){

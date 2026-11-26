@@ -127,6 +127,38 @@ class Portfolio:
             book = MarketBook(slug=slug, condition_id=condition_id, asset=asset, timeframe=timeframe)
             self.markets[slug] = book
         return book
+ 
+    def import_open_position(
+        self,
+        *,
+        slug: str,
+        condition_id: str,
+        asset: str,
+        timeframe: str,
+        outcome: str,
+        shares: Decimal,
+        current_value: Decimal,
+    ) -> None:
+        """Seed an already-open wallet holding at its current snapshot value.
+
+        The pre-snapshot PnL is intentionally excluded from the new experiment:
+        current value is the opening lot basis. Imported holdings consume the
+        same amount of PAPER cash, keeping total opening equity equal to
+        BANKROLL_USD rather than creating artificial capital.
+        """
+        qty = shares_q(D(shares))
+        value = usdc(D(current_value))
+        if not slug or not condition_id or not outcome or qty <= 0 or value < 0:
+            raise ValueError("invalid imported open position")
+        if value > self.cash:
+            raise ValueError("imported positions exceed available PAPER bankroll")
+        self.cash = usdc(self.cash - value)
+        book = self.market(slug, condition_id, asset, timeframe)
+        if book.closed and not book.resolved:
+            book.closed = False
+        lot = book.lot(outcome)
+        lot.shares = shares_q(lot.shares + qty)
+        lot.cost = usdc(lot.cost + value)
 
     def lock(self, order_id: str, amount: Decimal) -> bool:
         """Reserve collateral for a resting buy. Equity does not change."""

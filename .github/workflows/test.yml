@@ -12,7 +12,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install runtime dependencies
-        run: pip install -r requirements.txt
+      - name: Install runtime and test dependencies
+        run: pip install -r requirements.txt pytest
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Pytest regressions
+        run: python -m pytest -q

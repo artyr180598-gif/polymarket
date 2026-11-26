@@ -433,13 +433,18 @@ class CopyBook:
             return None
         kind = str(row.get("type") or "TRADE").upper()
         slug = str(row.get("slug") or "")
-        if not slug or not slug_allowed(slug, getattr(cfg, "copy_slug_prefixes", None)):
+        side = str(row.get("side") or "").upper()
+        in_scope = bool(slug) and slug_allowed(slug, getattr(cfg, "copy_slug_prefixes", None))
+        # A BTC-only experiment may still need to close imported ETH/SOL lots.
+        # Permit only reducing events outside the new-trade scope; never import
+        # fresh non-BTC BUYs or SPLITs into the PAPER account.
+        close_only = kind in ("MERGE", "REDEEM") or (kind == "TRADE" and side == "SELL")
+        if not in_scope and not close_only:
             self.bump("filtered")
             return None
         # Copy mode follows the target wallet's actual feed, not a static
         # asset allowlist: newly listed currencies and non-crypto markets are
         # eligible too, subject to market metadata, sizing and execution checks.
-        side = str(row.get("side") or "").upper()
         outcome = str(row.get("outcome") or "")
         if kind == "TRADE":
             if side not in ("BUY", "SELL") or not outcome:

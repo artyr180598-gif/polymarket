@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import math
+import random
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -60,6 +61,7 @@ COPY_API_ATTEMPTS = 3
 DATA_API = "https://data-api.polymarket.com"
 TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades",)
 ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity",)
+POSITIONS_ENDPOINT = f"{DATA_API}/v2/positions"
 
 
 class OrderBookNotFound(RuntimeError):
@@ -302,22 +304,49 @@ class Window:
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
-        self.ledger = Ledger(cfg.db_path)
+        # Only a requested destructive reset locks during construction;
+        # ordinary test/replay engines acquire the lifetime lock in start().
+        self.ledger = Ledger(cfg.db_path, acquire_process_lock=bool(cfg.paper_reset_id))
         # A reset request is a one-time, idempotent operation. The full DB is
         # backed up before PAPER rows and snapshots are cleared.
         # copy_wallet never sends a live order, even if TRADING_MODE=live.
         self.mode = "paper" if (not cfg.live_requested or cfg.strategy == "copy_wallet") else "live"
         if self.mode == "paper" and cfg.strategy == "copy_wallet" and cfg.paper_reset_id:
-            reset = self.ledger.backup_and_reset_paper_history(cfg.paper_reset_id)
-            if reset["reset"]:
-                log.info(
-                    "PAPER_HISTORY_RESET complete backup=%s cleared=%s reset_id=%s",
-                    reset["backup_path"], reset["counts"], cfg.paper_reset_id,
-                )
-            else:
-                log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
+            try:
+                reset = self.ledger.backup_and_reset_paper_history(cfg.paper_reset_id)
+                if reset["reset"]:
+                    log.info(
+                        "PAPER_HISTORY_RESET complete backup=%s cleared=%s reset_id=%s",
+                        reset["backup_path"], reset["counts"], cfg.paper_reset_id,
+                    )
+                else:
+                    log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
+            finally:
+                self.ledger.release_process_lock()
         self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
+        self._copy_reset_after_ts = self._copy_seed_after_ts
         saved = self.ledger.load_portfolio(self.mode)
+        self._copy_position_seed_at_by_slug: dict[str, float] = {}
+        self._copy_snapshot_at = 0.0
+        if isinstance(saved, dict):
+            try:
+                snapshot_at = float(saved.get("copy_snapshot_at") or 0.0)
+                if math.isfinite(snapshot_at) and snapshot_at > 0:
+                    self._copy_snapshot_at = snapshot_at
+            except (TypeError, ValueError):
+                pass
+            for slug, stamp in (saved.get("copy_position_seed_at_by_slug") or {}).items():
+                try:
+                    value = float(stamp)
+                except (TypeError, ValueError):
+                    continue
+                if slug and math.isfinite(value) and value > 0:
+                    self._copy_position_seed_at_by_slug[str(slug)] = value
+        self._fresh_account = saved is None
+        self._copy_positions_ready = not (
+            self.mode == "paper" and self.cfg.strategy == "copy_wallet"
+            and self._fresh_account and self.cfg.copy_import_positions
+        )
         self.consecutive_losses = 0
         self.manual_pause = False
         self.copy = CopyBook()
@@ -381,8 +410,22 @@ class TradingEngine:
         self._copy_last_lag = 0.0
         self._copy_detection_lag = 0.0
         self._copy_execution_lag = 0.0
+        self._copy_latency_samples: list[dict[str, float]] = []
+        if isinstance(stored_copy, dict):
+            for sample in (stored_copy.get("latency_samples") or [])[-1000:]:
+                if not isinstance(sample, dict):
+                    continue
+                try:
+                    values = {key: float(sample[key]) for key in ("detection", "execution", "total")}
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if all(math.isfinite(value) and value >= 0 for value in values.values()):
+                    self._copy_latency_samples.append(values)
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
+        self._copy_feed_started_at = 0.0
+        self._copy_feed_last_ok: dict[str, float] = {}
+        self._copy_feed_alerted: set[str] = set()
         # One clock for the latency-critical copy path. Tests freeze it; in
         # production it is wall time.
         self._clock: Callable[[], float] = time.time
@@ -430,6 +473,8 @@ class TradingEngine:
         latency-critical path down. The portfolio snapshot is small and is
         written immediately; ``copy`` state is flushed a few times a minute.
         """
+        if self.cfg.strategy == "copy_wallet" and self.cfg.copy_import_positions and not self._copy_positions_ready:
+            return
         try:
             self.ledger.save_portfolio(
                 self.mode,
@@ -437,6 +482,8 @@ class TradingEngine:
                     "portfolio": self.portfolio.to_dict(),
                     "consecutive_losses": self.consecutive_losses,
                     "manual_pause": self.manual_pause,
+                    "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                    "copy_snapshot_at": self._copy_snapshot_at,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -444,8 +491,15 @@ class TradingEngine:
         if copy:
             self._persist_copy()
 
+    def _copy_state_blob(self) -> dict:
+        blob = self.copy.to_dict()
+        blob["latency_samples"] = list(self._copy_latency_samples[-1000:])
+        return blob
+
     def _persist_copy(self, *, force: bool = False) -> None:
         if self.cfg.strategy != "copy_wallet":
+            return
+        if self.cfg.copy_import_positions and not self._copy_positions_ready:
             return
         now = time.monotonic()
         if not force and now - self._last_copy_persist < 20.0:
@@ -458,7 +512,7 @@ class TradingEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("persist copy pending: %s", exc)
         try:
-            self.ledger.save_copy(self.mode, self.copy.to_dict())
+            self.ledger.save_copy(self.mode, self._copy_state_blob())
             self._last_copy_persist = now
             self._copy_dirty = False
         except Exception as exc:  # noqa: BLE001
@@ -479,6 +533,7 @@ class TradingEngine:
             self._note("INFO", f"LEGACY_DB_DELETE {item.status}: {item.path}{detail}")
 
     async def start(self) -> None:
+        self.ledger.acquire_process_lock()
         self._delete_legacy_files()
         # Many short, parallel API calls: keep connections warm instead of a
         # new TLS handshake per poll. Latency here is the copy lag.
@@ -493,6 +548,23 @@ class TradingEngine:
             connector=connector,
             headers={"User-Agent": "PolyBot/2 copy-wallet"},
         )
+        self._copy_feed_started_at = time.monotonic()
+        if (
+            self.mode == "paper" and self.cfg.strategy == "copy_wallet"
+            and self._fresh_account and self.cfg.copy_import_positions
+        ):
+            if self.ledger.wallet_positions_imported(self.mode, self.cfg.copy_wallet):
+                self._copy_positions_ready = True
+            else:
+                self._copy_positions_ready = await self._import_wallet_positions()
+                if not self._copy_positions_ready:
+                    self.paused = True
+                    self._note(
+                        "ERROR",
+                        "Не удалось безопасно импортировать открытые позиции кошелька. "
+                        "Копирование не начнётся; снимок будет повторно запрошен при следующем старте.",
+                        notify=True,
+                    )
         if self.cfg.strategy == "copy_wallet":
             if not is_valid_wallet_address(self.cfg.copy_wallet):
                 self.paused = True
@@ -580,6 +652,7 @@ class TradingEngine:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        self.ledger.close()
 
     def pause(self) -> None:
         self.manual_pause = True
@@ -589,6 +662,9 @@ class TradingEngine:
         self._note("INFO", "Пауза. Новые заявки не ставятся.", notify=True)
 
     def resume(self) -> None:
+        if self.cfg.strategy == "copy_wallet" and not self._copy_positions_ready:
+            self._note("ERROR", "Возобновление отклонено: не завершён импорт открытых позиций кошелька.", notify=True)
+            return
         if self.cfg.strategy != "copy_wallet" and self.cfg.live_requested and not self.live.ready:
             self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
             return
@@ -1130,6 +1206,40 @@ class TradingEngine:
                 delay = max(delay, self._copy_backoff_until - time.monotonic())
             await asyncio.sleep(delay)
 
+    @classmethod
+    def _copy_event_order(cls, row: dict) -> tuple:
+        """Order same-block events by chain indexes when available.
+
+        If the public feeds omit indexes, use the expected wallet lifecycle:
+        SPLIT before fills, TRADE before MERGE, and REDEEM last. This is a
+        deterministic fallback, not a claim that the API exposes chain order.
+        """
+        def integer(*names: str) -> int:
+            for name in names:
+                value = row.get(name)
+                if value is None or value == "":
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        kind = str(row.get("type") or "TRADE").upper()
+        priority = {"SPLIT": 0, "TRADE": 1, "MERGE": 2, "REDEEM": 3}.get(kind, 4)
+        log_index_present = any(row.get(name) is not None for name in ("log_index", "logIndex"))
+        log_index = integer("log_index", "logIndex") if log_index_present else priority
+        sequence_id = integer("sequence_id", "sequenceId")
+        return (
+            cls._copy_row_timestamp(row),
+            sequence_id,
+            integer("block_number", "blockNumber"),
+            integer("transaction_index", "transactionIndex"),
+            str(row.get("transaction_hash") or row.get("transactionHash") or ""),
+            0 if log_index_present else 1,
+            log_index,
+        )
+
     @staticmethod
     def _copy_row_timestamp(row: dict) -> float:
         try:
@@ -1145,33 +1255,92 @@ class TradingEngine:
     def _seed_copy_stream(self, rows: list[dict], stream: str) -> tuple[int, list[dict]]:
         """Seed pre-reset events, but keep post-reset events for real copying."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0:
+        if cutoff <= 0 and not getattr(self, "_copy_position_seed_at_by_slug", {}) and not getattr(self, "_copy_snapshot_at", 0.0):
             old_rows, new_rows = rows, []
         else:
             old_rows, new_rows = [], []
             for row in rows:
-                stamp = self._copy_row_timestamp(row)
-                if stamp > cutoff:
+                if self._copy_row_timestamp(row) > self._copy_event_cutoff(row):
                     new_rows.append(row)
                 else:
                     old_rows.append(row)
         added = self.copy.seed(old_rows, cfg=self.cfg, stream=stream)
         return added, new_rows
 
+    def _copy_event_cutoff(self, row: dict) -> float:
+        """Combine reset time with the per-market snapshot watermark."""
+        reset_cutoff = float(getattr(self, "_copy_reset_after_ts", 0.0) or 0.0)
+        seed_cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
+        snapshot_at = float(getattr(self, "_copy_snapshot_at", 0.0) or 0.0)
+        position_map = getattr(self, "_copy_position_seed_at_by_slug", {}) or {}
+        slug = str(row.get("slug") or "")
+        outcome = str(row.get("outcome") or "")
+        if outcome:
+            key = f"{slug}|{outcome}"
+            position_cutoff = position_map.get(key)
+            if position_cutoff is None:
+                position_cutoff = snapshot_at or seed_cutoff
+        else:
+            market_cutoff = [
+                float(stamp or 0.0)
+                for key, stamp in position_map.items()
+                if key.startswith(f"{slug}|")
+            ]
+            position_cutoff = max(market_cutoff) if market_cutoff else (snapshot_at or seed_cutoff)
+        return max(reset_cutoff, float(position_cutoff or 0.0))
+
     def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
         """Reject pre-reset rows on every poll, including later API pages."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0:
+        if cutoff <= 0 and not self._copy_position_seed_at_by_slug and not self._copy_snapshot_at:
             return rows
         # A missing/invalid timestamp cannot be proven to belong to the new
         # PAPER run, so fail closed instead of replaying an unknown old fill.
         return [
             row for row in rows
-            if self._copy_row_timestamp(row) > cutoff
+            if self._copy_row_timestamp(row) > self._copy_event_cutoff(row)
         ]
+
+    def _check_copy_feed_health(
+        self,
+        trades_ok: bool | None,
+        activity_ok: bool | None,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Notify once on prolonged feed silence and once again on recovery."""
+        now = time.monotonic() if now is None else float(now)
+        checks = (
+            ("trades", trades_ok, float(self.cfg.copy_feed_stale_s)),
+            (
+                "activity",
+                activity_ok,
+                max(float(self.cfg.copy_feed_stale_s), 3.0 * float(self.cfg.copy_activity_poll_s)),
+            ),
+        )
+        for name, ok, threshold in checks:
+            if ok is None:
+                continue
+            if ok:
+                self._copy_feed_last_ok[name] = now
+                if name in self._copy_feed_alerted:
+                    self._copy_feed_alerted.discard(name)
+                    self._note("INFO", f"Лента кошелька {name} восстановилась.", notify=True)
+                continue
+            last_ok = self._copy_feed_last_ok.get(name, self._copy_feed_started_at or now)
+            if now - last_ok >= threshold and name not in self._copy_feed_alerted:
+                self._copy_feed_alerted.add(name)
+                self._note(
+                    "ERROR",
+                    f"Лента кошелька {name} не отвечает более {threshold:g} с. "
+                    "Новые события этой ленты могут задерживаться.",
+                    notify=True,
+                )
 
     async def _copy_wallet_tick(self) -> None:
         """Copy every new wallet event: trades, merges, splits and redeems."""
+        if not self._copy_positions_ready:
+            return
         if not is_valid_wallet_address(self.cfg.copy_wallet) or self._session is None:
             return
         now = self._clock()
@@ -1183,8 +1352,9 @@ class TradingEngine:
             self.ledger.save_copy_checkpoint(
                 self.mode,
                 {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
-                 "manual_pause": self.manual_pause},
-                self.copy.to_dict(), self.copy.pending_rows(),
+                 "manual_pause": self.manual_pause, "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                 "copy_snapshot_at": self._copy_snapshot_at},
+                self._copy_state_blob(), self.copy.pending_rows(),
             )
         monotonic_now = time.monotonic()
         # One complete trade feed is enough: takerOnly=false includes
@@ -1206,6 +1376,10 @@ class TradingEngine:
                 self._note_once(
                     "copy-feed-task", "ERROR", f"Лента кошелька: {outcome}", 20,
                 )
+        self._check_copy_feed_health(
+            trades is not None,
+            (activity is not None) if want_activity else None,
+        )
         if trades is None and activity is None:
             self.copy.bump("feed_errors")
             self._copy_backoff_until = time.monotonic() + 2.0
@@ -1259,10 +1433,7 @@ class TradingEngine:
 
         # Chronological order matters: the wallet's later fill may sell what
         # its earlier fill bought, and the carry must follow the same order.
-        incoming.sort(key=lambda row: (
-            self._copy_row_timestamp(row),
-            str(row.get("transaction_hash") or row.get("transactionHash") or ""),
-        ))
+        incoming.sort(key=self._copy_event_order)
         queued = 0
         for row in incoming:
             job = self.copy.observe(row, now=now, cfg=self.cfg)
@@ -1275,8 +1446,9 @@ class TradingEngine:
         self.ledger.save_copy_checkpoint(
             self.mode,
             {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
-             "manual_pause": self.manual_pause},
-            self.copy.to_dict(), self.copy.pending_rows(),
+             "manual_pause": self.manual_pause, "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+             "copy_snapshot_at": self._copy_snapshot_at},
+            self._copy_state_blob(), self.copy.pending_rows(),
         )
         self._last_copy_persist = time.monotonic()
 
@@ -1363,7 +1535,11 @@ class TradingEngine:
         # Ask the book and the metadata at the same time. Two sequential
         # round trips would put the fill a full RTT behind the wallet for no
         # reason: the token id is already in the wallet row.
-        if job.kind == "TRADE" and job.token_id and self._cached_book(job.token_id) is None:
+        if (
+            job.kind == "TRADE" and job.token_id
+            and int(getattr(self.cfg, "copy_exec_latency_ms", 0)) == 0
+            and self._cached_book(job.token_id) is None
+        ):
             self._book_task(job.token_id)
         window = await self._ensure_window(
             job.slug,
@@ -1490,7 +1666,16 @@ class TradingEngine:
         else:
             want = desired
         try:
-            bids, asks = await self._book_for(job.token_id)
+            latency_ms = int(getattr(self.cfg, "copy_exec_latency_ms", 0) or 0)
+            if latency_ms > 0:
+                # Do not use the signal-time prefetch: after the configured
+                # delay request a new public CLOB snapshot for simulated send time.
+                await asyncio.sleep(latency_ms / 1000.0)
+                self._book_cache.pop(job.token_id, None)
+                bids, asks = await self._book(job.token_id)
+                self._book_cache[job.token_id] = (bids, asks, time.monotonic())
+            else:
+                bids, asks = await self._book_for(job.token_id)
         except OrderBookNotFound as exc:
             # A 404 is a token/book lookup failure, not a transient network
             # timeout. Retrying the same event five times only adds latency.
@@ -1904,14 +2089,21 @@ class TradingEngine:
         detection_lag = max(0.0, job.detected_at - job.trade_ts) if job.trade_ts else 0.0
         execution_lag = max(0.0, float(now) - job.detected_at)
         total_lag = max(0.0, float(now) - job.trade_ts) if job.trade_ts else 0.0
+        self._copy_latency_samples.append({
+            "detection": detection_lag, "execution": execution_lag, "total": total_lag,
+        })
+        if len(self._copy_latency_samples) > 1000:
+            del self._copy_latency_samples[:-1000]
         # Commit the result and corresponding portfolio/copy snapshots in the
         # same transaction. The completed job must not reappear after restart.
-        copy_snapshot = self.copy.to_dict()
+        copy_snapshot = self._copy_state_blob()
         pending = [item for item in self.copy.pending_rows() if item.get("event_id") != job.event_id]
         copy_snapshot["jobs"] = pending
         checkpoint = {
             f"portfolio:{self.mode}": {"portfolio": self.portfolio.to_dict(),
-                "consecutive_losses": self.consecutive_losses, "manual_pause": self.manual_pause},
+                "consecutive_losses": self.consecutive_losses, "manual_pause": self.manual_pause,
+                "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                "copy_snapshot_at": self._copy_snapshot_at},
             f"copy:{self.mode}": copy_snapshot,
             f"copy_pending:{self.mode}": pending,
         }
@@ -2030,7 +2222,7 @@ class TradingEngine:
                     self._note_once(f"{label}-net", "ERROR", f"{label}: {exc}", 20)
                     return None
                 self._note_once(f"{label}-retry", "INFO", f"{label}: {exc}; повтор", 15)
-            await asyncio.sleep(retry_delay)
+            await asyncio.sleep(retry_delay * random.uniform(0.8, 1.2))
         return None
 
     @staticmethod
@@ -2227,6 +2419,155 @@ class TradingEngine:
                 60,
             )
         return [row for row in collected if is_target_wallet(row, self.cfg.copy_wallet)]
+
+    async def _fetch_wallet_positions(self) -> list[dict] | None:
+        """Fetch a complete, cursor-paginated opening snapshot of wallet positions.
+
+        A partial snapshot is never returned: importing only some pages would
+        make later SELL/MERGE/REDEEM events corrupt the opening account state.
+        """
+        if self._session is None or not is_valid_wallet_address(self.cfg.copy_wallet):
+            return None
+        rows: list[dict] = []
+        cursor = ""
+        for page_number in range(100):
+            params = {
+                "user": self.cfg.copy_wallet.lower(),
+                "status": "OPEN",
+                "filter_type": "TOKENS",
+                "filter_amount": "0.01",
+                "include_archived": "true",
+                "limit": "1000",
+                "_": str(time.time_ns() // 1_000_000),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._wallet_api_page(
+                POSITIONS_ENDPOINT, params, "Снимок открытых позиций",
+            )
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                return None
+            page = payload["data"]
+            if any(not isinstance(row, dict) for row in page):
+                return None
+            for row in page:
+                wallet = wallet_of(row)
+                if not wallet or wallet != self.cfg.copy_wallet.lower():
+                    self._note_once(
+                        "positions-wallet-mismatch", "ERROR",
+                        "Снимок позиций содержит строку без подтверждённого адреса целевого кошелька.",
+                        60,
+                    )
+                    return None
+            rows.extend(page)
+            next_cursor, has_more = self._page_cursor(payload)
+            if not has_more:
+                return rows
+            if not next_cursor or next_cursor == cursor:
+                self._note_once(
+                    "positions-cursor", "ERROR",
+                    "Снимок позиций неполный: API не вернул новый курсор.",
+                    60,
+                )
+                return None
+            cursor = next_cursor
+        self._note_once(
+            "positions-page-limit", "ERROR",
+            "Снимок позиций превышает безопасный лимит страниц; импорт отменён.",
+            60,
+        )
+        return None
+
+    async def _import_wallet_positions(self) -> bool:
+        """Import the wallet's current holdings once, at their snapshot value."""
+        rows = await self._fetch_wallet_positions()
+        if rows is None:
+            return False
+        imported = 0
+        total_value = _ZERO
+        snapshot_at = time.time()
+        parsed: list[tuple[str, str, str, str, str, Decimal, Decimal, float]] = []
+        try:
+            # Validate the entire snapshot before mutating the in-memory ledger.
+            for row in rows:
+                slug = str(row.get("slug") or "")
+                condition_id = str(row.get("condition_id") or "")
+                outcome = str(row.get("outcome") or "")
+                try:
+                    shares = D(row.get("current_size"))
+                    value = D(row.get("current_value"))
+                    last_event_at = float(row.get("last_event_at"))
+                except Exception as exc:
+                    raise ValueError("position quantity/value/last_event_at is missing") from exc
+                if (
+                    not shares.is_finite() or not value.is_finite()
+                    or shares <= 0 or value < 0
+                    or not math.isfinite(last_event_at) or last_event_at <= 0
+                ):
+                    raise ValueError("position quantity/value/last_event_at is invalid")
+                if not slug or not condition_id or not outcome:
+                    raise ValueError("position identity is incomplete")
+                if last_event_at > 1e11:
+                    last_event_at /= 1000.0
+                asset, timeframe = _asset_timeframe(slug)
+                parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at))
+            requested_opening_value = sum((item[6] for item in parsed), _ZERO)
+            if requested_opening_value > self.portfolio.cash:
+                raise ValueError(
+                    f"open positions value {requested_opening_value} exceeds "
+                    f"available PAPER bankroll {self.portfolio.cash}"
+                )
+            for slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at in parsed:
+                self.portfolio.import_open_position(
+                    slug=slug,
+                    condition_id=condition_id,
+                    asset=asset,
+                    timeframe=timeframe,
+                    outcome=outcome,
+                    shares=shares,
+                    current_value=value,
+                )
+                watermark_key = f"{slug}|{outcome}"
+                self._copy_position_seed_at_by_slug[watermark_key] = max(
+                    self._copy_position_seed_at_by_slug.get(watermark_key, 0.0), last_event_at,
+                )
+                imported += 1
+                total_value += value
+        except Exception as exc:
+            self._note_once(
+                "positions-import-invalid", "ERROR",
+                f"Импорт позиций отменён из-за неполной/некорректной строки: {exc}",
+                60,
+            )
+            return False
+        self._copy_snapshot_at = snapshot_at
+        summary = {
+            "wallet": self.cfg.copy_wallet.lower(),
+            "imported_positions": imported,
+            "opening_value_usdc": str(usdc(total_value)),
+            "imported_at": time.time(),
+            "basis": "current_value_at_snapshot; pre-snapshot PnL excluded",
+        }
+        self.ledger.save_wallet_positions_import(
+            self.mode,
+            self.cfg.copy_wallet,
+            {
+                "portfolio": self.portfolio.to_dict(),
+                "consecutive_losses": self.consecutive_losses,
+                "manual_pause": self.manual_pause,
+                "copy": self._copy_state_blob(),
+                "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                "copy_snapshot_at": self._copy_snapshot_at,
+            },
+            summary,
+        )
+        self._note(
+            "INFO",
+            f"Открытые позиции кошелька импортированы: {imported} шт. · "
+            "текущая стоимость $" + str(usdc(total_value)) + " · прошлый PnL исключён из новой истории.",
+            notify=True,
+        )
+        return True
 
     async def _fetch_wallet_trades(self, taker_only: bool | None = None) -> list[dict] | None:
         """Fetch the complete wallet fill feed exactly once.
@@ -2921,6 +3262,8 @@ class TradingEngine:
             await asyncio.sleep(15)
 
     def _housekeep_once(self) -> None:
+        if self.cfg.strategy == "copy_wallet" and self.cfg.copy_import_positions and not self._copy_positions_ready:
+            return
         now = time.time()
         if now - self._last_equity_ts > 30:
             try:
@@ -2968,6 +3311,16 @@ class TradingEngine:
         dropped = self.portfolio.prune_closed(max_age_s=3 * 86400)
         if dropped:
             self._persist(copy=False)
+
+    def _latency_percentile(self, metric: str, percentile: float) -> float | None:
+        values = sorted(
+            sample[metric] for sample in self._copy_latency_samples
+            if metric in sample and math.isfinite(sample[metric])
+        )
+        if not values:
+            return None
+        index = max(0, min(len(values) - 1, math.ceil(percentile * len(values)) - 1))
+        return round(values[index], 3)
 
     def snapshot(self) -> dict[str, Any]:
         equity = self.portfolio.equity(self.marks)
@@ -3077,6 +3430,14 @@ class TradingEngine:
                     "last_detection_lag_s": round(self._copy_detection_lag, 3),
                     "last_execution_lag_s": round(self._copy_execution_lag, 3),
                     "last_event_at": self._copy_last_seen_at,
+                    "latency_percentiles": {
+                        name: {
+                            "p50": self._latency_percentile(name, 0.50),
+                            "p95": self._latency_percentile(name, 0.95),
+                        }
+                        for name in ("detection", "execution", "total")
+                    },
+                    "exec_latency_ms": int(getattr(self.cfg, "copy_exec_latency_ms", 0)),
                     "window_cap_usd": self.cfg.copy_window_cap_usd,
                     "exposure_cap_usd": self.cfg.copy_exposure_cap_usd,
                 }
@@ -3099,13 +3460,9 @@ class TradingEngine:
             "taker_rebates": str(self.portfolio.taker_rebates),
             "liquidity_rewards": str(self.portfolio.liquidity_rewards),
             "edge": edge,
-            "wallet_edge": [
-                {"label": "июль–август 2026", "roi": "4.1%"},
-                {"label": "сентябрь 2026", "roi": "3.3%"},
-                {"label": "октябрь 2026", "roi": "2.6%"},
-                {"label": "ноябрь 2026", "roi": "2.4%"},
-                {"label": "последние 14 дней", "roi": "1.9%"},
-            ],
+            # Never display hard-coded target-wallet returns. Historical wallet
+            # PnL is not derivable from the current public trade tape alone.
+            "wallet_edge": [],
             "exposure": str(self.portfolio.exposure_cost()),
             "consecutive_losses": self.consecutive_losses,
             "stats": stats,
