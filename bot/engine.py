@@ -479,6 +479,7 @@ class TradingEngine:
             self._note("INFO", f"LEGACY_DB_DELETE {item.status}: {item.path}{detail}")
 
     async def start(self) -> None:
+        self.ledger.acquire_process_lock()
         self._delete_legacy_files()
         # Many short, parallel API calls: keep connections warm instead of a
         # new TLS handshake per poll. Latency here is the copy lag.
@@ -580,6 +581,7 @@ class TradingEngine:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        self.ledger.close()
 
     def pause(self) -> None:
         self.manual_pause = True
