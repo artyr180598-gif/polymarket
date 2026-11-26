@@ -2484,9 +2484,11 @@ class TradingEngine:
         if rows is None:
             return False
         imported = 0
+        redeemable_count = 0
         total_value = _ZERO
+        redeemed_value = _ZERO
         snapshot_at = time.time()
-        parsed: list[tuple[str, str, str, str, str, Decimal, Decimal, float]] = []
+        parsed: list[tuple[str, str, str, str, str, Decimal, Decimal, float, bool]] = []
         try:
             # Validate the entire snapshot before mutating the in-memory ledger.
             for row in rows:
@@ -2499,6 +2501,12 @@ class TradingEngine:
                     last_event_at = float(row.get("last_event_at"))
                 except Exception as exc:
                     raise ValueError("position quantity/value/last_event_at is missing") from exc
+                redeemable_raw = row.get("redeemable")
+                redeemable = (
+                    redeemable_raw is True
+                    or str(redeemable_raw).strip().lower() in ("true", "1", "yes")
+                    or str(row.get("status") or "").upper() == "REDEEMABLE"
+                )
                 if (
                     not shares.is_finite() or not value.is_finite()
                     or shares <= 0 or value < 0
@@ -2510,14 +2518,20 @@ class TradingEngine:
                 if last_event_at > 1e11:
                     last_event_at /= 1000.0
                 asset, timeframe = _asset_timeframe(slug)
-                parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at))
+                parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at, redeemable))
+            # Outcomes in one binary market must agree on settlement state.
+            settlement_by_slug: dict[str, set[bool]] = {}
+            for slug, _, _, _, _, _, _, _, redeemable in parsed:
+                settlement_by_slug.setdefault(slug, set()).add(redeemable)
+            if any(len(states) > 1 for states in settlement_by_slug.values()):
+                raise ValueError("market has inconsistent redeemable flags across outcomes")
             requested_opening_value = sum((item[6] for item in parsed), _ZERO)
             if requested_opening_value > self.portfolio.cash:
                 raise ValueError(
                     f"open positions value {requested_opening_value} exceeds "
                     f"available PAPER bankroll {self.portfolio.cash}"
                 )
-            for slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at in parsed:
+            for slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at, redeemable in parsed:
                 self.portfolio.import_open_position(
                     slug=slug,
                     condition_id=condition_id,
@@ -2533,6 +2547,20 @@ class TradingEngine:
                 )
                 imported += 1
                 total_value += value
+            # The OPEN book also contains settled-but-unredeemed positions.
+            # Move those to cash at the API's exact current payout mark so
+            # stale resolved windows do not remain as fictitious open exposure.
+            for slug, _, _, _, outcome, shares, value, _, redeemable in parsed:
+                if not redeemable:
+                    continue
+                payout_per_share = value / shares
+                if not payout_per_share.is_finite() or payout_per_share < 0 or payout_per_share > 1:
+                    raise ValueError("redeemable position has an invalid payout per share")
+                self.portfolio.redeem_outcome(
+                    slug, outcome, shares, payout_per_share,
+                )
+                redeemable_count += 1
+                redeemed_value += value
         except Exception as exc:
             self._note_once(
                 "positions-import-invalid", "ERROR",
@@ -2545,6 +2573,8 @@ class TradingEngine:
             "wallet": self.cfg.copy_wallet.lower(),
             "imported_positions": imported,
             "opening_value_usdc": str(usdc(total_value)),
+            "redeemable_positions_settled": redeemable_count,
+            "redeemed_value_usdc": str(usdc(redeemed_value)),
             "imported_at": time.time(),
             "basis": "current_value_at_snapshot; pre-snapshot PnL excluded",
         }
@@ -2564,7 +2594,8 @@ class TradingEngine:
         self._note(
             "INFO",
             f"Открытые позиции кошелька импортированы: {imported} шт. · "
-            "текущая стоимость $" + str(usdc(total_value)) + " · прошлый PnL исключён из новой истории.",
+            f"стоимость снимка ${usdc(total_value)} · уже погашено {redeemable_count} позиций "
+            f"на ${usdc(redeemed_value)} · прошлый PnL исключён из новой истории.",
             notify=True,
         )
         return True
