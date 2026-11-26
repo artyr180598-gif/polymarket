@@ -324,6 +324,7 @@ class TradingEngine:
             finally:
                 self.ledger.release_process_lock()
         self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
+        self._copy_reset_after_ts = self._copy_seed_after_ts
         saved = self.ledger.load_portfolio(self.mode)
         self._copy_position_seed_at_by_slug: dict[str, float] = {}
         self._copy_snapshot_at = 0.0
@@ -1220,7 +1221,7 @@ class TradingEngine:
     def _seed_copy_stream(self, rows: list[dict], stream: str) -> tuple[int, list[dict]]:
         """Seed pre-reset events, but keep post-reset events for real copying."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0 and not self._copy_position_seed_at_by_slug:
+        if cutoff <= 0 and not self._copy_position_seed_at_by_slug and not self._copy_snapshot_at:
             old_rows, new_rows = rows, []
         else:
             old_rows, new_rows = [], []
@@ -1234,27 +1235,28 @@ class TradingEngine:
 
     def _copy_event_cutoff(self, row: dict) -> float:
         """Combine reset time with the per-market snapshot watermark."""
-        global_cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
+        reset_cutoff = float(getattr(self, "_copy_reset_after_ts", 0.0) or 0.0)
+        seed_cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
         slug = str(row.get("slug") or "")
         outcome = str(row.get("outcome") or "")
         if outcome:
             key = f"{slug}|{outcome}"
             position_cutoff = self._copy_position_seed_at_by_slug.get(key)
             if position_cutoff is None:
-                position_cutoff = self._copy_snapshot_at
+                position_cutoff = self._copy_snapshot_at or seed_cutoff
         else:
             market_cutoff = [
                 float(stamp or 0.0)
                 for key, stamp in self._copy_position_seed_at_by_slug.items()
                 if key.startswith(f"{slug}|")
             ]
-            position_cutoff = max(market_cutoff) if market_cutoff else self._copy_snapshot_at
-        return max(global_cutoff, float(position_cutoff or 0.0))
+            position_cutoff = max(market_cutoff) if market_cutoff else (self._copy_snapshot_at or seed_cutoff)
+        return max(reset_cutoff, float(position_cutoff or 0.0))
 
     def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
         """Reject pre-reset rows on every poll, including later API pages."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0 and not self._copy_position_seed_at_by_slug:
+        if cutoff <= 0 and not self._copy_position_seed_at_by_slug and not self._copy_snapshot_at:
             return rows
         # A missing/invalid timestamp cannot be proven to belong to the new
         # PAPER run, so fail closed instead of replaying an unknown old fill.
@@ -1314,7 +1316,8 @@ class TradingEngine:
             self.ledger.save_copy_checkpoint(
                 self.mode,
                 {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
-                 "manual_pause": self.manual_pause, "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug},
+                 "manual_pause": self.manual_pause, "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                 "copy_snapshot_at": self._copy_snapshot_at},
                 self._copy_state_blob(), self.copy.pending_rows(),
             )
         monotonic_now = time.monotonic()
@@ -2065,7 +2068,8 @@ class TradingEngine:
         checkpoint = {
             f"portfolio:{self.mode}": {"portfolio": self.portfolio.to_dict(),
                 "consecutive_losses": self.consecutive_losses, "manual_pause": self.manual_pause,
-                "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug},
+                "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                "copy_snapshot_at": self._copy_snapshot_at},
             f"copy:{self.mode}": copy_snapshot,
             f"copy_pending:{self.mode}": pending,
         }
