@@ -335,6 +335,27 @@ class Ledger:
             [row[name] for name in columns],
         )
 
+    def wallet_positions_imported(self, mode: str, wallet: str) -> bool:
+        key = f"wallet_positions_imported:{mode}:{wallet.lower()}"
+        with self._lock:
+            row = self.conn.execute("SELECT v FROM kv WHERE k = ?", (key,)).fetchone()
+        return bool(row)
+
+    def save_wallet_positions_import(
+        self, mode: str, wallet: str, portfolio: dict, summary: dict[str, Any]
+    ) -> None:
+        """Commit the opening portfolio and its import marker atomically."""
+        key = f"wallet_positions_imported:{mode}:{wallet.lower()}"
+        with self._lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (f"portfolio:{mode}", json.dumps(portfolio, ensure_ascii=False)),
+            )
+            self.conn.execute(
+                "INSERT INTO kv(k, v) VALUES(?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (key, json.dumps(summary, ensure_ascii=False)),
+            )
+
     def save_portfolio(self, mode: str, blob: dict) -> None:
         with self._lock:
             self.conn.execute(
