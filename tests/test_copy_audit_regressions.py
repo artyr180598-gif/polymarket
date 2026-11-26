@@ -152,3 +152,18 @@ def test_latency_percentiles_are_calculated_without_fabricated_samples(tmp_path)
     assert engine._latency_percentile("detection", 0.50) == 3.0
     assert engine._latency_percentile("execution", 0.95) == 6.0
     assert engine._latency_percentile("total", 0.95) == 11.0
+
+
+def test_engine_acquires_process_lock_before_ledger_load(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    db_path = str(tmp_path / "engine-owner.db")
+    engine = TradingEngine(BotConfig(db_path=db_path, strategy="copy_wallet"))
+    other = Ledger(db_path)
+    try:
+        with pytest.raises(RuntimeError, match="another PolyBot process"):
+            other.acquire_process_lock()
+    finally:
+        engine.ledger.close()
+        other.close()
