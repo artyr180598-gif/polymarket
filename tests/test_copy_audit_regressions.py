@@ -306,6 +306,8 @@ def test_wallet_position_import_commits_opening_equity_once(tmp_path):
         assert engine.ledger.wallet_positions_imported("paper", DEFAULT_WALLET)
         saved = engine.ledger.load_portfolio("paper")
         assert saved["portfolio"]["initial_cash"] == "2754.250000"
+        assert saved["copy_snapshot_at"] > 0
+        assert saved["copy_position_seed_at_by_slug"]["eth-updown-5m-1795266600|Up"] == 1795266601
     finally:
         engine.ledger.close()
 
@@ -329,7 +331,7 @@ def test_incomplete_wallet_position_snapshot_does_not_partially_import(tmp_path)
                 "outcome": "Up",
                 "current_size": 10,
                 "current_value": 4.25,
-            "last_event_at": 1795266601,
+                "last_event_at": 1795266601,
             },
             {
                 "proxy_wallet": DEFAULT_WALLET,
@@ -396,13 +398,15 @@ def test_copy_event_cutoff_uses_per_market_position_watermark(tmp_path):
 
     engine = TradingEngine(BotConfig(db_path=str(tmp_path / "market-watermark.db")))
     engine._copy_seed_after_ts = 100.0
+    engine._copy_reset_after_ts = 100.0
+    engine._copy_snapshot_at = 200.0
     engine._copy_position_seed_at_by_slug = {"eth-updown-5m-1795266600|Up": 150.0}
     try:
         eth = {"slug": "eth-updown-5m-1795266600"}
         sol = {"slug": "sol-updown-5m-1795266600"}
         assert engine._copy_event_cutoff({**eth, "outcome": "Up"}) == 150.0
-        assert engine._copy_event_cutoff({**eth, "outcome": "Down"}) == 100.0
-        assert engine._copy_event_cutoff(sol) == 100.0
+        assert engine._copy_event_cutoff({**eth, "outcome": "Down"}) == 200.0
+        assert engine._copy_event_cutoff(sol) == 200.0
         assert engine._copy_rows_after_reset([
             {**eth, "outcome": "Up", "timestamp": 125},
             {**eth, "outcome": "Up", "timestamp": 151},
