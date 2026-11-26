@@ -178,7 +178,10 @@ function copyCard(s){
     ["Не копируется", (n.unsupported || 0) + " тип · " + (n.filtered || 0) + " вне фильтра"],
     ["Ошибки ленты", String(n.feed_errors || 0)],
     ["В очереди", String(c.pending || 0)],
-    ["Задержка", (c.last_lag_s || 0) + " с"],
+    ["Задержка обнаружения p50 / p95", (c.latency_percentiles?.detection?.p50 ?? "—") + " / " + (c.latency_percentiles?.detection?.p95 ?? "—") + " с"],
+    ["Задержка исполнения p50 / p95", (c.latency_percentiles?.execution?.p50 ?? "—") + " / " + (c.latency_percentiles?.execution?.p95 ?? "—") + " с"],
+    ["Общая задержка p50 / p95", (c.latency_percentiles?.total?.p50 ?? "—") + " / " + (c.latency_percentiles?.total?.p95 ?? "—") + " с"],
+    ["Искусственная задержка", (c.exec_latency_ms || 0) + " мс"],
   ].map(function (pair) { return '<div class="row"><span>'+pair[0]+'</span><span>'+pair[1]+'</span></div>'; }).join("");
   return card("Копирование кошелька", bits);
 }
