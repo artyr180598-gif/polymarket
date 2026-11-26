@@ -325,6 +325,15 @@ class TradingEngine:
                 self.ledger.release_process_lock()
         self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
         saved = self.ledger.load_portfolio(self.mode)
+        self._copy_position_seed_at_by_slug: dict[str, float] = {}
+        if isinstance(saved, dict):
+            for slug, stamp in (saved.get("copy_position_seed_at_by_slug") or {}).items():
+                try:
+                    value = float(stamp)
+                except (TypeError, ValueError):
+                    continue
+                if slug and math.isfinite(value) and value > 0:
+                    self._copy_position_seed_at_by_slug[str(slug)] = value
         self._fresh_account = saved is None
         self._copy_positions_ready = not (
             self.mode == "paper" and self.cfg.strategy == "copy_wallet"
@@ -1202,29 +1211,35 @@ class TradingEngine:
     def _seed_copy_stream(self, rows: list[dict], stream: str) -> tuple[int, list[dict]]:
         """Seed pre-reset events, but keep post-reset events for real copying."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0:
+        if cutoff <= 0 and not self._copy_position_seed_at_by_slug:
             old_rows, new_rows = rows, []
         else:
             old_rows, new_rows = [], []
             for row in rows:
-                stamp = self._copy_row_timestamp(row)
-                if stamp > cutoff:
+                if self._copy_row_timestamp(row) > self._copy_event_cutoff(row):
                     new_rows.append(row)
                 else:
                     old_rows.append(row)
         added = self.copy.seed(old_rows, cfg=self.cfg, stream=stream)
         return added, new_rows
 
+    def _copy_event_cutoff(self, row: dict) -> float:
+        """Combine reset time with the per-market snapshot watermark."""
+        global_cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
+        slug = str(row.get("slug") or "")
+        position_cutoff = float(self._copy_position_seed_at_by_slug.get(slug, 0.0) or 0.0)
+        return max(global_cutoff, position_cutoff)
+
     def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
         """Reject pre-reset rows on every poll, including later API pages."""
         cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
-        if cutoff <= 0:
+        if cutoff <= 0 and not self._copy_position_seed_at_by_slug:
             return rows
         # A missing/invalid timestamp cannot be proven to belong to the new
         # PAPER run, so fail closed instead of replaying an unknown old fill.
         return [
             row for row in rows
-            if self._copy_row_timestamp(row) > cutoff
+            if self._copy_row_timestamp(row) > self._copy_event_cutoff(row)
         ]
 
     def _check_copy_feed_health(
@@ -2420,15 +2435,22 @@ class TradingEngine:
                 try:
                     shares = D(row.get("current_size"))
                     value = D(row.get("current_value"))
+                    last_event_at = float(row.get("last_event_at"))
                 except Exception as exc:
-                    raise ValueError("position quantity/value is missing") from exc
-                if not shares.is_finite() or not value.is_finite() or shares <= 0 or value < 0:
-                    raise ValueError("position quantity/value is invalid")
+                    raise ValueError("position quantity/value/last_event_at is missing") from exc
+                if (
+                    not shares.is_finite() or not value.is_finite()
+                    or shares <= 0 or value < 0
+                    or not math.isfinite(last_event_at) or last_event_at <= 0
+                ):
+                    raise ValueError("position quantity/value/last_event_at is invalid")
                 if not slug or not condition_id or not outcome:
                     raise ValueError("position identity is incomplete")
+                if last_event_at > 1e11:
+                    last_event_at /= 1000.0
                 asset, timeframe = _asset_timeframe(slug)
-                parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value))
-            for slug, condition_id, asset, timeframe, outcome, shares, value in parsed:
+                parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at))
+            for slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at in parsed:
                 self.portfolio.import_open_position(
                     slug=slug,
                     condition_id=condition_id,
@@ -2437,6 +2459,9 @@ class TradingEngine:
                     outcome=outcome,
                     shares=shares,
                     current_value=value,
+                )
+                self._copy_position_seed_at_by_slug[slug] = max(
+                    self._copy_position_seed_at_by_slug.get(slug, 0.0), last_event_at,
                 )
                 imported += 1
                 total_value += value
@@ -2462,6 +2487,7 @@ class TradingEngine:
                 "consecutive_losses": self.consecutive_losses,
                 "manual_pause": self.manual_pause,
                 "copy": self._copy_state_blob(),
+                "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
             },
             summary,
         )
