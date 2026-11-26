@@ -687,6 +687,10 @@ class WalletApiTests(unittest.TestCase):
 
 
 class TapeReplayTests(unittest.TestCase):
+    @unittest.skipUnless(
+        os.getenv("POLYBOT_RUN_NETWORK_TESTS") == "1",
+        "live Data API replay is opt-in; default test suite must run offline",
+    )
     def test_last_six_hours_are_the_wallets_own_rows(self) -> None:
         """Tape-approximated: real trades, no historical book, so no fill prices."""
         now = time.time()
