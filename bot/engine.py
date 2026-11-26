@@ -474,6 +474,7 @@ class TradingEngine:
                     "portfolio": self.portfolio.to_dict(),
                     "consecutive_losses": self.consecutive_losses,
                     "manual_pause": self.manual_pause,
+                    "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
                 },
             )
         except Exception as exc:  # noqa: BLE001
