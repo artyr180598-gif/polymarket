@@ -1207,6 +1207,38 @@ class TradingEngine:
             await asyncio.sleep(delay)
 
     @staticmethod
+    @classmethod
+    def _copy_event_order(cls, row: dict) -> tuple:
+        """Order same-block events by chain indexes when available.
+
+        If the public feeds omit indexes, use the expected wallet lifecycle:
+        SPLIT before fills, TRADE before MERGE, and REDEEM last. This is a
+        deterministic fallback, not a claim that the API exposes chain order.
+        """
+        def integer(*names: str) -> int:
+            for name in names:
+                value = row.get(name)
+                if value is None or value == "":
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+            return 0
+
+        kind = str(row.get("type") or "TRADE").upper()
+        priority = {"SPLIT": 0, "TRADE": 1, "MERGE": 2, "REDEEM": 3}.get(kind, 4)
+        log_index_present = any(row.get(name) is not None for name in ("log_index", "logIndex"))
+        log_index = integer("log_index", "logIndex") if log_index_present else priority
+        return (
+            cls._copy_row_timestamp(row),
+            integer("block_number", "blockNumber"),
+            integer("transaction_index", "transactionIndex"),
+            str(row.get("transaction_hash") or row.get("transactionHash") or ""),
+            0 if log_index_present else 1,
+            log_index,
+        )
+
     def _copy_row_timestamp(row: dict) -> float:
         try:
             stamp = float(row.get("timestamp") or 0)
@@ -1399,10 +1431,7 @@ class TradingEngine:
 
         # Chronological order matters: the wallet's later fill may sell what
         # its earlier fill bought, and the carry must follow the same order.
-        incoming.sort(key=lambda row: (
-            self._copy_row_timestamp(row),
-            str(row.get("transaction_hash") or row.get("transactionHash") or ""),
-        ))
+        incoming.sort(key=self._copy_event_order)
         queued = 0
         for row in incoming:
             job = self.copy.observe(row, now=now, cfg=self.cfg)
