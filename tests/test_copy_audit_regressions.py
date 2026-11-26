@@ -441,3 +441,32 @@ def test_cross_feed_events_use_chain_order_then_lifecycle_fallback(tmp_path):
         assert [row["type"] for row in sorted(indexed, key=engine._copy_event_order)] == ["TRADE", "MERGE"]
     finally:
         engine.ledger.close()
+
+
+def test_cross_feed_order_uses_data_api_sequence_id_before_fallback():
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig())
+    split = {"timestamp": 1795266600, "sequence_id": 10, "type": "SPLIT"}
+    trade = {"timestamp": 1795266600, "sequence_id": 11, "type": "TRADE"}
+    merge = {"timestamp": 1795266600, "sequence_id": 12, "type": "MERGE"}
+    assert sorted([merge, trade, split], key=engine._copy_event_order) == [split, trade, merge]
+    engine.ledger.close()
+
+
+def test_cross_feed_order_falls_back_to_lifecycle_when_sequence_missing():
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig())
+    rows = [
+        {"timestamp": 1795266600, "type": "REDEEM"},
+        {"timestamp": 1795266600, "type": "MERGE"},
+        {"timestamp": 1795266600, "type": "TRADE"},
+        {"timestamp": 1795266600, "type": "SPLIT"},
+    ]
+    assert [r["type"] for r in sorted(rows, key=engine._copy_event_order)] == [
+        "SPLIT", "TRADE", "MERGE", "REDEEM"
+    ]
+    engine.ledger.close()
