@@ -406,6 +406,9 @@ class TradingEngine:
                     self._copy_latency_samples.append(values)
         self._copy_last_seen_at = 0.0
         self._copy_backoff_until = 0.0
+        self._copy_feed_started_at = 0.0
+        self._copy_feed_last_ok: dict[str, float] = {}
+        self._copy_feed_alerted: set[str] = set()
         # One clock for the latency-critical copy path. Tests freeze it; in
         # production it is wall time.
         self._clock: Callable[[], float] = time.time
@@ -526,6 +529,7 @@ class TradingEngine:
             connector=connector,
             headers={"User-Agent": "PolyBot/2 copy-wallet"},
         )
+        self._copy_feed_started_at = time.monotonic()
         if (
             self.mode == "paper" and self.cfg.strategy == "copy_wallet"
             and self._fresh_account and self.cfg.copy_import_positions
@@ -1223,6 +1227,42 @@ class TradingEngine:
             if self._copy_row_timestamp(row) > cutoff
         ]
 
+    def _check_copy_feed_health(
+        self,
+        trades_ok: bool | None,
+        activity_ok: bool | None,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Notify once on prolonged feed silence and once again on recovery."""
+        now = time.monotonic() if now is None else float(now)
+        checks = (
+            ("trades", trades_ok, float(self.cfg.copy_feed_stale_s)),
+            (
+                "activity",
+                activity_ok,
+                max(float(self.cfg.copy_feed_stale_s), 3.0 * float(self.cfg.copy_activity_poll_s)),
+            ),
+        )
+        for name, ok, threshold in checks:
+            if ok is None:
+                continue
+            if ok:
+                self._copy_feed_last_ok[name] = now
+                if name in self._copy_feed_alerted:
+                    self._copy_feed_alerted.discard(name)
+                    self._note("INFO", f"Лента кошелька {name} восстановилась.", notify=True)
+                continue
+            last_ok = self._copy_feed_last_ok.get(name, self._copy_feed_started_at or now)
+            if now - last_ok >= threshold and name not in self._copy_feed_alerted:
+                self._copy_feed_alerted.add(name)
+                self._note(
+                    "ERROR",
+                    f"Лента кошелька {name} не отвечает более {threshold:g} с. "
+                    "Новые события этой ленты могут задерживаться.",
+                    notify=True,
+                )
+
     async def _copy_wallet_tick(self) -> None:
         """Copy every new wallet event: trades, merges, splits and redeems."""
         if not self._copy_positions_ready:
@@ -1261,6 +1301,10 @@ class TradingEngine:
                 self._note_once(
                     "copy-feed-task", "ERROR", f"Лента кошелька: {outcome}", 20,
                 )
+        self._check_copy_feed_health(
+            trades is not None,
+            (activity is not None) if want_activity else None,
+        )
         if trades is None and activity is None:
             self.copy.bump("feed_errors")
             self._copy_backoff_until = time.monotonic() + 2.0
