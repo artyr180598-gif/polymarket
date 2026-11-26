@@ -303,7 +303,7 @@ class Window:
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
-        self.ledger = Ledger(cfg.db_path)
+        self.ledger = Ledger(cfg.db_path, acquire_process_lock=True)
         # A reset request is a one-time, idempotent operation. The full DB is
         # backed up before PAPER rows and snapshots are cleared.
         # copy_wallet never sends a live order, even if TRADING_MODE=live.
