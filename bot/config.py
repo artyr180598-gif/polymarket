@@ -117,6 +117,8 @@ class BotConfig:
     # Legacy setting; wallet-copy fills are no longer artificially delayed.
     copy_delay_s: float = 0.0
     copy_max_slip: float = 0.03
+    # Artificial delay between observing a wallet fill and requesting a fresh book.
+    copy_exec_latency_ms: int = 0
     # Slug prefixes such as "btc-updown-5m,eth-updown". Empty = all markets.
     copy_slug_prefixes: list[str] = field(default_factory=list)
     # Seconds between wallet-feed polls. 0.5 keeps our lag near the data API.
@@ -258,6 +260,7 @@ class BotConfig:
             copy_scale_auto=scale_auto,
             copy_delay_s=_float("COPY_DELAY_S", 0.0, 0.0),
             copy_max_slip=_float("COPY_MAX_SLIP", 0.03, 0.0, 0.50),
+            copy_exec_latency_ms=_int("COPY_EXEC_LATENCY_MS", 0, 0, 30000),
             copy_slug_prefixes=prefixes,
             copy_poll_s=_float("COPY_POLL_S", 0.5, 0.2, 10.0),
             copy_activity_poll_s=_float("COPY_ACTIVITY_POLL_S", 0.5, 0.2, 120.0),
