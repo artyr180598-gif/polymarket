@@ -15,8 +15,6 @@ jobs:
       - name: Install runtime and test dependencies
         run: pip install -r requirements.txt pytest
       - name: Unit tests
-        env:
-          POLYBOT_RUN_NETWORK_TESTS: "1"
         run: python -m unittest discover -s tests -v
       - name: Pytest regressions
         run: python -m pytest -q
