@@ -61,6 +61,7 @@ COPY_API_ATTEMPTS = 3
 DATA_API = "https://data-api.polymarket.com"
 TRADE_ENDPOINTS = (f"{DATA_API}/v2/trades",)
 ACTIVITY_ENDPOINTS = (f"{DATA_API}/v2/activity",)
+POSITIONS_ENDPOINT = f"{DATA_API}/v2/positions"
 
 
 class OrderBookNotFound(RuntimeError):
@@ -319,6 +320,11 @@ class TradingEngine:
                 log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
         self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
         saved = self.ledger.load_portfolio(self.mode)
+        self._fresh_account = saved is None
+        self._copy_positions_ready = not (
+            self.mode == "paper" and self.cfg.strategy == "copy_wallet"
+            and self._fresh_account and self.cfg.copy_import_positions
+        )
         self.consecutive_losses = 0
         self.manual_pause = False
         self.copy = CopyBook()
@@ -496,6 +502,22 @@ class TradingEngine:
             connector=connector,
             headers={"User-Agent": "PolyBot/2 copy-wallet"},
         )
+        if (
+            self.mode == "paper" and self.cfg.strategy == "copy_wallet"
+            and self._fresh_account and self.cfg.copy_import_positions
+        ):
+            if self.ledger.wallet_positions_imported(self.mode, self.cfg.copy_wallet):
+                self._copy_positions_ready = True
+            else:
+                self._copy_positions_ready = await self._import_wallet_positions()
+                if not self._copy_positions_ready:
+                    self.paused = True
+                    self._note(
+                        "ERROR",
+                        "Не удалось безопасно импортировать открытые позиции кошелька. "
+                        "Копирование не начнётся; снимок будет повторно запрошен при следующем старте.",
+                        notify=True,
+                    )
         if self.cfg.strategy == "copy_wallet":
             if not is_valid_wallet_address(self.cfg.copy_wallet):
                 self.paused = True
@@ -593,6 +615,9 @@ class TradingEngine:
         self._note("INFO", "Пауза. Новые заявки не ставятся.", notify=True)
 
     def resume(self) -> None:
+        if self.cfg.strategy == "copy_wallet" and not self._copy_positions_ready:
+            self._note("ERROR", "Возобновление отклонено: не завершён импорт открытых позиций кошелька.", notify=True)
+            return
         if self.cfg.strategy != "copy_wallet" and self.cfg.live_requested and not self.live.ready:
             self._note("ERROR", self.live.block_reason or "LIVE не готов, резюме отклонено", notify=True)
             return
@@ -1176,6 +1201,8 @@ class TradingEngine:
 
     async def _copy_wallet_tick(self) -> None:
         """Copy every new wallet event: trades, merges, splits and redeems."""
+        if not self._copy_positions_ready:
+            return
         if not is_valid_wallet_address(self.cfg.copy_wallet) or self._session is None:
             return
         now = self._clock()
@@ -2249,6 +2276,130 @@ class TradingEngine:
                 60,
             )
         return [row for row in collected if is_target_wallet(row, self.cfg.copy_wallet)]
+
+    async def _fetch_wallet_positions(self) -> list[dict] | None:
+        """Fetch a complete, cursor-paginated opening snapshot of wallet positions.
+
+        A partial snapshot is never returned: importing only some pages would
+        make later SELL/MERGE/REDEEM events corrupt the opening account state.
+        """
+        if self._session is None or not is_valid_wallet_address(self.cfg.copy_wallet):
+            return None
+        rows: list[dict] = []
+        cursor = ""
+        for page_number in range(100):
+            params = {
+                "user": self.cfg.copy_wallet.lower(),
+                "status": "OPEN",
+                "filter_type": "TOKENS",
+                "filter_amount": "0.01",
+                "include_archived": "true",
+                "limit": "1000",
+                "_": str(time.time_ns() // 1_000_000),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._wallet_api_page(
+                POSITIONS_ENDPOINT, params, "Снимок открытых позиций",
+            )
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                return None
+            page = payload["data"]
+            if any(not isinstance(row, dict) for row in page):
+                return None
+            for row in page:
+                wallet = wallet_of(row)
+                if not wallet or wallet != self.cfg.copy_wallet.lower():
+                    self._note_once(
+                        "positions-wallet-mismatch", "ERROR",
+                        "Снимок позиций содержит строку без подтверждённого адреса целевого кошелька.",
+                        60,
+                    )
+                    return None
+            rows.extend(page)
+            next_cursor, has_more = self._page_cursor(payload)
+            if not has_more:
+                return rows
+            if not next_cursor or next_cursor == cursor:
+                self._note_once(
+                    "positions-cursor", "ERROR",
+                    "Снимок позиций неполный: API не вернул новый курсор.",
+                    60,
+                )
+                return None
+            cursor = next_cursor
+        self._note_once(
+            "positions-page-limit", "ERROR",
+            "Снимок позиций превышает безопасный лимит страниц; импорт отменён.",
+            60,
+        )
+        return None
+
+    async def _import_wallet_positions(self) -> bool:
+        """Import the wallet's current holdings once, at their snapshot value."""
+        rows = await self._fetch_wallet_positions()
+        if rows is None:
+            return False
+        imported = 0
+        total_value = _ZERO
+        try:
+            for row in rows:
+                slug = str(row.get("slug") or "")
+                condition_id = str(row.get("condition_id") or "")
+                outcome = str(row.get("outcome") or "")
+                try:
+                    shares = D(row.get("current_size"))
+                    value = D(row.get("current_value"))
+                except Exception as exc:
+                    raise ValueError("position quantity/value is missing") from exc
+                if not shares.is_finite() or not value.is_finite() or shares <= 0 or value < 0:
+                    raise ValueError("position quantity/value is invalid")
+                if not slug or not condition_id or not outcome:
+                    raise ValueError("position identity is incomplete")
+                asset, timeframe = _asset_timeframe(slug)
+                self.portfolio.import_open_position(
+                    slug=slug,
+                    condition_id=condition_id,
+                    asset=asset,
+                    timeframe=timeframe,
+                    outcome=outcome,
+                    shares=shares,
+                    current_value=value,
+                )
+                imported += 1
+                total_value += value
+        except Exception as exc:
+            self._note_once(
+                "positions-import-invalid", "ERROR",
+                f"Импорт позиций отменён из-за неполной/некорректной строки: {exc}",
+                60,
+            )
+            return False
+        summary = {
+            "wallet": self.cfg.copy_wallet.lower(),
+            "imported_positions": imported,
+            "opening_value_usdc": str(usdc(total_value)),
+            "imported_at": time.time(),
+            "basis": "current_value_at_snapshot; pre-snapshot PnL excluded",
+        }
+        self.ledger.save_wallet_positions_import(
+            self.mode,
+            self.cfg.copy_wallet,
+            {
+                "portfolio": self.portfolio.to_dict(),
+                "consecutive_losses": self.consecutive_losses,
+                "manual_pause": self.manual_pause,
+                "copy": self.copy.to_dict(),
+            },
+            summary,
+        )
+        self._note(
+            "INFO",
+            f"Открытые позиции кошелька импортированы: {imported} шт. · "
+            f"текущая стоимость \${usdc(total_value)} · прошлый PnL исключён из новой истории.",
+            notify=True,
+        )
+        return True
 
     async def _fetch_wallet_trades(self, taker_only: bool | None = None) -> list[dict] | None:
         """Fetch the complete wallet fill feed exactly once.
