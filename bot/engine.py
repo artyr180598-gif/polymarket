@@ -1293,7 +1293,7 @@ class TradingEngine:
             self.ledger.save_copy_checkpoint(
                 self.mode,
                 {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
-                 "manual_pause": self.manual_pause},
+                 "manual_pause": self.manual_pause, "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug},
                 self._copy_state_blob(), self.copy.pending_rows(),
             )
         monotonic_now = time.monotonic()
@@ -1389,7 +1389,7 @@ class TradingEngine:
         self.ledger.save_copy_checkpoint(
             self.mode,
             {"portfolio": self.portfolio.to_dict(), "consecutive_losses": self.consecutive_losses,
-             "manual_pause": self.manual_pause},
+             "manual_pause": self.manual_pause, "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug},
             self._copy_state_blob(), self.copy.pending_rows(),
         )
         self._last_copy_persist = time.monotonic()
@@ -2043,7 +2043,8 @@ class TradingEngine:
         copy_snapshot["jobs"] = pending
         checkpoint = {
             f"portfolio:{self.mode}": {"portfolio": self.portfolio.to_dict(),
-                "consecutive_losses": self.consecutive_losses, "manual_pause": self.manual_pause},
+                "consecutive_losses": self.consecutive_losses, "manual_pause": self.manual_pause,
+                "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug},
             f"copy:{self.mode}": copy_snapshot,
             f"copy_pending:{self.mode}": pending,
         }
@@ -2425,7 +2426,7 @@ class TradingEngine:
             return False
         imported = 0
         total_value = _ZERO
-        parsed: list[tuple[str, str, str, str, str, Decimal, Decimal]] = []
+        parsed: list[tuple[str, str, str, str, str, Decimal, Decimal, float]] = []
         try:
             # Validate the entire snapshot before mutating the in-memory ledger.
             for row in rows:
