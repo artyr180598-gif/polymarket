@@ -270,3 +270,74 @@ def test_paper_reset_clears_open_position_import_marker(tmp_path):
     assert not ledger.wallet_positions_imported("paper", "0xabc")
     assert ledger.load_portfolio("paper") is None
     ledger.close()
+
+
+def test_wallet_position_import_commits_opening_equity_once(tmp_path):
+    import asyncio
+    from bot.config import BotConfig
+    from bot.copy_wallet import DEFAULT_WALLET
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(
+        db_path=str(tmp_path / "position-import.db"),
+        copy_import_positions=True,
+        bankroll_usd=2750,
+    ))
+    async def positions():
+        return [{
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "eth-updown-5m-1795266600",
+            "condition_id": "0xcondition",
+            "outcome": "Up",
+            "current_size": 10,
+            "current_value": 4.25,
+        }]
+    engine._fetch_wallet_positions = positions
+    try:
+        assert asyncio.run(engine._import_wallet_positions()) is True
+        assert engine.portfolio.cash == Decimal("2750")
+        assert engine.portfolio.initial_cash == Decimal("2754.25")
+        assert engine.ledger.wallet_positions_imported("paper", DEFAULT_WALLET)
+        saved = engine.ledger.load_portfolio("paper")
+        assert saved["portfolio"]["initial_cash"] == "2754.250000"
+    finally:
+        engine.ledger.close()
+
+
+def test_incomplete_wallet_position_snapshot_does_not_partially_import(tmp_path):
+    import asyncio
+    from bot.config import BotConfig
+    from bot.copy_wallet import DEFAULT_WALLET
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(
+        db_path=str(tmp_path / "position-import-invalid.db"),
+        copy_import_positions=True,
+    ))
+    async def positions():
+        return [
+            {
+                "proxy_wallet": DEFAULT_WALLET,
+                "slug": "eth-updown-5m-1795266600",
+                "condition_id": "0xcondition",
+                "outcome": "Up",
+                "current_size": 10,
+                "current_value": 4.25,
+            },
+            {
+                "proxy_wallet": DEFAULT_WALLET,
+                "slug": "sol-updown-5m-1795266600",
+                "condition_id": "",
+                "outcome": "Down",
+                "current_size": 5,
+                "current_value": 1.5,
+            },
+        ]
+    engine._fetch_wallet_positions = positions
+    try:
+        assert asyncio.run(engine._import_wallet_positions()) is False
+        assert engine.portfolio.markets == {}
+        assert engine.ledger.load_portfolio("paper") is None
+        assert not engine.ledger.wallet_positions_imported("paper", DEFAULT_WALLET)
+    finally:
+        engine.ledger.close()
