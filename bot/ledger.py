@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import fcntl
 import time
 from typing import Any
 
@@ -58,6 +59,8 @@ class Ledger:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        self._process_lock_file = None
+        self._process_lock_path = os.path.abspath(db_path) + ".lock"
         self.added_columns: list[str] = []
         self._init()
 
@@ -148,6 +151,45 @@ class Ledger:
             )
             self._migrate_locked()
             self.conn.commit()
+
+    def acquire_process_lock(self) -> None:
+        """Hold an OS advisory lock so only one bot process owns this ledger.
+
+        The lock is on a sibling file, not the SQLite database itself; it is
+        released by the kernel if Railway kills the process.
+        """
+        if self._process_lock_file is not None:
+            return
+        handle = open(self._process_lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"another PolyBot process already owns database {self.db_path}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\\n")
+        handle.flush()
+        self._process_lock_file = handle
+
+    def release_process_lock(self) -> None:
+        handle = self._process_lock_file
+        if handle is None:
+            return
+        self._process_lock_file = None
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self.conn.close()
+            finally:
+                self.release_process_lock()
 
     def backup_and_reset_paper_history(self, reset_id: str) -> dict[str, Any]:
         """Back up the complete SQLite database, then start a fresh PAPER ledger once.
