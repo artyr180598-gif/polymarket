@@ -178,7 +178,7 @@ class Ledger:
             ) from exc
         handle.seek(0)
         handle.truncate()
-        handle.write(f"pid={os.getpid()}\\n")
+        handle.write(f"pid={os.getpid()}\n")
         handle.flush()
         self._process_lock_file = handle
 
