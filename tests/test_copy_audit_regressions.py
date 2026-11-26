@@ -186,9 +186,9 @@ def test_imported_open_position_is_neutral_at_snapshot_value():
         shares=D("10"),
         current_value=D("4.25"),
     )
-    assert p.cash == D("2750")
-    assert p.initial_cash == D("2754.25")
-    assert p.equity() == D("2754.25")
+    assert p.cash == D("2745.75")
+    assert p.initial_cash == D("2750")
+    assert p.equity() == D("2750")
     assert p.unrealized() == D("0")
     assert p.markets["eth-updown-5m-1795266600"].outcomes["Up"].shares == D("10")
 
@@ -301,11 +301,13 @@ def test_wallet_position_import_commits_opening_equity_once(tmp_path):
     engine._fetch_wallet_positions = positions
     try:
         assert asyncio.run(engine._import_wallet_positions()) is True
-        assert engine.portfolio.cash == Decimal("2750")
-        assert engine.portfolio.initial_cash == Decimal("2754.25")
+        assert engine.portfolio.cash == Decimal("2745.75")
+        assert engine.portfolio.initial_cash == Decimal("2750")
+        assert engine.portfolio.equity() == Decimal("2750")
         assert engine.ledger.wallet_positions_imported("paper", DEFAULT_WALLET)
         saved = engine.ledger.load_portfolio("paper")
-        assert saved["portfolio"]["initial_cash"] == "2754.250000"
+        assert saved["portfolio"]["initial_cash"] == "2750.000000"
+        assert saved["portfolio"]["cash"] == "2745.750000"
         assert saved["copy_snapshot_at"] > 0
         assert saved["copy_position_seed_at_by_slug"]["eth-updown-5m-1795266600|Up"] == 1795266601
     finally:
@@ -470,3 +472,21 @@ def test_cross_feed_order_falls_back_to_lifecycle_when_sequence_missing():
         "SPLIT", "TRADE", "MERGE", "REDEEM"
     ]
     engine.ledger.close()
+
+
+def test_imported_positions_over_bankroll_fail_without_partial_mutation():
+    from bot.accounting import D
+
+    p = Portfolio(initial_cash=D("5"), cash=D("5"))
+    with pytest.raises(ValueError, match="exceed available PAPER bankroll"):
+        p.import_open_position(
+            slug="eth-updown-5m-1795266600",
+            condition_id="0xcondition",
+            asset="ETH",
+            timeframe="5m",
+            outcome="Up",
+            shares=D("10"),
+            current_value=D("5.01"),
+        )
+    assert p.cash == D("5")
+    assert p.markets == {}
