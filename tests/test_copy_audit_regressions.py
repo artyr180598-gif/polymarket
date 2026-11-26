@@ -137,3 +137,18 @@ def test_exec_latency_configuration_is_bounded(monkeypatch, tmp_path):
     monkeypatch.setenv("COPY_EXEC_LATENCY_MS", "-5")
     cfg = BotConfig.from_env(env_file=str(tmp_path / "missing.env"))
     assert cfg.copy_exec_latency_ms == 0
+
+
+def test_latency_percentiles_are_calculated_without_fabricated_samples(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(db_path=str(tmp_path / "latency.db")))
+    engine._copy_latency_samples = [
+        {"detection": 1.0, "execution": 2.0, "total": 3.0},
+        {"detection": 3.0, "execution": 4.0, "total": 7.0},
+        {"detection": 5.0, "execution": 6.0, "total": 11.0},
+    ]
+    assert engine._latency_percentile("detection", 0.50) == 3.0
+    assert engine._latency_percentile("execution", 0.95) == 6.0
+    assert engine._latency_percentile("total", 0.95) == 11.0
