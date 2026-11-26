@@ -2486,6 +2486,7 @@ class TradingEngine:
         imported = 0
         total_value = _ZERO
         snapshot_at = time.time()
+        watermark_fallback_positions = 0
         parsed: list[tuple[str, str, str, str, str, Decimal, Decimal, float]] = []
         try:
             # Validate the entire snapshot before mutating the in-memory ledger.
@@ -2496,18 +2497,22 @@ class TradingEngine:
                 try:
                     shares = D(row.get("current_size"))
                     value = D(row.get("current_value"))
-                    last_event_at = float(row.get("last_event_at"))
                 except Exception as exc:
-                    raise ValueError("position quantity/value/last_event_at is missing") from exc
-                if (
-                    not shares.is_finite() or not value.is_finite()
-                    or shares <= 0 or value < 0
-                    or not math.isfinite(last_event_at) or last_event_at <= 0
-                ):
-                    raise ValueError("position quantity/value/last_event_at is invalid")
+                    raise ValueError("position quantity/value is missing") from exc
+                if not shares.is_finite() or not value.is_finite() or shares <= 0 or value < 0:
+                    raise ValueError("position quantity/value is invalid")
                 if not slug or not condition_id or not outcome:
                     raise ValueError("position identity is incomplete")
-                if last_event_at > 1e11:
+                try:
+                    last_event_at = float(row.get("last_event_at") or 0.0)
+                except (TypeError, ValueError):
+                    last_event_at = 0.0
+                if not math.isfinite(last_event_at) or last_event_at <= 0:
+                    # Legacy positions without native economics have no event timestamp.
+                    # The post-response snapshot time is the conservative cutoff.
+                    last_event_at = snapshot_at
+                    watermark_fallback_positions += 1
+                elif last_event_at > 1e11:
                     last_event_at /= 1000.0
                 asset, timeframe = _asset_timeframe(slug)
                 parsed.append((slug, condition_id, asset, timeframe, outcome, shares, value, last_event_at))
@@ -2547,6 +2552,8 @@ class TradingEngine:
             "opening_value_usdc": str(usdc(total_value)),
             "imported_at": time.time(),
             "basis": "current_value_at_snapshot; pre-snapshot PnL excluded",
+            "watermark_basis": "per_position_last_event_at; snapshot_time_fallback",
+            "watermark_fallback_positions": watermark_fallback_positions,
         }
         self.ledger.save_wallet_positions_import(
             self.mode,
