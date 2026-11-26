@@ -418,3 +418,26 @@ def test_copy_event_cutoff_uses_per_market_position_watermark(tmp_path):
         ]
     finally:
         engine.ledger.close()
+
+
+def test_cross_feed_events_use_chain_order_then_lifecycle_fallback(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    engine = TradingEngine(BotConfig(db_path=str(tmp_path / "event-order.db")))
+    rows = [
+        {"type": "REDEEM", "timestamp": 10, "transaction_hash": "0xsame"},
+        {"type": "MERGE", "timestamp": 10, "transaction_hash": "0xsame"},
+        {"type": "TRADE", "timestamp": 10, "transaction_hash": "0xsame"},
+        {"type": "SPLIT", "timestamp": 10, "transaction_hash": "0xsame"},
+    ]
+    try:
+        ordered = sorted(rows, key=engine._copy_event_order)
+        assert [row["type"] for row in ordered] == ["SPLIT", "TRADE", "MERGE", "REDEEM"]
+        indexed = [
+            {"type": "MERGE", "timestamp": 10, "transaction_hash": "0xchain", "log_index": 9},
+            {"type": "TRADE", "timestamp": 10, "transaction_hash": "0xchain", "log_index": 4},
+        ]
+        assert [row["type"] for row in sorted(indexed, key=engine._copy_event_order)] == ["TRADE", "MERGE"]
+    finally:
+        engine.ledger.close()
