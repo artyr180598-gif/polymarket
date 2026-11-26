@@ -326,7 +326,14 @@ class TradingEngine:
         self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
         saved = self.ledger.load_portfolio(self.mode)
         self._copy_position_seed_at_by_slug: dict[str, float] = {}
+        self._copy_snapshot_at = 0.0
         if isinstance(saved, dict):
+            try:
+                snapshot_at = float(saved.get("copy_snapshot_at") or 0.0)
+                if math.isfinite(snapshot_at) and snapshot_at > 0:
+                    self._copy_snapshot_at = snapshot_at
+            except (TypeError, ValueError):
+                pass
             for slug, stamp in (saved.get("copy_position_seed_at_by_slug") or {}).items():
                 try:
                     value = float(stamp)
@@ -1230,19 +1237,18 @@ class TradingEngine:
         slug = str(row.get("slug") or "")
         outcome = str(row.get("outcome") or "")
         if outcome:
-            position_cutoff = float(
-                self._copy_position_seed_at_by_slug.get(f"{slug}|{outcome}", 0.0) or 0.0
-            )
+            key = f"{slug}|{outcome}"
+            position_cutoff = self._copy_position_seed_at_by_slug.get(key)
+            if position_cutoff is None:
+                position_cutoff = self._copy_snapshot_at
         else:
-            position_cutoff = max(
-                (
-                    float(stamp or 0.0)
-                    for key, stamp in self._copy_position_seed_at_by_slug.items()
-                    if key.startswith(f"{slug}|")
-                ),
-                default=0.0,
-            )
-        return max(global_cutoff, position_cutoff)
+            market_cutoff = [
+                float(stamp or 0.0)
+                for key, stamp in self._copy_position_seed_at_by_slug.items()
+                if key.startswith(f"{slug}|")
+            ]
+            position_cutoff = max(market_cutoff) if market_cutoff else self._copy_snapshot_at
+        return max(global_cutoff, float(position_cutoff or 0.0))
 
     def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
         """Reject pre-reset rows on every poll, including later API pages."""
@@ -2440,6 +2446,7 @@ class TradingEngine:
             return False
         imported = 0
         total_value = _ZERO
+        snapshot_at = time.time()
         parsed: list[tuple[str, str, str, str, str, Decimal, Decimal, float]] = []
         try:
             # Validate the entire snapshot before mutating the in-memory ledger.
@@ -2488,6 +2495,7 @@ class TradingEngine:
                 60,
             )
             return False
+        self._copy_snapshot_at = snapshot_at
         summary = {
             "wallet": self.cfg.copy_wallet.lower(),
             "imported_positions": imported,
@@ -2504,6 +2512,7 @@ class TradingEngine:
                 "manual_pause": self.manual_pause,
                 "copy": self._copy_state_blob(),
                 "copy_position_seed_at_by_slug": self._copy_position_seed_at_by_slug,
+                "copy_snapshot_at": self._copy_snapshot_at,
             },
             summary,
         )
