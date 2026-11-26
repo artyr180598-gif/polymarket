@@ -245,7 +245,8 @@ class Ledger:
                     )
                     self.conn.execute(f"DELETE FROM {table} WHERE mode = ?", ("paper",))
                 self.conn.execute(
-                    "DELETE FROM kv WHERE k IN (?, ?, ?)",
+                    "DELETE FROM kv WHERE k IN (?, ?, ?) "
+                    "OR k LIKE 'wallet_positions_imported:paper:%'",
                     ("portfolio:paper", "copy:paper", "copy_pending:paper"),
                 )
                 reset_at = time.time()
