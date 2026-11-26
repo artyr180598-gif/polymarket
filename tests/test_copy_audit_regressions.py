@@ -345,3 +345,25 @@ def test_incomplete_wallet_position_snapshot_does_not_partially_import(tmp_path)
         assert not engine.ledger.wallet_positions_imported("paper", DEFAULT_WALLET)
     finally:
         engine.ledger.close()
+
+
+def test_latency_samples_survive_engine_restart(tmp_path):
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+
+    db_path = str(tmp_path / "latency-persist.db")
+    cfg = BotConfig(db_path=db_path)
+    first = TradingEngine(cfg)
+    first._copy_latency_samples = [
+        {"detection": 0.2, "execution": 0.3, "total": 0.5},
+        {"detection": 0.4, "execution": 0.6, "total": 1.0},
+    ]
+    first._persist_copy(force=True)
+    first.ledger.close()
+
+    second = TradingEngine(cfg)
+    try:
+        assert second._copy_latency_samples == first._copy_latency_samples
+        assert second._latency_percentile("total", 0.50) == 0.5
+    finally:
+        second.ledger.close()
