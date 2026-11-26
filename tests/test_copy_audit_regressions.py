@@ -167,3 +167,92 @@ def test_engine_acquires_process_lock_before_ledger_load(tmp_path):
     finally:
         engine.ledger.close()
         other.close()
+
+
+def test_imported_open_position_is_neutral_at_snapshot_value():
+    from bot.accounting import D
+
+    p = Portfolio(initial_cash=D("2750"), cash=D("2750"))
+    p.import_open_position(
+        slug="eth-updown-5m-1795266600",
+        condition_id="0xcondition",
+        asset="ETH",
+        timeframe="5m",
+        outcome="Up",
+        shares=D("10"),
+        current_value=D("4.25"),
+    )
+    assert p.cash == D("2750")
+    assert p.initial_cash == D("2754.25")
+    assert p.equity() == D("2754.25")
+    assert p.unrealized() == D("0")
+    assert p.markets["eth-updown-5m-1795266600"].outcomes["Up"].shares == D("10")
+
+
+def test_wallet_positions_import_marker_and_snapshot_commit_together(tmp_path):
+    ledger = Ledger(str(tmp_path / "positions.db"))
+    snapshot = {"portfolio": {"initial_cash": "2754.25", "cash": "2750"}}
+    assert not ledger.wallet_positions_imported("paper", "0xabc")
+    ledger.save_wallet_positions_import(
+        "paper", "0xabc", snapshot,
+        {"imported_positions": 1, "opening_value_usdc": "4.25"},
+    )
+    assert ledger.wallet_positions_imported("paper", "0xabc")
+    assert ledger.load_portfolio("paper") == snapshot
+    ledger.close()
+
+
+def test_positions_snapshot_follows_cursor_and_verifies_wallet(tmp_path):
+    import asyncio
+    from bot.config import BotConfig
+    from bot.engine import TradingEngine
+    from bot.copy_wallet import DEFAULT_WALLET
+
+    engine = TradingEngine(BotConfig(db_path=str(tmp_path / "positions-cursor.db")))
+    engine._session = object()
+    calls = []
+    async def page(url, params, label):
+        calls.append(dict(params))
+        row = {
+            "proxy_wallet": DEFAULT_WALLET,
+            "slug": "eth-updown-5m-1795266600",
+            "condition_id": "0xcondition",
+            "outcome": "Up",
+            "current_size": 10,
+            "current_value": 4.25,
+        }
+        if not params.get("cursor"):
+            return {"data": [row], "pagination": {"has_more": True, "next_cursor": "next"}}
+        return {"data": [], "pagination": {"has_more": False}}
+    engine._wallet_api_page = page
+    try:
+        rows = asyncio.run(engine._fetch_wallet_positions())
+        assert len(rows) == 1
+        assert calls[0]["status"] == "OPEN"
+        assert calls[1]["cursor"] == "next"
+    finally:
+        engine.ledger.close()
+
+
+def test_btc_scope_allows_only_non_btc_position_closures():
+    from bot.config import BotConfig
+    from bot.copy_wallet import CopyBook, DEFAULT_WALLET
+
+    cfg = BotConfig(copy_slug_prefixes=["btc-updown"])
+    book = CopyBook()
+    base = {
+        "proxy_wallet": DEFAULT_WALLET,
+        "slug": "eth-updown-5m-1795266600",
+        "condition_id": "0xcondition",
+        "timestamp": 1795266601,
+        "size": 10,
+        "price": 0.4,
+        "outcome": "Up",
+    }
+    assert book.observe({**base, "transaction_hash": "buy", "side": "BUY"}, now=1, cfg=cfg) is None
+    sell = book.observe({**base, "transaction_hash": "sell", "side": "SELL"}, now=1, cfg=cfg)
+    assert sell is not None and sell.side == "SELL"
+    split = book.observe({**base, "transaction_hash": "split", "type": "SPLIT"}, now=1, cfg=cfg)
+    assert split is None
+    merge = book.observe({**base, "transaction_hash": "merge", "type": "MERGE"}, now=1, cfg=cfg)
+    assert merge is not None and merge.side == "MERGE"
