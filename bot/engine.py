@@ -1228,7 +1228,20 @@ class TradingEngine:
         """Combine reset time with the per-market snapshot watermark."""
         global_cutoff = float(getattr(self, "_copy_seed_after_ts", 0.0) or 0.0)
         slug = str(row.get("slug") or "")
-        position_cutoff = float(self._copy_position_seed_at_by_slug.get(slug, 0.0) or 0.0)
+        outcome = str(row.get("outcome") or "")
+        if outcome:
+            position_cutoff = float(
+                self._copy_position_seed_at_by_slug.get(f"{slug}|{outcome}", 0.0) or 0.0
+            )
+        else:
+            position_cutoff = max(
+                (
+                    float(stamp or 0.0)
+                    for key, stamp in self._copy_position_seed_at_by_slug.items()
+                    if key.startswith(f"{slug}|")
+                ),
+                default=0.0,
+            )
         return max(global_cutoff, position_cutoff)
 
     def _copy_rows_after_reset(self, rows: list[dict]) -> list[dict]:
@@ -2462,8 +2475,9 @@ class TradingEngine:
                     shares=shares,
                     current_value=value,
                 )
-                self._copy_position_seed_at_by_slug[slug] = max(
-                    self._copy_position_seed_at_by_slug.get(slug, 0.0), last_event_at,
+                watermark_key = f"{slug}|{outcome}"
+                self._copy_position_seed_at_by_slug[watermark_key] = max(
+                    self._copy_position_seed_at_by_slug.get(watermark_key, 0.0), last_event_at,
                 )
                 imported += 1
                 total_value += value
