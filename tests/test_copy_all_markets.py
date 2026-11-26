@@ -180,7 +180,7 @@ class MarketCoverageTests(unittest.TestCase):
         self.assertEqual(config.trading_mode, "paper")
         self.assertEqual(config.strategy, "copy_wallet")
         self.assertEqual(config.enabled_assets, ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"])
-        self.assertFalse(config.auto_start)
+        self.assertTrue(config.auto_start)
 
     def test_scope_filter_is_optional(self) -> None:
         cfg = _cfg(copy_slug_prefixes=["eth-updown"], enabled_assets=["ETH"])
