@@ -304,20 +304,25 @@ class Window:
 class TradingEngine:
     def __init__(self, cfg: BotConfig) -> None:
         self.cfg = cfg
-        self.ledger = Ledger(cfg.db_path, acquire_process_lock=True)
+        # Only a requested destructive reset locks during construction;
+        # ordinary test/replay engines acquire the lifetime lock in start().
+        self.ledger = Ledger(cfg.db_path, acquire_process_lock=bool(cfg.paper_reset_id))
         # A reset request is a one-time, idempotent operation. The full DB is
         # backed up before PAPER rows and snapshots are cleared.
         # copy_wallet never sends a live order, even if TRADING_MODE=live.
         self.mode = "paper" if (not cfg.live_requested or cfg.strategy == "copy_wallet") else "live"
         if self.mode == "paper" and cfg.strategy == "copy_wallet" and cfg.paper_reset_id:
-            reset = self.ledger.backup_and_reset_paper_history(cfg.paper_reset_id)
-            if reset["reset"]:
-                log.info(
-                    "PAPER_HISTORY_RESET complete backup=%s cleared=%s reset_id=%s",
-                    reset["backup_path"], reset["counts"], cfg.paper_reset_id,
-                )
-            else:
-                log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
+            try:
+                reset = self.ledger.backup_and_reset_paper_history(cfg.paper_reset_id)
+                if reset["reset"]:
+                    log.info(
+                        "PAPER_HISTORY_RESET complete backup=%s cleared=%s reset_id=%s",
+                        reset["backup_path"], reset["counts"], cfg.paper_reset_id,
+                    )
+                else:
+                    log.info("PAPER_HISTORY_RESET already applied reset_id=%s", cfg.paper_reset_id)
+            finally:
+                self.ledger.release_process_lock()
         self._copy_seed_after_ts = self.ledger.paper_history_reset_at()
         saved = self.ledger.load_portfolio(self.mode)
         self._fresh_account = saved is None
