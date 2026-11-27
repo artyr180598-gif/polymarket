@@ -674,6 +674,55 @@ class Ledger:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def audit_export(self, mode: str) -> dict[str, Any]:
+        """Return a consistent, read-only export of the financial journal.
+
+        The export intentionally excludes credentials and unrelated kv values.
+        A SQLite read transaction gives all journal tables one database snapshot.
+        """
+        tables = ("fills", "copies", "merges", "resolutions", "equity_points")
+        with self._lock:
+            self.conn.execute("BEGIN")
+            try:
+                rows: dict[str, list[dict[str, Any]]] = {}
+                schema: dict[str, list[dict[str, Any]]] = {}
+                for table in tables:
+                    rows[table] = [
+                        dict(row) for row in self.conn.execute(
+                            f"SELECT * FROM {table} WHERE mode = ? ORDER BY id ASC", (mode,)
+                        ).fetchall()
+                    ]
+                    schema[table] = [
+                        dict(row) for row in self.conn.execute(
+                            f"PRAGMA table_info({table})"
+                        ).fetchall()
+                    ]
+                kv_rows = self.conn.execute(
+                    """
+                    SELECT k, v FROM kv
+                    WHERE k IN (?, ?, ?, ?, ?)
+                       OR k LIKE ?
+                    ORDER BY k
+                    """,
+                    (
+                        f"portfolio:{mode}", f"copy:{mode}", f"copy_pending:{mode}",
+                        "paper_history_reset_id", "paper_history_reset_at",
+                        f"wallet_positions_imported:{mode}:%",
+                    ),
+                ).fetchall()
+                metadata = {str(row["k"]): row["v"] for row in kv_rows}
+                self.conn.execute("ROLLBACK")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return {
+            "mode": mode,
+            "tables": rows,
+            "schema": schema,
+            "metadata": metadata,
+            "row_counts": {name: len(items) for name, items in rows.items()},
+        }
+
     def stats(self, mode: str, now: float | None = None) -> dict[str, Any]:
         now = now if now is not None else time.time()
         day = now - (now % 86400)

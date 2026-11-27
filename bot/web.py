@@ -40,6 +40,52 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
             "pin_required": bool(engine.cfg.dashboard_pin),
         }
 
+    @app.get("/api/audit/export", dependencies=[Depends(verify_pin)])
+    async def audit_export() -> JSONResponse:
+        """Download a PIN-protected, read-only financial audit snapshot."""
+        from datetime import datetime, timezone
+
+        captured = datetime.now(timezone.utc)
+        stamp = captured.isoformat()
+        journal = engine.ledger.audit_export(engine.mode)
+        marks = [
+            {"slug": slug, "outcome": outcome, "best_bid": str(price)}
+            for (slug, outcome), price in sorted(engine.marks.items())
+        ]
+        # Do not call engine.snapshot() here: it rolls the daily baseline and
+        # therefore has a bookkeeping side effect. Capture the in-memory
+        # portfolio directly, and decode the last durable portfolio checkpoint
+        # from the same SQLite read snapshot as the journal.
+        import json
+
+        persisted_raw = journal["metadata"].get(f"portfolio:{engine.mode}")
+        try:
+            persisted_portfolio = json.loads(persisted_raw) if persisted_raw else None
+        except (TypeError, ValueError):
+            persisted_portfolio = None
+        payload = {
+            "format": "polybot-financial-audit-v1",
+            "captured_at": stamp,
+            "mode": engine.mode,
+            "strategy": engine.cfg.strategy,
+            "paper_only": engine.mode == "paper",
+            "portfolio_runtime": engine.portfolio.to_dict(),
+            "portfolio_persisted": persisted_portfolio,
+            "portfolio_persisted_available": persisted_portfolio is not None,
+            "marks": marks,
+            "journal": journal,
+            "consistency_note": (
+                "Journal tables and persisted portfolio checkpoint share one SQLite "
+                "read snapshot. Runtime portfolio and marks are captured separately "
+                "and may be slightly newer or older."
+            ),
+        }
+        filename = "polybot-audit-" + captured.strftime("%Y%m%dT%H%M%SZ") + ".json"
+        return JSONResponse(
+            payload,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     @app.get("/api/state", dependencies=[Depends(verify_pin)])
     async def state() -> JSONResponse:
         return JSONResponse(engine.snapshot())
