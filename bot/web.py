@@ -40,6 +40,35 @@ def create_app(engine: TradingEngine, lifespan=None) -> FastAPI:
             "pin_required": bool(engine.cfg.dashboard_pin),
         }
 
+    @app.get("/api/audit/export", dependencies=[Depends(verify_pin)])
+    async def audit_export() -> JSONResponse:
+        """Download a PIN-protected, read-only financial audit snapshot."""
+        from datetime import datetime, timezone
+
+        captured = datetime.now(timezone.utc)
+        stamp = captured.isoformat()
+        journal = engine.ledger.audit_export(engine.mode)
+        marks = [
+            {"slug": slug, "outcome": outcome, "best_bid": str(price)}
+            for (slug, outcome), price in sorted(engine.marks.items())
+        ]
+        payload = {
+            "format": "polybot-financial-audit-v1",
+            "captured_at": stamp,
+            "mode": engine.mode,
+            "strategy": engine.cfg.strategy,
+            "paper_only": engine.cfg.strategy == "copy_wallet" or engine.mode == "paper",
+            "snapshot": engine.snapshot(),
+            "portfolio": engine.portfolio.to_dict(),
+            "marks": marks,
+            "journal": journal,
+        }
+        filename = "polybot-audit-" + captured.strftime("%Y%m%dT%H%M%SZ") + ".json"
+        return JSONResponse(
+            payload,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     @app.get("/api/state", dependencies=[Depends(verify_pin)])
     async def state() -> JSONResponse:
         return JSONResponse(engine.snapshot())
