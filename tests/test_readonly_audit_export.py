@@ -33,6 +33,18 @@ class AuditExportTests(unittest.TestCase):
                 asset="BTC", timeframe="5m", winner="Up", pnl="0.2", payout="1",
             )
             ledger.record_equity(mode="paper", equity="100.2", cash="99", realized="0.2")
+            # The durable portfolio checkpoint is where open/closed residual lots live.
+            ledger.save_portfolio("paper", {
+                "initial_cash": "100", "cash": "99", "realized": "0.2",
+                "markets": {
+                    "btc-updown-5m-1": {
+                        "condition_id": "c", "asset": "BTC", "timeframe": "5m",
+                        "realized": "0", "resolved": False, "winner": "",
+                        "closed": False, "closed_ts": 0,
+                        "outcomes": {"Up": {"shares": "2", "cost": "0.8", "fees": "0.01"}},
+                    }
+                },
+            })
 
             before = {
                 table: ledger.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -51,6 +63,9 @@ class AuditExportTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(exported["tables"]["fills"][0]["slug"], "btc-updown-5m-1")
             self.assertEqual(exported["tables"]["copies"][0]["status"], "FILLED")
+            persisted = __import__("json").loads(exported["metadata"]["portfolio:paper"])
+            lot = persisted["markets"]["btc-updown-5m-1"]["outcomes"]["Up"]
+            self.assertEqual(lot, {"shares": "2", "cost": "0.8", "fees": "0.01"})
             self.assertNotIn("secret", exported["metadata"])
         finally:
             ledger.close()
